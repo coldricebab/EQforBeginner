@@ -9,6 +9,7 @@
 //! live-evidence admission, closed-loop comparison, and measured headroom.
 
 use crate::wireless_sweep::{decode_reference_wav, ReferenceChannel};
+use chrono::Local;
 use eqforbeginner_audio_io::{
     InputCaptureCancellation, MonoInputCapture, MonoInputCaptureRequest, PROJECT_SAMPLE_RATE_HZ,
 };
@@ -90,6 +91,17 @@ pub const SWEEP_MARKER_CHANNEL_ANALYSIS_VERSION: &str = "uploaded-wav-marker-cha
 pub const LIVE_SUBWOOFER_SETUP_VERSION: &str = "manual-single-sub-settings-v1";
 pub const LIVE_SUBWOOFER_SEARCH_PLAN_VERSION: &str = "live-separated-path-search-plan-v1";
 pub const LIVE_ACCEPTED_MEASUREMENT_CACHE_VERSION: &str = "accepted-measurement-snapshot-cache-v3";
+/// Session subdirectory holding a REW-importable copy of every accepted capture.
+///
+/// REW's own `.mdat` is a Java-serialized save format with no documented
+/// third-party writer, so this app does not try to synthesize one: a file REW
+/// silently misreads would be worse than no file. What REW does document as
+/// importable is an impulse response in a WAV, so each accepted capture is also
+/// written as a mono 48 kHz float WAV named after what was measured. Importing
+/// those into REW and using its own "Save All Measurements" produces a genuine
+/// `.mdat` written by REW itself.
+const LIVE_REW_EXPORT_DIRECTORY: &str = "rew";
+pub const LIVE_REW_EXPORT_VERSION: &str = "rew-impulse-export-v1";
 pub const MAX_LIVE_SWEEP_BYTES: usize = 32 * 1024 * 1024;
 const REQUIRED_CALIBRATION_BAND_HZ: [f64; 2] = [20.0, 20_000.0];
 const MAX_CALIBRATION_TEXT_BYTES: usize = 2 * 1024 * 1024;
@@ -862,6 +874,99 @@ fn write_new_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
         .map_err(|error| format!("could not sync {}: {error}", path.display()))
 }
 
+/// Human-readable REW measurement name for one capture, e.g. `L+Sub P0` or
+/// `Sub XO02`.
+///
+/// REW names an imported measurement after its file, and that name is the only
+/// context it carries once it is sitting in REW's measurement list next to
+/// measurements from other sessions. It therefore has to say which acoustic path
+/// was measured, not which internal capture kind produced it.
+fn rew_measurement_label(
+    system_mode: LiveSystemMode,
+    kind: LiveCaptureKind,
+    channel: LiveChannel,
+    position_id: &str,
+) -> String {
+    let channel_label = match channel {
+        LiveChannel::Left => "L",
+        LiveChannel::Right => "R",
+    };
+    let path = match (kind, system_mode) {
+        (LiveCaptureKind::SubOnly, _) => "Sub".to_string(),
+        // A main-only capture is the speaker measured with the subwoofer
+        // physically switched off, so it is the bare channel.
+        (LiveCaptureKind::SubMainOnly, _) => channel_label.to_string(),
+        (
+            LiveCaptureKind::Baseline | LiveCaptureKind::Verification,
+            LiveSystemMode::SingleSub21,
+        ) => format!("{channel_label}+Sub"),
+        (LiveCaptureKind::Baseline | LiveCaptureKind::Verification, LiveSystemMode::Stereo20) => {
+            channel_label.to_string()
+        }
+    };
+    // A verification capture measures the same physical path as its baseline,
+    // with the trial filter active. Without this the two are indistinguishable
+    // in REW and the wrong one can be read as the "before" curve.
+    let state = if matches!(kind, LiveCaptureKind::Verification) {
+        " filtered"
+    } else {
+        ""
+    };
+    format!("{path} {position_id}{state}")
+}
+
+/// Reserve a collision-free REW export path for one capture.
+///
+/// The timestamp is local wall-clock time because it exists for a human reading
+/// a file list, not for any ordering decision the app makes; capture ordering
+/// comes from the artifact index, which is independent of the clock.
+fn reserve_rew_export_path(root: &Path, label: &str) -> Result<PathBuf, String> {
+    let directory = root.join(LIVE_REW_EXPORT_DIRECTORY);
+    fs::create_dir_all(&directory)
+        .map_err(|error| format!("could not create the REW export directory: {error}"))?;
+    let stamp = Local::now().format("%Y-%m-%d %H-%M-%S").to_string();
+    let candidate = directory.join(format!("{label} {stamp}.wav"));
+    if !candidate.exists() {
+        return Ok(candidate);
+    }
+    // Same path, same label, same second: an immediate retry. Both captures are
+    // evidence, so the later one is suffixed rather than overwriting the first.
+    for attempt in 2..=64u32 {
+        let candidate = directory.join(format!("{label} {stamp} #{attempt}.wav"));
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err("could not allocate a unique REW export file name".to_string())
+}
+
+/// Write one calibrated impulse response as a mono 48 kHz float WAV.
+///
+/// This is the same calibrated impulse the design reads, so REW shows what the
+/// app designed from. The microphone correction is already applied — loading a
+/// UMIK calibration file in REW on top of this would apply it twice.
+fn write_rew_impulse_wav(path: &Path, samples: &[f64]) -> Result<(), String> {
+    if samples.is_empty() || samples.iter().any(|sample| !sample.is_finite()) {
+        return Err("impulse response is empty or not finite".to_string());
+    }
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: PROJECT_SAMPLE_RATE_HZ,
+        bits_per_sample: 32,
+        sample_format: hound::SampleFormat::Float,
+    };
+    let mut writer = hound::WavWriter::create(path, spec)
+        .map_err(|error| format!("could not create {}: {error}", path.display()))?;
+    for &sample in samples {
+        writer
+            .write_sample(sample as f32)
+            .map_err(|error| format!("could not write {}: {error}", path.display()))?;
+    }
+    writer
+        .finalize()
+        .map_err(|error| format!("could not finalize {}: {error}", path.display()))
+}
+
 fn advance_evidence_generation(session: &mut LiveSession) -> Result<(), String> {
     session.last_export = None;
     session.evidence_generation = session
@@ -1126,7 +1231,7 @@ impl LiveMeasurementState {
         }
         let (id, root) = selected
             .ok_or_else(|| "could not allocate a unique live project directory".to_string())?;
-        for child in ["inputs", "captures", "trial", "final", "snapshots"] {
+        for child in ["inputs", "captures", "trial", "final", "snapshots", "rew"] {
             fs::create_dir(root.join(child)).map_err(|error| {
                 format!("could not create live project directory `{child}`: {error}")
             })?;
@@ -2776,6 +2881,107 @@ mod tests {
         assert_eq!(
             snapshot["markerChannelAnalysisVersion"],
             SWEEP_MARKER_CHANNEL_ANALYSIS_VERSION
+        );
+        assert_eq!(snapshot["rewExportAlgorithm"], LIVE_REW_EXPORT_VERSION);
+
+        // The accepted capture is also written where REW can open it. REW names
+        // an imported measurement after its file, so the name has to identify
+        // the acoustic path and when it was measured without any other context.
+        let session_root = snapshot_path.parent().unwrap().parent().unwrap();
+        let exports: Vec<PathBuf> = fs::read_dir(session_root.join("rew"))
+            .expect("the session must have a REW export directory")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .collect();
+        assert_eq!(exports.len(), 1, "{exports:?}");
+        let exported = &exports[0];
+        let exported_name = exported.file_name().unwrap().to_str().unwrap();
+        assert!(
+            exported_name.starts_with("L P0 ") && exported_name.ends_with(".wav"),
+            "unexpected REW export name `{exported_name}`"
+        );
+        // `L P0 2026-07-29 14-30-05.wav`
+        let stamp = exported_name
+            .trim_start_matches("L P0 ")
+            .trim_end_matches(".wav");
+        assert_eq!(stamp.len(), 19, "expected a date and time in `{stamp}`");
+        assert_eq!(stamp.matches('-').count(), 4);
+        let reader = hound::WavReader::open(exported).expect("REW export must be a readable WAV");
+        let spec = reader.spec();
+        assert_eq!(spec.channels, 1);
+        assert_eq!(spec.sample_rate, PROJECT_SAMPLE_RATE_HZ);
+        assert_eq!(spec.bits_per_sample, 32);
+        assert_eq!(spec.sample_format, hound::SampleFormat::Float);
+        assert_eq!(
+            reader.len() as usize,
+            SweepDeconvolutionConfig::default().impulse_length_samples,
+            "the export must carry the whole calibrated impulse REW will analyze"
+        );
+    }
+
+    /// The five names a user asked to be able to recognize in REW.
+    #[test]
+    fn rew_export_names_say_which_acoustic_path_was_measured() {
+        let name =
+            |mode, kind, channel, position| rew_measurement_label(mode, kind, channel, position);
+        // A 2.1 baseline is the main plus the subwoofer playing together.
+        assert_eq!(
+            name(
+                LiveSystemMode::SingleSub21,
+                LiveCaptureKind::Baseline,
+                LiveChannel::Left,
+                "P0"
+            ),
+            "L+Sub P0"
+        );
+        assert_eq!(
+            name(
+                LiveSystemMode::SingleSub21,
+                LiveCaptureKind::Baseline,
+                LiveChannel::Right,
+                "P2"
+            ),
+            "R+Sub P2"
+        );
+        // The separated-path stage measures each source alone.
+        assert_eq!(
+            name(
+                LiveSystemMode::SingleSub21,
+                LiveCaptureKind::SubMainOnly,
+                LiveChannel::Left,
+                "XO01"
+            ),
+            "L XO01"
+        );
+        assert_eq!(
+            name(
+                LiveSystemMode::SingleSub21,
+                LiveCaptureKind::SubOnly,
+                LiveChannel::Left,
+                "XO02"
+            ),
+            "Sub XO02"
+        );
+        // Without a subwoofer the baseline is just the speaker.
+        assert_eq!(
+            name(
+                LiveSystemMode::Stereo20,
+                LiveCaptureKind::Baseline,
+                LiveChannel::Right,
+                "P0"
+            ),
+            "R P0"
+        );
+        // The closed-loop capture measures the same path with the trial filter
+        // active; reading it as the unfiltered baseline would invert the result.
+        assert_eq!(
+            name(
+                LiveSystemMode::SingleSub21,
+                LiveCaptureKind::Verification,
+                LiveChannel::Left,
+                "P0"
+            ),
+            "L+Sub P0 filtered"
         );
     }
 
@@ -7416,6 +7622,8 @@ struct MeasurementSnapshot<'a> {
     trial_design_sha256: Option<&'a str>,
     detector_algorithm: &'static str,
     deconvolution_algorithm: &'static str,
+    /// Identifies how the sibling REW-importable WAV in `rew/` was written.
+    rew_export_algorithm: &'static str,
     sample_rate_hz: u32,
     raw_capture_wav: String,
     accepted: bool,
@@ -7995,7 +8203,7 @@ impl LiveMeasurementState {
         channel: LiveChannel,
         position_id: &str,
         evidence: &LiveCaptureEvidence,
-    ) -> Result<(String, PathBuf, PathBuf), String> {
+    ) -> Result<(String, PathBuf, PathBuf, PathBuf), String> {
         let mut guard = self
             .session
             .lock()
@@ -8015,10 +8223,15 @@ impl LiveMeasurementState {
             position_id,
             channel.as_str()
         );
+        let rew_path = reserve_rew_export_path(
+            &session.root,
+            &rew_measurement_label(session.system_mode, kind, channel, position_id),
+        )?;
         Ok((
             session.id.clone(),
             session.root.join("captures").join(format!("{stem}.wav")),
             session.root.join("snapshots").join(format!("{stem}.json")),
+            rew_path,
         ))
     }
 
@@ -8105,7 +8318,7 @@ pub fn analyze_and_store_capture(
             u32::from(evidence.input_channel_index) + 1,
         ));
     }
-    let (session_id, raw_path, snapshot_path) =
+    let (session_id, raw_path, snapshot_path, rew_path) =
         state.reserve_capture_paths(kind, channel, &position_id, evidence)?;
     write_raw_capture(&raw_path, capture)?;
 
@@ -8276,7 +8489,7 @@ pub fn analyze_and_store_capture(
         .iter()
         .map(|index| measurement.calibrated_frequency_response.magnitude_db[*index])
         .collect::<Vec<_>>();
-    let summary = LiveCaptureSummary {
+    let mut summary = LiveCaptureSummary {
         kind,
         channel,
         position_id: position_id.clone(),
@@ -8331,6 +8544,7 @@ pub fn analyze_and_store_capture(
         trial_design_sha256: evidence.design_sha256.as_deref(),
         detector_algorithm: LIVE_CAPTURE_ENDPOINT_VERSION,
         deconvolution_algorithm: KNOWN_SWEEP_DECONVOLUTION_VERSION,
+        rew_export_algorithm: LIVE_REW_EXPORT_VERSION,
         sample_rate_hz: PROJECT_SAMPLE_RATE_HZ,
         raw_capture_wav: raw_path.display().to_string(),
         accepted,
@@ -8366,6 +8580,18 @@ pub fn analyze_and_store_capture(
     let snapshot_bytes = serde_json::to_vec_pretty(&snapshot)
         .map_err(|error| format!("could not serialize measurement snapshot: {error}"))?;
     write_new_file(&snapshot_path, &snapshot_bytes)?;
+    if accepted {
+        // A convenience copy for REW. Failing to write it must not discard a
+        // physically valid measurement, so the failure is reported as a
+        // diagnostic on the capture instead of an error.
+        if let Err(error) =
+            write_rew_impulse_wav(&rew_path, &measurement.calibrated_impulse_samples)
+        {
+            summary
+                .diagnostic_codes
+                .push(format!("rew_export_failed:{error}"));
+        }
+    }
 
     state.store_measurement(
         kind,

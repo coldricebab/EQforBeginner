@@ -212,6 +212,38 @@ response-shape RMSE over 20-500 Hz uses a loose 6.0 dB gross-change bound. P0_EN
 separate center-area sample, not proof of exact microphone replacement. Arrival timing
 is still not qualified by this test.
 
+## Opening the measurements in REW
+
+Every accepted capture is also written to `live-projects/<session-id>/rew/` as a mono
+48 kHz IEEE-float WAV of its calibrated impulse response, named after what was measured
+and when:
+
+```text
+L+Sub P0 2026-07-29 14-30-05.wav
+L XO01 2026-07-29 14-22-31.wav
+Sub XO01 2026-07-29 14-24-02.wav
+L+Sub P0 filtered 2026-07-29 15-10-00.wav
+```
+
+`L`/`R` is the speaker alone, `L+Sub`/`R+Sub` is that speaker with the subwoofer, `Sub`
+is the subwoofer alone, and ` filtered` marks a closed-loop capture taken with the trial
+filter active. In a 2.0 project the baseline is `L`/`R`, because there is no subwoofer
+in the path.
+
+Load them with REW's **File → Import Impulse Response**, or drag them onto the REW
+window. REW names each imported measurement after its file, so the list reads the same
+way. Once they are in REW, its own **File → Save All Measurements** writes a real
+`.mdat`.
+
+The app does not write `.mdat` itself. That format is REW's Java-serialized save file
+with no documented third-party writer, and a file REW silently misread would be worse
+than no file at all — so the app hands REW a format REW documents as importable and lets
+REW write its own save file.
+
+Microphone calibration is already applied to these impulses, because they are the same
+data the design reads. Do not load a UMIK calibration file in REW on top of them or the
+correction is applied twice.
+
 ## Timing
 
 The supplied stereo sweeps include lower-energy events around the measurement signal.

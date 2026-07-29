@@ -1,3 +1,5 @@
+*English · [한국어](STATUS_ko.md)*
+
 # Implementation status
 
 Last updated: 2026-07-29.
@@ -21,7 +23,7 @@ intentionally absent rather than hidden behind a mock.
 
 Deterministic suites, on macOS, at the commit that opens this beta:
 
-- `cargo test --workspace` — 177 passed, 3 hardware-dependent tests ignored, 0 failed.
+- `cargo test --workspace` — 178 passed, 3 hardware-dependent tests ignored, 0 failed.
 - `cargo clippy --workspace --all-targets -- -D warnings` — clean.
 - `cargo fmt --all --check` — clean.
 - `npm test --prefix apps/desktop` — 13 files, 36 tests passed.
