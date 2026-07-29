@@ -71,6 +71,28 @@ Notes:
 - New behaviour that touches a validation gate should come with the evidence that
   justifies the number, not only a passing test.
 
+## Building installers
+
+Each platform builds on its own machine — Tauri's Windows bundle needs the MSVC
+linker, WebView2 and WiX/NSIS, none of which cross-compile from macOS.
+
+```sh
+npm run tauri --prefix apps/desktop -- build --bundles dmg
+```
+
+```sh
+npm run tauri --prefix apps/desktop -- build --bundles msi,nsis
+```
+
+The first command is macOS, the second Windows. To get both without owning both
+machines, run the `release` workflow from the Actions tab, or push a `v*` tag; it
+builds each platform on its own runner and uploads the installers.
+
+**Nothing produced by any of these is signed.** The macOS app is ad-hoc signed at best,
+so Gatekeeper blocks it after a download, and Windows SmartScreen warns about the
+installer. That is accurate — this is an unsigned beta — and it is the state until
+Developer ID signing and notarization are in place.
+
 ## The one rule
 
 Never let a predicted result be presented as a verified one. The entire structure of
