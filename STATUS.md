@@ -90,11 +90,3 @@ numbers most worth challenging.
   notice bundle and a real distribution review have not been done.
 - Device-discovery and capture smoke tests stay ignored in unattended CI because they
   need a physical microphone and OS permission. Hot-unplug handling is unverified.
-
-## Next concrete goals
-
-1. Get the app run end to end in a room that is not the author's, on hardware that is
-   not the author's, and find out which gates are wrong.
-2. A real Roon import test on another machine, including Windows.
-3. Replace single-room threshold calibration with evidence from several rooms.
-4. Developer ID signing and notarization before anything resembling a public release.
