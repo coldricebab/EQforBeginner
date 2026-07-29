@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  Signing with a Developer ID enables the hardened runtime, which withholds
+	  protected resources unless the app asks for them here. The whole product is
+	  a microphone measurement tool, so without this entitlement a notarized
+	  build is refused audio input at runtime and every capture returns silence.
+	  NSMicrophoneUsageDescription in Info.plist supplies the accompanying
+	  explanation TCC shows the user; both are required, neither is sufficient.
+	-->
+	<key>com.apple.security.device.audio-input</key>
+	<true/>
+</dict>
+</plist>

@@ -55,8 +55,33 @@ jobs:
       - name: Test desktop frontend
         run: npm test --prefix apps/desktop
 
+      # Signing is opt-in and driven entirely by repository secrets. With none
+      # set these are empty, Tauri falls back to an ad-hoc signature, and the
+      # build still succeeds — an unsigned beta rather than a failed one. Adding
+      # the macOS secrets turns on Developer ID signing; adding the notarization
+      # secrets on top of them also submits the app to Apple.
       - name: Build bundles
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: npm run tauri --prefix apps/desktop -- build --bundles ${{ matrix.bundles }} ${{ matrix.extra-args }}
+
+      # State what actually happened rather than letting a download imply more
+      # trust than the artifact carries.
+      - name: Report macOS signature
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          app=$(find target -type d -name '*.app' -path '*/release/bundle/*' | head -1)
+          if [ -n "$app" ]; then
+            codesign -dv --verbose=2 "$app" 2>&1 | grep -E 'Signature|Authority|TeamIdentifier' || true
+            codesign -d --entitlements - "$app" 2>&1 | grep -c 'audio-input' \
+              | xargs -I{} echo "audio-input entitlement present: {}"
+          fi
 
       - name: Collect bundles
         shell: bash
