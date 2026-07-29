@@ -1,0 +1,10 @@
+# Keep line endings LF everywhere. The calibration and target-curve parsers are
+# tested against the exact committed bytes, and CI runs on Windows.
+* text=auto eol=lf
+
+# Binary product assets and test fixtures.
+*.wav binary
+*.png binary
+*.ico binary
+*.icns binary
+*.zip binary

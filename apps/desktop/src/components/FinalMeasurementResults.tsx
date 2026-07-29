@@ -1,0 +1,176 @@
+import { useId } from "react";
+import type { Messages } from "../i18n";
+import {
+  formatMetric,
+  type LiveDesignSummary,
+  type LiveExportSummary,
+  type LiveVerificationSummary,
+} from "../lib/liveMeasurement";
+import { MeasuredFrequencyResponseChart } from "./MeasuredFrequencyResponseChart";
+
+type Props = {
+  copy: Messages["liveMeasurement"];
+  chartCopy: Messages["chart"];
+  design: LiveDesignSummary;
+  verification: LiveVerificationSummary;
+  exported: LiveExportSummary | null;
+};
+
+function changeSummary(
+  raw: number,
+  verified: number,
+  copy: Messages["liveMeasurement"]["resultAnalysis"],
+): string {
+  if (
+    !Number.isFinite(raw) ||
+    !Number.isFinite(verified) ||
+    raw <= Number.EPSILON
+  ) {
+    return "—";
+  }
+  const percentage = (Math.abs(raw - verified) / raw) * 100;
+  const template = verified <= raw ? copy.improvement : copy.regression;
+  return template.replace("{percent}", percentage.toFixed(1));
+}
+
+export function FinalMeasurementResults({
+  copy,
+  chartCopy,
+  design,
+  verification,
+  exported,
+}: Props) {
+  const headingId = useId();
+  const resultCopy = copy.resultAnalysis;
+
+  return (
+    <section className="final-measurement-results" aria-labelledby={headingId}>
+      <header className="final-measurement-results__header">
+        <div>
+          <p className="eyebrow">{resultCopy.eyebrow}</p>
+          <h3 id={headingId}>{resultCopy.title}</h3>
+          <p>{resultCopy.body}</p>
+        </div>
+        <span>
+          <i aria-hidden="true">✓</i>
+          {resultCopy.measuredBadge}
+        </span>
+      </header>
+
+      <section
+        className="final-result-metrics"
+        aria-labelledby={`${headingId}-metrics`}
+      >
+        <h4 id={`${headingId}-metrics`}>{resultCopy.keyMetrics}</h4>
+        <div className="final-result-metrics__grid">
+          <article>
+            <span>L</span>
+            <div>
+              <strong>{resultCopy.leftResponse}</strong>
+              <p>
+                {formatMetric(verification.leftRawRmseDb, "dB", 3)}
+                <i aria-hidden="true">→</i>
+                {formatMetric(verification.leftVerifiedRmseDb, "dB", 3)}
+              </p>
+              <small>
+                {changeSummary(
+                  verification.leftRawRmseDb,
+                  verification.leftVerifiedRmseDb,
+                  resultCopy,
+                )}
+              </small>
+            </div>
+          </article>
+          <article>
+            <span>R</span>
+            <div>
+              <strong>{resultCopy.rightResponse}</strong>
+              <p>
+                {formatMetric(verification.rightRawRmseDb, "dB", 3)}
+                <i aria-hidden="true">→</i>
+                {formatMetric(verification.rightVerifiedRmseDb, "dB", 3)}
+              </p>
+              <small>
+                {changeSummary(
+                  verification.rightRawRmseDb,
+                  verification.rightVerifiedRmseDb,
+                  resultCopy,
+                )}
+              </small>
+            </div>
+          </article>
+          <article>
+            <span aria-hidden="true">≈</span>
+            <div>
+              <strong>{resultCopy.predictionAgreement}</strong>
+              <p>
+                L {formatMetric(verification.leftPredictedVerifiedRmseDb, "dB", 3)}
+                <i aria-hidden="true">·</i>
+                R {formatMetric(verification.rightPredictedVerifiedRmseDb, "dB", 3)}
+              </p>
+              <small>
+                ≤{" "}
+                {formatMetric(
+                  verification.maximumAllowedPredictedVerifiedRmseDb,
+                  "dB",
+                  1,
+                )}
+              </small>
+            </div>
+          </article>
+          <article>
+            <span aria-hidden="true">◇</span>
+            <div>
+              <strong>{resultCopy.filterSafety}</strong>
+              <p>
+                −{formatMetric(design.maximumAttenuationDb, "dB", 2)}
+                <i aria-hidden="true">/</i>+
+                {formatMetric(design.maximumBoostDb, "dB", 2)}
+              </p>
+              <small>
+                {design.protectedDipsPassed
+                  ? resultCopy.protectedDipsPassed
+                  : resultCopy.protectedDipsFailed}
+              </small>
+            </div>
+          </article>
+          <article>
+            <span aria-hidden="true">P</span>
+            <div>
+              <strong>{copy.positionsUsed}</strong>
+              <p>{design.positionCount}</p>
+              <small>
+                {resultCopy.measuredPositions.replace(
+                  "{count}",
+                  design.positionCount.toString(),
+                )}
+              </small>
+            </div>
+          </article>
+          <article>
+            <span aria-hidden="true">dB</span>
+            <div>
+              <strong>{copy.headroom}</strong>
+              <p>
+                {exported
+                  ? formatMetric(exported.recommendedHeadroomDb, "dB", 1)
+                  : "—"}
+              </p>
+              <small>
+                {exported
+                  ? `${copy.nativeRates}: ${exported.nativeRateCount}`
+                  : resultCopy.exportPending}
+              </small>
+            </div>
+          </article>
+        </div>
+        <p className="final-result-metrics__note">{resultCopy.evidenceNote}</p>
+      </section>
+
+      <MeasuredFrequencyResponseChart
+        copy={chartCopy}
+        data={verification.frequencyResponse}
+      />
+    </section>
+  );
+}

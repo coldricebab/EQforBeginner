@@ -1,0 +1,19 @@
+[package]
+name = "eqforbeginner-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Deterministic Phase 1, Phase 3, offline Phase 4 and Phase 5 shadow harness for EQforBeginner"
+
+[dependencies]
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+eqforbeginner-dsp-core = { path = "../dsp-core" }
+eqforbeginner-export = { path = "../export" }
+tempfile = "3"
+
+[lints]
+workspace = true

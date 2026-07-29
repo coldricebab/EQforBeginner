@@ -1,0 +1,17 @@
+[package]
+name = "eqforbeginner-dsp-core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+description = "Deterministic offline DSP core for limited-band multi-position room correction"
+
+[dependencies]
+rustfft = "6.2"
+serde = { version = "1.0", features = ["derive"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"

@@ -1,0 +1,2 @@
+# Development-only converter dependency; not used by the Rust app or CLI runtime.
+javaobj-py3==0.5.0

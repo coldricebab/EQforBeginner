@@ -1,0 +1,565 @@
+export type Locale = "ko" | "en";
+
+export type StepMessage = {
+  short: string;
+  title: string;
+  description: string;
+  tip: string;
+};
+
+export type Messages = {
+  meta: {
+    language: string;
+    languageName: string;
+    skipToContent: string;
+  };
+  brand: {
+    name: string;
+    tagline: string;
+    privacy: string;
+  };
+  status: {
+    shell: string;
+    liveReady: string;
+    liveReadyBody: string;
+    notConnected: string;
+    notConnectedBody: string;
+    synthetic: string;
+    syntheticBody: string;
+    offline: string;
+    locked: string;
+    ready: string;
+    pending: string;
+    measured: string;
+  };
+  wizard: {
+    label: string;
+    step: string;
+    of: string;
+    current: string;
+    completed: string;
+    upcoming: string;
+    previous: string;
+    next: string;
+    steps: StepMessage[];
+  };
+  project: {
+    heading: string;
+    body: string;
+    stereo: string;
+    stereoBody: string;
+    sub: string;
+    subBody: string;
+    signal: string;
+    signalBody: string;
+  };
+  connect: {
+    heading: string;
+    body: string;
+    output: string;
+    microphone: string;
+    calibration: string;
+    sampleRate: string;
+    chooseFile: string;
+    fixedRate: string;
+    scan: string;
+    scanning: string;
+    scanFirst: string;
+    scanComplete: string;
+    nativeShellRequired: string;
+    scanFailed: string;
+    noCompatible: string;
+    defaultDevice: string;
+    channels: string;
+    scanWarnings: string;
+    discoveryOnly: string;
+  };
+  level: {
+    heading: string;
+    body: string;
+    noise: string;
+    input: string;
+    playback: string;
+    waiting: string;
+    start: string;
+    safety: string;
+  };
+  center: {
+    heading: string;
+    body: string;
+    left: string;
+    right: string;
+    timing: string;
+    start: string;
+  };
+  sub: {
+    heading: string;
+    body: string;
+    manual: string;
+    manualBody: string;
+    crossover: string;
+    delay: string;
+    polarity: string;
+    level: string;
+    disclaimer: string;
+  };
+  multipoint: {
+    heading: string;
+    body: string;
+    center: string;
+    repeat: string;
+    position: string;
+    weight: string;
+    none: string;
+    overfit: string;
+  };
+  target: {
+    heading: string;
+    body: string;
+    bk: string;
+    bkBody: string;
+    harman: string;
+    harmanBody: string;
+    custom: string;
+    customBody: string;
+    import: string;
+    align: string;
+  };
+  analysis: {
+    heading: string;
+    body: string;
+    cutOnly: string;
+    protected: string;
+    protectedBody: string;
+    corrected: string;
+    correctedBody: string;
+    band: string;
+    bandValue: string;
+    maxCut: string;
+    maxCutValue: string;
+    headroom: string;
+    estimate: string;
+    demoOnly: string;
+  };
+  verify: {
+    heading: string;
+    body: string;
+    required: string;
+    checklist: string[];
+    start: string;
+  };
+  export: {
+    heading: string;
+    body: string;
+    blocked: string;
+    package: string;
+    rates: string;
+    manifest: string;
+    readme: string;
+    button: string;
+  };
+  chart: {
+    heading: string;
+    subheading: string;
+    typeLabel: string;
+    channelLabel: string;
+    raw: string;
+    target: string;
+    predicted: string;
+    verified: string;
+    left: string;
+    right: string;
+    spatial: string;
+    zoom: string;
+    full: string;
+    xAxis: string;
+    yAxis: string;
+    unavailable: string;
+    protectedDip: string;
+    correctedPeak: string;
+    measurementError: string;
+    markersLabel: string;
+    accessibleDescription: string;
+    displaySmoothing: string;
+    scopeNote: string;
+  };
+  wirelessSweep: {
+    eyebrow: string;
+    title: string;
+    body: string;
+    chooseTitle: string;
+    chooseBody: string;
+    chooseButton: string;
+    importing: string;
+    armTitle: string;
+    armBody: string;
+    microphone: string;
+    noMicrophone: string;
+    armButton: string;
+    listeningButton: string;
+    cancelButton: string;
+    playTitle: string;
+    playBody: string;
+    playChecklist: string[];
+    referenceSummary: string;
+    file: string;
+    format: string;
+    duration: string;
+    referenceChannel: string;
+    filePeak: string;
+    sweepCheck: string;
+    sweepLike: string;
+    sweepUncertain: string;
+    referenceChannels: Record<
+      "mono" | "left" | "right" | "identical_stereo",
+      string
+    >;
+    status: Record<
+      | "empty"
+      | "importing"
+      | "ready"
+      | "listening"
+      | "detected"
+      | "not_detected"
+      | "ambiguous"
+      | "error",
+      string
+    >;
+    listeningTitle: string;
+    listeningBody: string;
+    resultTitles: Record<"detected" | "not_detected" | "ambiguous", string>;
+    resultBodies: Record<"detected" | "not_detected" | "ambiguous", string>;
+    detectedStart: string;
+    confidence: string;
+    confidenceMargin: string;
+    clockDrift: string;
+    inputPeak: string;
+    clippedSamples: string;
+    streamWarning: string;
+    qualityWarning: string;
+    boundary: string;
+    errors: {
+      wavOnly: string;
+      fileTooLarge: string;
+      nativeOnly: string;
+    };
+  };
+  liveMeasurement: {
+    eyebrow: string;
+    title: string;
+    body: string;
+    badge: string;
+    stageNavigation: string;
+    stageProgress: string;
+    previousStage: string;
+    nextStage: string;
+    manualTitle: string;
+    manualBody: string;
+    sessionTitle: string;
+    sessionBody: string;
+    systemTypeTitle: string;
+    systemTypeRequired: string;
+    systemLabels: Record<"stereo_2_0" | "single_sub_2_1", string>;
+    systemBodies: Record<"stereo_2_0" | "single_sub_2_1", string>;
+    selectedSystem: string;
+    startSession: string;
+    startingSession: string;
+    sessionId: string;
+    outputDirectory: string;
+    inputsTitle: string;
+    inputsBody: string;
+    microphoneTitle: string;
+    microphoneBody: string;
+    selectMicrophone: string;
+    inputChannel: string;
+    defaultMicrophone: string;
+    inputOnlyNotice: string;
+    nativeScanOnly: string;
+    scanFailed: string;
+    calibrationTitle: string;
+    calibrationBody: string;
+    chooseCalibration: string;
+    importingCalibration: string;
+    calibrationReady: string;
+    calibrationSerial: string;
+    sweepTitles: Record<"left" | "right", string>;
+    sweepBody: string;
+    chooseSweep: string;
+    importingSweep: string;
+    sweepReady: string;
+    sweepMarkerWarning: string;
+    sweepChannelAnalysisTitle: string;
+    sweepSignalLabels: Record<"measurement" | "start" | "end", string>;
+    sweepChannelLabels: Record<
+      "mono" | "left" | "right" | "identical_stereo",
+      string
+    >;
+    sweepChannelUnknown: string;
+    sweepChannelDominance: string;
+    subwooferTitle: string;
+    subwooferBody: string;
+    subwooferScopeTitle: string;
+    subwooferScopeBody: string;
+  subwooferCandidateCountHint: string;
+  subwooferDelayAxisNote: string;
+    subwooferChecklist: string[];
+    subwooferSearch: {
+      title: string;
+      body: string;
+      crossoverCandidates: string;
+      crossoverCandidatesHint: string;
+      measuredSettings: string;
+      measuredSettingsHint: string;
+      delayMinimum: string;
+      delayMaximum: string;
+      delayStep: string;
+      savePlan: string;
+      savingPlan: string;
+      planSaved: string;
+      planPath: string;
+      timingReference: string;
+      subSweep: string;
+      measurementsTitle: string;
+      measurementsBody: string;
+      safetyChecklist: string[];
+      candidateTitle: string;
+      mainOnlyLeft: string;
+      mainOnlyRight: string;
+      subOnly: string;
+      subOnlyRoute: string;
+      tripletProgress: string;
+      optimize: string;
+      optimizing: string;
+      predictionTitle: string;
+      predictionBody: string;
+      lowerScoreBetter: string;
+      rank: string;
+      score: string;
+      rmsDeficit: string;
+      p95Deficit: string;
+      worstDeficit: string;
+      scoringBand: string;
+      candidateCount: string;
+      subLevelAdvisory: string;
+      reportPath: string;
+      applyTitle: string;
+      applyBody: string;
+    };
+    crossoverHz: string;
+    mainDelayMs: string;
+    polarityDegrees: string;
+    subLevelDb: string;
+    hardwareConfirmation: string;
+    saveSubwooferSetup: string;
+    savingSubwooferSetup: string;
+    subwooferSetupSaved: string;
+    subwooferSettingsPath: string;
+    subwooferSetupLimits: string;
+    restoreAcceptedMeasurements: string;
+    restoringAcceptedMeasurements: string;
+    restoredAcceptedMeasurements: string;
+    noAcceptedMeasurementsToRestore: string;
+    restoredMeasurementSource: string;
+    restoredMeasurementSources: string;
+    cachedMeasurementBadge: string;
+    timestampDiagnostic: string;
+    baselineTitle: string;
+    baselineBody: string;
+    baselineBody21: string;
+    selectedMicrophone: string;
+    noMicrophone: string;
+    scanMicrophones: string;
+    scanningMicrophones: string;
+    rawRoonChecklist: string[];
+    rawRoonChecklist21: string[];
+    position: string;
+    positionLabels: Record<
+      "P0" | "P1" | "P2" | "P3" | "P4" | "P5" | "P0_END",
+      string
+    >;
+    positionDetails: Record<
+      "P0" | "P1" | "P2" | "P3" | "P4" | "P5" | "P0_END",
+      string
+    >;
+    positionGuide: {
+      title: string;
+      body: string;
+      diagramLabel: string;
+      speakers: string;
+      listeningArea: string;
+      topView: string;
+      sideView: string;
+      floor: string;
+      earHeight: string;
+      microphone: string;
+      note: string;
+    };
+    channelLabels: Record<"left" | "right", string>;
+    pairProgress: string;
+    pending: string;
+    listening: string;
+    accepted: string;
+    rejected: string;
+    startCapture: string;
+    retryCapture: string;
+    cancelCapture: string;
+    captureActive: string;
+    captureActiveBody: string;
+    capturePhases: Record<
+      | "waiting_for_start"
+      | "start_marker_detected"
+      | "measuring_sweep"
+      | "end_marker_detected"
+      | "saving_measurement",
+      string
+    >;
+    levelStatuses: Record<
+      "waiting" | "too_low" | "good" | "high" | "clipping",
+      string
+    >;
+    levelGuidance: Record<
+      "waiting" | "too_low" | "good" | "high" | "clipping",
+      string
+    >;
+    startMarker: string;
+    endMarker: string;
+    markerDetected: string;
+    markerWaiting: string;
+    automaticSaveNotice: string;
+    levelMeterTitle: string;
+    levelPeak: string;
+    levelRms: string;
+    reconstructionFit: string;
+    reconstructionFitAdvisory: string;
+    estimatedSpl: string;
+    estimatedSplUnavailable: string;
+    estimatedSplNote: string;
+    recommendedLevel: string;
+    captureIssueGuidance: {
+      clipping: string;
+      noise: string;
+      interrupted: string;
+      incomplete: string;
+      reconstruction: string;
+      unstable: string;
+      generic: string;
+    };
+    designTitle: string;
+    designBody: string;
+    selectedTarget: string;
+    targetLabels: Record<"bk" | "harman" | "custom", string>;
+    importCustomTarget: string;
+    importingTarget: string;
+    customTargetReady: string;
+    customTargetRequired: string;
+    customTargetFormat: string;
+    customTargetCoverageWarning: string;
+    incompleteBaselineWarning: string;
+    designButton: string;
+    designing: string;
+    trialReady: string;
+    positionsUsed: string;
+    leftRmse: string;
+    rightRmse: string;
+    maximumCut: string;
+    maximumBoost: string;
+    predictedImprovement: string;
+    smallImprovementAdvisory: string;
+    trialZip: string;
+    trialWav: string;
+    downloadTrialZip: string;
+    downloadFinalZip: string;
+    savingZip: string;
+    zipSaved: string;
+    predictedOnly: string;
+    trialChecklist: string[];
+    trialDeclaration: string;
+    verifyTitle: string;
+    verifyBody: string;
+    validateButton: string;
+    validating: string;
+    verificationPassed: string;
+    verificationFailed: string;
+    leftVerifiedRmse: string;
+    rightVerifiedRmse: string;
+    leftPredictionGap: string;
+    rightPredictionGap: string;
+    leftImprovementGate: string;
+    rightImprovementGate: string;
+    verificationRetryTitle: string;
+    verificationRetrySteps: string[];
+    exportTitle: string;
+    exportBody: string;
+    exportButton: string;
+    exporting: string;
+    exportReady: string;
+    finalZip: string;
+    projectFile: string;
+    headroom: string;
+    firPeakBound: string;
+    finalBindingMagnitude: string;
+    finalBindingGroupDelay: string;
+    nativeRates: string;
+    resultAnalysis: {
+      eyebrow: string;
+      title: string;
+      body: string;
+      measuredBadge: string;
+      keyMetrics: string;
+      leftResponse: string;
+      rightResponse: string;
+      rawToVerified: string;
+      improvement: string;
+      regression: string;
+      predictionAgreement: string;
+      filterSafety: string;
+      protectedDipsPassed: string;
+      protectedDipsFailed: string;
+      measuredPositions: string;
+      exportPending: string;
+      evidenceNote: string;
+    };
+    errorTitle: string;
+    boundary: string;
+    errors: {
+      nativeOnly: string;
+      startFirst: string;
+      calibrationTooLarge: string;
+      targetTxtOnly: string;
+      targetTooLarge: string;
+      wavOnly: string;
+      sweepTooLarge: string;
+    };
+  };
+  developer: {
+    eyebrow: string;
+    title: string;
+    body: string;
+    developerOnly: string;
+    workspace: string;
+    workspacePlaceholder: string;
+    preflight: string;
+    preflighting: string;
+    runPipeline: string;
+    runningPipeline: string;
+    nativeOnly: string;
+    measurementDisconnected: string;
+    measurementDisconnectedBody: string;
+    phaseLabels: Record<"phase3" | "phase4" | "phase6", string>;
+    idle: string;
+    running: string;
+    passed: string;
+    blocked: string;
+    failed: string;
+    available: string;
+    unavailable: string;
+    output: string;
+    artifacts: string;
+    logs: string;
+    noRun: string;
+    exportLocked: string;
+    exportUnlocked: string;
+    exportButton: string;
+    stopped: string;
+  };
+};

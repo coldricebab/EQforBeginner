@@ -1,0 +1,37 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  desktop-and-dsp:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Install desktop dependencies
+        run: npm ci --prefix apps/desktop
+      - name: Test desktop frontend
+        run: npm test --prefix apps/desktop
+      - name: Build desktop frontend
+        run: npm run build --prefix apps/desktop
+      - name: Test Rust workspace
+        run: cargo test --workspace --all-targets
+      - name: Check Rust formatting
+        run: cargo fmt --all --check
+      - name: Lint Rust workspace
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Check Tauri shell
+        run: cargo check -p eqforbeginner-desktop

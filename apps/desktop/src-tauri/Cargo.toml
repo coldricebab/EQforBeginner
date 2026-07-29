@@ -1,0 +1,32 @@
+[package]
+name = "eqforbeginner-desktop"
+version.workspace = true
+description = "Guided 2.0 and 2.1 room-correction desktop shell"
+authors = ["EQforBeginner contributors"]
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "eqforbeginner_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "=2.6.3", features = [] }
+
+[dependencies]
+hound = "3.5.1"
+rustfft = "6.2"
+sha2 = "0.10"
+eqforbeginner-audio-io = { path = "../../../crates/audio-io" }
+eqforbeginner-cli = { path = "../../../crates/dsp-cli" }
+eqforbeginner-dsp-core = { path = "../../../crates/dsp-core" }
+eqforbeginner-export = { path = "../../../crates/export" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tauri = { version = "=2.11.5", features = [] }
+tempfile = "3.20"
+tauri-plugin-dialog = "=2.7.2"
+
+[lints]
+workspace = true
