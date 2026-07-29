@@ -11,8 +11,8 @@
 [다운로드 링크 Windows]
 [다운로드 링크 Mac]
 
-[L 스윕 다운로드 링크]
-[R 스윕 다운로드 링크]
+[L 스윕 다운로드 링크](https://drive.google.com/file/d/1oUExSKQPChtX7unysMLhCc10M9hqM8DW/view?usp=sharing)
+[R 스윕 다운로드 링크](https://drive.google.com/file/d/1FIxWwctuwBQ99odKo2pj-PBXEp3CO1Ce/view?usp=sharing)
 
 ### 0 - 측정 전 준비물
 
