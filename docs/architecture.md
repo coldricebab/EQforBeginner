@@ -387,6 +387,16 @@ until a Windows runner is available.
 
 ## License policy
 
+The SECS advanced option is a port of SECS by 한플 (Hanpeul), published on the
+DCInside speaker gallery (https://gall.dcinside.com/mgallery/board/view/?id=speakers&no=514096&s_type=search_name&s_keyword=%ED%95%9C%ED%94%8C&page=1).
+The original author granted this project permission to modify and improve the
+work and asked for a credit link; that permission is not a statement that the
+upstream program carries an open-source license, and the upstream ships no
+license text. `THIRD-PARTY-NOTICES.md` records the grant, the credit, and the
+boundary between the original design and this project's additions. Anyone
+reusing `crates/dsp-core/src/secs.rs` beyond what this project's MIT license
+can convey should contact the original author.
+
 Project source is MIT. Every runtime dependency must be compatible with commercial
 desktop distribution (MIT, BSD, ISC, Zlib, or Apache-2.0 preferred). CPAL and Tauri
 are MIT/Apache-family licensed; direct `base64` 0.22 fixture decoding and `sha2`

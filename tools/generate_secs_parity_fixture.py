@@ -1,5 +1,12 @@
 """Generate the SECS parity fixture (`testdata/secs-parity.json`).
 
+The reference program is SECS by 한플 (Hanpeul), published on the DCInside
+speaker gallery:
+https://gall.dcinside.com/mgallery/board/view/?id=speakers&no=514096&s_type=search_name&s_keyword=%ED%95%9C%ED%94%8C&page=1
+Used with the original author's permission; see THIRD-PARTY-NOTICES.md. This
+script only reads a developer-local copy of that program - no upstream source
+is redistributed in this repository.
+
 Developer-local prerequisites (matches the other tools/ extractors):
 - `debugfiles/SECS.py` must exist (the upstream SECS snapshot; gitignored).
 - numpy + scipy, e.g. `python3 -m venv .venv && .venv/bin/pip install numpy scipy`.

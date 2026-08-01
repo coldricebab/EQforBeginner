@@ -598,6 +598,9 @@ export const en: Messages = {
     secsToggleLabel: "Use the SECS correction method (experimental)",
     secsToggleNote:
       "SECS is an open-source single-point algorithm ported with the original author's permission. It designs a full-band mixed-phase filter from the central P0 measurement only, ignoring the other seats and their safety limits (protected dips, bounded boost). The trial is predicted-only until you declare it active in Roon and pass the same P0 L/R closed-loop verification as the main path (judged 20-650 Hz on smoothed curves, so a small microphone reposition is tolerated). Final export then ships per-rate SECS redesigns bound to the verified 48 kHz filter.",
+    secsCredit:
+      "SECS was created by 한플 (Hanpeul) and is used here with the author's permission. Multi-position averaging, target-curve following, the 2.1 shared sub band, verification and export are this app's additions, not the original design.",
+    secsCreditLink: "View the original",
     secsDesigning: "Running the SECS design…",
     secsTrialReady: "SECS trial filter created (predicted-only)",
     secsAutoDelay: "Automatic target delay",

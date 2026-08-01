@@ -255,6 +255,10 @@ export type LiveDesignSummary = {
   warning: string;
 };
 
+/** Original SECS by 한플 (Hanpeul); credit link requested by the author. */
+export const SECS_ORIGINAL_URL =
+  "https://gall.dcinside.com/mgallery/board/view/?id=speakers&no=514096&s_type=search_name&s_keyword=%ED%95%9C%ED%94%8C&page=1";
+
 export type LiveSecsResolution = "low" | "normal" | "high";
 export type LiveSecsLatencyMode = "normal" | "low" | "zero";
 /** App target curve the SECS correction steers toward; "flat" keeps the

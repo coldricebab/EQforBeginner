@@ -19,8 +19,11 @@ intentionally absent rather than hidden behind a mock.
 | 4 — closed-loop verification | Partial, live gate implemented | The live adapter reuses the bounded-gain / minimum-phase / protected-dip / spatial design with B&K-style, Harman-style, or imported custom targets, emits a predicted-only trial ZIP, and requires new accepted P0 L/R captures made after the user declares that exact trial active in Roon. `live-closed-loop-validation-v4` judges improvement on 1/12-octave-smoothed curves scored as the RMS of per-octave-cell RMSE, keeps a ≤3 dB smoothed predicted-versus-verified agreement gate over 20–650 Hz, fits an applied-correction scale to catch an unloaded or doubled filter, and retains the unsmoothed residual as a diagnostic. A failure guides redesign and reverification instead of shipping. Automatic L/R swap detection is absent. |
 | 5 — Roon package | Partial, verified-live export implemented | A project whose closed loop passes can run the native-rate redesign, response-bind its final 48 kHz member to the verified trial (0.05 dB / 0.02 ms), write and read back the six-rate minimum-phase Roon ZIP, persist a final project record and hash, and calculate bounded headroom. Trial and final stages expose native save dialogs that revalidate and byte-check only the current session's package. Windows execution, installer validation, Developer ID signing, and notarization are absent. |
 
-An experimental **SECS advanced option** (an open-source single-point full-band
-algorithm ported with its author's permission, `secs-port-v1`) can design a
+An experimental **SECS advanced option** (`secs-port-v1`) - a port of SECS by
+한플 (Hanpeul), published on the DCInside speaker gallery
+([original](https://gall.dcinside.com/mgallery/board/view/?id=speakers&no=514096&s_type=search_name&s_keyword=%ED%95%9C%ED%94%8C&page=1)),
+used with the original author's permission and credited per
+`THIRD-PARTY-NOTICES.md` - can design a
 full-band mixed-phase trial from the accepted central P0 pair, deliberately
 bypassing the multi-seat safety design. The SECS.py control set (boost
 ceiling, tilt, bass shelf, resolution, curtain, latency mode, fixed or

@@ -26,6 +26,7 @@ import {
   type LiveCaptureSummary,
   type LiveChannel,
   SECS_DEFAULT_SETTINGS,
+  SECS_ORIGINAL_URL,
   type LiveDesignSummary,
   type LiveExportSummary,
   type LiveSecsDesignSettings,
@@ -1700,6 +1701,17 @@ export function LiveMeasurementPanel({
             <span>{copy.secsToggleLabel}</span>
           </label>
           <p className="live-warning">{copy.secsToggleNote}</p>
+          {/* Credit requested by the original author of SECS. */}
+          <p className="live-secs-credit">
+            {copy.secsCredit}{" "}
+            <a
+              href={SECS_ORIGINAL_URL}
+              target="_blank"
+              rel="noreferrer noopener"
+            >
+              {copy.secsCreditLink}
+            </a>
+          </p>
           {secsMode && (
             <fieldset className="live-secs-settings" disabled={busy !== null}>
               <legend>{copy.secsSettingsTitle}</legend>

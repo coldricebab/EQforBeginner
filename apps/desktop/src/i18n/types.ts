@@ -479,6 +479,8 @@ export type Messages = {
     secsAdvancedTitle: string;
     secsToggleLabel: string;
     secsToggleNote: string;
+    secsCredit: string;
+    secsCreditLink: string;
     secsDesigning: string;
     secsTrialReady: string;
     secsAutoDelay: string;

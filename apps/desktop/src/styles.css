@@ -3269,6 +3269,8 @@ h3 {
 .live-result--failed { border-color: #765052; background: #301c20; }
 .live-result--warning { border-color: #77683f; background: #2b2413; }
 .live-secs-skip-verification { margin-top: 0.75rem; }
+.live-secs-credit { margin: 0.35rem 0 0; font-size: 0.85rem; color: #9aa4bd; }
+.live-secs-credit a { color: #8fb6ff; }
 .live-result > strong { display: block; margin-bottom: 10px; font-size: 11px; }
 .live-result__heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
 .live-result__heading strong { font-size: 11px; }

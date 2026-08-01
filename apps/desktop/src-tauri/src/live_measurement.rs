@@ -7804,7 +7804,9 @@ impl LiveMeasurementState {
             "EQforBeginner {} developer-beta convolution (SECS advanced option)\n\
              Project: {}\n\
              Algorithm: {SECS_ALGORITHM_VERSION} - single-point (P0) full-band correction\n\
-             ported from the open-source SECS project.\n\
+             ported from SECS by 한플 (Hanpeul), used with the original author's\n\
+             permission. Original: https://gall.dcinside.com/mgallery/board/view/\n\
+             ?id=speakers&no=514096 - see THIRD-PARTY-NOTICES.md.\n\
              Correction: mixed phase (excess-phase inversion with per-band pre-ringing\n\
              limits) plus minimum-phase magnitude EQ toward an adaptive target;\n\
              designed from the central P0 pair only. Other seats are not part of\n\
@@ -11520,7 +11522,9 @@ impl LiveMeasurementState {
              Load this ZIP in one Roon convolution slot, keep volume and microphone gain\n\
              fixed, then perform the required P0 L/R verification measurements.\n\
              Algorithm: {SECS_ALGORITHM_VERSION} - single-point (P0) full-band correction\n\
-             ported from the open-source SECS project.\n\
+             ported from SECS by 한플 (Hanpeul), used with the original author's\n\
+             permission. Original: https://gall.dcinside.com/mgallery/board/view/\n\
+             ?id=speakers&no=514096 - see THIRD-PARTY-NOTICES.md.\n\
              Correction: mixed phase (excess-phase inversion with per-band pre-ringing\n\
              limits) plus minimum-phase magnitude EQ toward an adaptive target.\n\
              Settings: boost cap +{:.1} dB, tilt {:.1} dB/oct, bass +{:.1} dB @ {:.0} Hz,\n\

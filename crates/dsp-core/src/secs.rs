@@ -1,9 +1,20 @@
-//! Port of the open-source SECS single-point room-correction algorithm.
+//! Port of the SECS single-point room-correction algorithm.
 //!
-//! Source: `debugfiles/SECS.py` (developer states the original author granted
-//! permission to adapt it). This module mirrors the Python DSP line by line so
-//! the two implementations can be held to a numerical parity fixture
-//! (`testdata/secs-parity.json`, generated from the Python reference).
+//! Original author: 한플 (Hanpeul). Original work: SECS, published on the
+//! DCInside speaker gallery:
+//! <https://gall.dcinside.com/mgallery/board/view/?id=speakers&no=514096&s_type=search_name&s_keyword=%ED%95%9C%ED%94%8C&page=1>
+//!
+//! The original author gave this project permission to modify and improve the
+//! work, asking that the original be credited with a link. See
+//! `THIRD-PARTY-NOTICES.md` for the scope of that permission and for which
+//! parts of this file are the original design versus this project's additions
+//! (multi-position averaging, the house-curve overlay, and the 2.1
+//! shared-sub-band commonization are ours, not the original author's).
+//!
+//! Ported from the developer-local upstream snapshot `debugfiles/SECS.py`.
+//! This module mirrors the Python DSP line by line so the two implementations
+//! can be held to a numerical parity fixture (`testdata/secs-parity.json`,
+//! generated from the Python reference).
 //!
 //! Scope and honesty boundaries:
 //! - Only the DSP is ported: per-channel precompute, filter synthesis, the
