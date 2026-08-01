@@ -580,7 +580,7 @@ export eligibility, and recommended headroom cannot be inferred.
 The live developer beta reuses `run_phase4_offline` rather than reimplementing the
 objective above. Accepted L/R capture pairs on the same frequency grid become measured
 positions. P0 has weight 2 by default; if P0_END is present, P0 and P0_END each have
-weight 1. P1-P5 each have weight 1. A trial requires at least an accepted P0 pair.
+weight 1. P1-P8 each have weight 1. A trial requires at least an accepted P0 pair.
 When both central pairs exist, let `m_c,p` be the median level over 200-500 Hz and
 remove it from each channel response. Trial design additionally requires
 
@@ -590,7 +590,7 @@ RMSE_20-500((L_c,P0_END - m_c,P0_END) - (L_c,P0 - m_c,P0)) <= 6.0 dB
 ```
 
 for both channels. The absolute level bound remains the session/gain stability check.
-The shape bound is intentionally loose because P0_END is returned by hand after P1-P5;
+The shape bound is intentionally loose because P0_END is returned by hand after P1-P8;
 it rejects only a gross path/location change and does not demand exact modal
 reproduction. This checks repeat level and coarse shape, not arrival-time repeatability.
 The live Phase 4 trial uses the existing native 48 kHz duration, 16,320 samples; the

@@ -131,8 +131,10 @@ Run this only in the native Tauri app; the browser preview cannot open the micro
    playback; that action rejects the capture. If either marker is never confirmed,
    cancel and retry from the exact beginning of the WAV. Follow the diagram in the
    wizard: P1 is 25-30 cm left of P0, P2 is
-   25-30 cm right, P3 is 20-25 cm toward the speakers, P4 is 20-25 cm behind P0, and
-   P5 is 10-15 cm directly above P0. Measure P0 L/R first, then preferably P1-P5, then
+   25-30 cm right, P3 is 20-25 cm toward the speakers, P4 is 20-25 cm behind P0,
+   P5 is 10-15 cm directly above P0, P6 is 25-30 cm diagonally behind-left of P0,
+   P7 is 25-30 cm diagonally behind-right of P0, and P8 is 10-15 cm directly below
+   P0. Measure P0 L/R first, then preferably P1-P8, then
    return approximately to the original listening-center area for P0_END L/R; jig-level
    replacement is not required. Stop immediately if the sweep is unexpectedly loud.
    With both central pairs present, design is blocked if either channel shifts by more
@@ -194,7 +196,7 @@ measurement path remains the only product measurement surface.
 1. Capture P0 center L and R separately through the normal bass-management path.
 2. Repeat P0 response evidence and reject unstable level or response shape. The current
    live gate does not qualify arrival timing.
-3. Capture P1-P5 around the listening region using the on-screen placement guide.
+3. Capture P1-P8 around the listening region using the on-screen placement guide.
 4. Allow inaccessible positions to be skipped, but never invent or mirror data.
 5. Repeat P0 at the end. The automatic gate invalidates excessive level or response-shape
    drift; timing and other suspected path changes remain human checks.

@@ -90,6 +90,13 @@ export function MeasuredFrequencyResponseChart({ copy, data }: Props) {
   const headingId = useId();
   const clipId = useId().replaceAll(":", "");
   const [fullBand, setFullBand] = useState(false);
+  // Predicted-only plots (SECS design before any remeasurement) carry empty
+  // verified curves; the verified toggle disappears rather than drawing an
+  // empty trace that could be mistaken for a measured result.
+  const hasVerified = data.verifiedLeftDb.length > 0;
+  const availableCurves = hasVerified
+    ? CURVES
+    : CURVES.filter((curve) => curve !== "verified");
   const [visibleCurves, setVisibleCurves] = useState<Record<CurveKind, boolean>>({
     raw: true,
     target: true,
@@ -113,7 +120,7 @@ export function MeasuredFrequencyResponseChart({ copy, data }: Props) {
     : data.correctionHighHz;
   const activeSeries = useMemo(
     () =>
-      CURVES.flatMap((curve) =>
+      availableCurves.flatMap((curve) =>
         CHANNELS.filter(
           (channel) => visibleCurves[curve] && visibleChannels[channel],
         ).map((channel) => ({
@@ -122,7 +129,7 @@ export function MeasuredFrequencyResponseChart({ copy, data }: Props) {
           values: series(data, curve, channel),
         })),
       ),
-    [data, visibleChannels, visibleCurves],
+    [availableCurves, data, visibleChannels, visibleCurves],
   );
   const visibleLevels = activeSeries.flatMap(({ values }) =>
     values.filter(
@@ -215,7 +222,7 @@ export function MeasuredFrequencyResponseChart({ copy, data }: Props) {
         <fieldset>
           <legend>{copy.typeLabel}</legend>
           <div className="toggle-row">
-            {CURVES.map((curve) => (
+            {availableCurves.map((curve) => (
               <label className={`plot-toggle plot-toggle--${curve}`} key={curve}>
                 <input
                   type="checkbox"

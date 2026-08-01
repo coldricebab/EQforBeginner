@@ -356,6 +356,17 @@ async fn design_live_trial_filter(
 }
 
 #[tauri::command]
+async fn design_live_secs_trial_filter(
+    settings: live_measurement::LiveSecsDesignSettings,
+    state: tauri::State<'_, Arc<live_measurement::LiveMeasurementState>>,
+) -> Result<live_measurement::LiveSecsDesignSummary, String> {
+    let state = Arc::clone(&state);
+    tauri::async_runtime::spawn_blocking(move || state.design_secs_trial(settings))
+        .await
+        .map_err(|error| format!("live SECS design worker failed: {error}"))?
+}
+
+#[tauri::command]
 async fn validate_live_closed_loop(
     state: tauri::State<'_, Arc<live_measurement::LiveMeasurementState>>,
 ) -> Result<live_measurement::LiveVerificationSummary, String> {
@@ -367,12 +378,20 @@ async fn validate_live_closed_loop(
 
 #[tauri::command]
 async fn export_live_roon_convolution(
+    skip_verification: Option<bool>,
     state: tauri::State<'_, Arc<live_measurement::LiveMeasurementState>>,
 ) -> Result<live_measurement::LiveExportSummary, String> {
     let state = Arc::clone(&state);
-    tauri::async_runtime::spawn_blocking(move || state.finalize_export())
-        .await
-        .map_err(|error| format!("live export worker failed: {error}"))?
+    let skip = skip_verification.unwrap_or(false);
+    tauri::async_runtime::spawn_blocking(move || {
+        if skip {
+            state.finalize_export_skipping_verification()
+        } else {
+            state.finalize_export()
+        }
+    })
+    .await
+    .map_err(|error| format!("live export worker failed: {error}"))?
 }
 
 #[tauri::command]
@@ -451,6 +470,7 @@ pub fn run() {
             restore_live_accepted_measurements,
             set_live_trial_activation,
             design_live_trial_filter,
+            design_live_secs_trial_filter,
             validate_live_closed_loop,
             export_live_roon_convolution,
             download_live_roon_zip,

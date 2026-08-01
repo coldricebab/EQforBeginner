@@ -54,4 +54,24 @@ describe("MeasuredFrequencyResponseChart", () => {
     expect(html).toContain("필터 적용 후 중앙 P0 재측정");
     expect(html).not.toContain("합성 예시");
   });
+
+  it("hides the verified toggle and trace on a predicted-only plot", () => {
+    const predictedOnly: LiveFrequencyResponsePlot = {
+      ...measuredPlotFixture,
+      verifiedLeftDb: [],
+      verifiedRightDb: [],
+      verifiedAverageDb: [],
+    };
+    const html = renderToStaticMarkup(
+      <MeasuredFrequencyResponseChart
+        copy={messages.ko.chart}
+        data={predictedOnly}
+      />,
+    );
+
+    expect(html).toContain("Raw");
+    expect(html).toContain("Predicted");
+    expect(html).not.toContain(">Verified<");
+    expect(html).not.toContain("trace--verified");
+  });
 });

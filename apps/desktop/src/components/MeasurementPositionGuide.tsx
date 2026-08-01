@@ -11,6 +11,9 @@ const SURROUND_POSITIONS: readonly LiveBaselinePosition[] = [
   "P3",
   "P4",
   "P5",
+  "P6",
+  "P7",
+  "P8",
 ];
 
 export function MeasurementPositionGuide({ copy }: Props) {
@@ -75,10 +78,14 @@ export function MeasurementPositionGuide({ copy }: Props) {
             <PositionPoint id="P2" x={315} y={190} />
             <PositionPoint id="P3" x={220} y={122} />
             <PositionPoint id="P4" x={220} y={258} />
+            <PositionPoint id="P6" x={150} y={250} />
+            <PositionPoint id="P7" x={290} y={250} />
             <line className="position-diagram__offset" x1="151" y1="190" x2="192" y2="190" />
             <line className="position-diagram__offset" x1="248" y1="190" x2="289" y2="190" />
             <line className="position-diagram__offset" x1="220" y1="148" x2="220" y2="162" />
             <line className="position-diagram__offset" x1="220" y1="218" x2="220" y2="232" />
+            <line className="position-diagram__offset" x1="199" y1="208" x2="171" y2="232" />
+            <line className="position-diagram__offset" x1="241" y1="208" x2="269" y2="232" />
           </g>
 
           <line className="position-diagram__divider" x1="440" y1="24" x2="440" y2="306" />
@@ -100,12 +107,21 @@ export function MeasurementPositionGuide({ copy }: Props) {
             <line className="position-diagram__stand" x1="590" y1="145" x2="590" y2="185" />
             <PositionPoint id="P0" x={590} y={185} primary />
             <PositionPoint id="P5" x={590} y={125} />
+            <PositionPoint id="P8" x={590} y={245} />
             <line
               className="position-diagram__height"
               x1="630"
               y1="176"
               x2="630"
               y2="134"
+              markerEnd="url(#position-guide-arrow)"
+            />
+            <line
+              className="position-diagram__height"
+              x1="630"
+              y1="194"
+              x2="630"
+              y2="236"
               markerEnd="url(#position-guide-arrow)"
             />
           </g>

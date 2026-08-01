@@ -4,6 +4,7 @@ import {
   formatMetric,
   type LiveDesignSummary,
   type LiveExportSummary,
+  type LiveSecsDesignSummary,
   type LiveVerificationSummary,
 } from "../lib/liveMeasurement";
 import { MeasuredFrequencyResponseChart } from "./MeasuredFrequencyResponseChart";
@@ -11,7 +12,10 @@ import { MeasuredFrequencyResponseChart } from "./MeasuredFrequencyResponseChart
 type Props = {
   copy: Messages["liveMeasurement"];
   chartCopy: Messages["chart"];
-  design: LiveDesignSummary;
+  /** Phase 4 design; null when the SECS advanced option produced the trial. */
+  design: LiveDesignSummary | null;
+  /** SECS design; null on the Phase 4 path. */
+  secsDesign?: LiveSecsDesignSummary | null;
   verification: LiveVerificationSummary;
   exported: LiveExportSummary | null;
 };
@@ -37,11 +41,13 @@ export function FinalMeasurementResults({
   copy,
   chartCopy,
   design,
+  secsDesign = null,
   verification,
   exported,
 }: Props) {
   const headingId = useId();
   const resultCopy = copy.resultAnalysis;
+  const positionCount = design?.positionCount ?? secsDesign?.positionCount ?? 0;
 
   return (
     <section className="final-measurement-results" aria-labelledby={headingId}>
@@ -122,27 +128,40 @@ export function FinalMeasurementResults({
             <span aria-hidden="true">◇</span>
             <div>
               <strong>{resultCopy.filterSafety}</strong>
-              <p>
-                −{formatMetric(design.maximumAttenuationDb, "dB", 2)}
-                <i aria-hidden="true">/</i>+
-                {formatMetric(design.maximumBoostDb, "dB", 2)}
-              </p>
-              <small>
-                {design.protectedDipsPassed
-                  ? resultCopy.protectedDipsPassed
-                  : resultCopy.protectedDipsFailed}
-              </small>
+              {design ? (
+                <>
+                  <p>
+                    −{formatMetric(design.maximumAttenuationDb, "dB", 2)}
+                    <i aria-hidden="true">/</i>+
+                    {formatMetric(design.maximumBoostDb, "dB", 2)}
+                  </p>
+                  <small>
+                    {design.protectedDipsPassed
+                      ? resultCopy.protectedDipsPassed
+                      : resultCopy.protectedDipsFailed}
+                  </small>
+                </>
+              ) : (
+                <>
+                  <p>
+                    +{formatMetric(secsDesign?.settings.maxBoostDb ?? 0, "dB", 1)}
+                    <i aria-hidden="true">/</i>
+                    {formatMetric(secsDesign?.preampDb ?? 0, "dB", 2)}
+                  </p>
+                  <small>{resultCopy.secsFilterNote}</small>
+                </>
+              )}
             </div>
           </article>
           <article>
             <span aria-hidden="true">P</span>
             <div>
               <strong>{copy.positionsUsed}</strong>
-              <p>{design.positionCount}</p>
+              <p>{positionCount}</p>
               <small>
                 {resultCopy.measuredPositions.replace(
                   "{count}",
-                  design.positionCount.toString(),
+                  positionCount.toString(),
                 )}
               </small>
             </div>

@@ -74,4 +74,56 @@ describe("localized wizard copy", () => {
       expect(copy.rightImprovementGate).toMatch(/옥타브|octave/i);
     }
   });
+
+  it("keeps the SECS advanced option honest in both locales", () => {
+    for (const locale of Object.values(messages)) {
+      const copy = locale.liveMeasurement;
+      // The toggle note must say the trial is predicted-only, that it designs
+      // from P0 alone, and that export requires the P0 closed-loop
+      // verification to pass first.
+      expect(copy.secsToggleNote).toMatch(/예측 전용|predicted-only/i);
+      expect(copy.secsToggleNote).toContain("P0");
+      expect(copy.secsToggleNote).toMatch(/검증|verification/i);
+      expect(copy.secsTrialReady).toMatch(/예측 전용|predicted-only/i);
+      expect(copy.secsToggleLabel).toMatch(/실험적|experimental/i);
+      // The verification-skip strings must carry the predicted-only state.
+      expect(copy.secsSkipVerificationNote).toMatch(/예측 전용|predicted-only/i);
+      expect(copy.exportUnverifiedWarning).toMatch(/예측 전용|predicted-only/i);
+      expect(copy.exportReadyUnverified).toMatch(/예측 전용|PREDICTED-ONLY/i);
+      // Every SECS parameter control must carry a label in both locales.
+      for (const key of [
+        "secsSettingsTitle",
+        "secsSettingsSummary",
+        "secsMaxBoost",
+        "secsTilt",
+        "secsBassBoost",
+        "secsBassFrequency",
+        "secsResolution",
+        "secsResolutionLow",
+        "secsResolutionNormal",
+        "secsResolutionHigh",
+        "secsCurtain",
+        "secsLatency",
+        "secsLatencyNormal",
+        "secsLatencyLow",
+        "secsLatencyZero",
+        "secsDelayMode",
+        "secsDelayAuto",
+        "secsDelayFixed",
+        "secsMultiPosition",
+        "secsFollowTarget",
+        "secsTargetCurve",
+        "secsTargetFlat",
+        "secsSharedSubBand",
+        "secsSharedSubBandValue",
+        "secsSkipVerification",
+        "secsSkipVerificationNote",
+        "secsSkipVerificationVerifyHint",
+        "exportReadyUnverified",
+        "exportUnverifiedWarning",
+      ] as const) {
+        expect(copy[key].trim()).not.toBe("");
+      }
+    }
+  });
 });

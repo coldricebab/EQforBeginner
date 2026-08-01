@@ -374,11 +374,29 @@ export type Messages = {
     rawRoonChecklist21: string[];
     position: string;
     positionLabels: Record<
-      "P0" | "P1" | "P2" | "P3" | "P4" | "P5" | "P0_END",
+      | "P0"
+      | "P1"
+      | "P2"
+      | "P3"
+      | "P4"
+      | "P5"
+      | "P6"
+      | "P7"
+      | "P8"
+      | "P0_END",
       string
     >;
     positionDetails: Record<
-      "P0" | "P1" | "P2" | "P3" | "P4" | "P5" | "P0_END",
+      | "P0"
+      | "P1"
+      | "P2"
+      | "P3"
+      | "P4"
+      | "P5"
+      | "P6"
+      | "P7"
+      | "P8"
+      | "P0_END",
       string
     >;
     positionGuide: {
@@ -458,6 +476,41 @@ export type Messages = {
     designButton: string;
     designing: string;
     trialReady: string;
+    secsAdvancedTitle: string;
+    secsToggleLabel: string;
+    secsToggleNote: string;
+    secsDesigning: string;
+    secsTrialReady: string;
+    secsAutoDelay: string;
+    secsLowCutoff: string;
+    secsHighCutoff: string;
+    secsPreamp: string;
+    secsBalanceTrim: string;
+    secsPhaseScore: string;
+    secsSettingsTitle: string;
+    secsSettingsSummary: string;
+    secsMaxBoost: string;
+    secsTilt: string;
+    secsBassBoost: string;
+    secsBassFrequency: string;
+    secsResolution: string;
+    secsResolutionLow: string;
+    secsResolutionNormal: string;
+    secsResolutionHigh: string;
+    secsCurtain: string;
+    secsLatency: string;
+    secsLatencyNormal: string;
+    secsLatencyLow: string;
+    secsLatencyZero: string;
+    secsDelayMode: string;
+    secsDelayAuto: string;
+    secsDelayFixed: string;
+    secsMultiPosition: string;
+    secsFollowTarget: string;
+    secsTargetCurve: string;
+    secsTargetFlat: string;
+    secsSharedSubBand: string;
+    secsSharedSubBandValue: string;
     positionsUsed: string;
     leftRmse: string;
     rightRmse: string;
@@ -493,6 +546,11 @@ export type Messages = {
     exportButton: string;
     exporting: string;
     exportReady: string;
+    exportReadyUnverified: string;
+    exportUnverifiedWarning: string;
+    secsSkipVerification: string;
+    secsSkipVerificationNote: string;
+    secsSkipVerificationVerifyHint: string;
     finalZip: string;
     projectFile: string;
     headroom: string;
@@ -515,6 +573,7 @@ export type Messages = {
       filterSafety: string;
       protectedDipsPassed: string;
       protectedDipsFailed: string;
+      secsFilterNote: string;
       measuredPositions: string;
       exportPending: string;
       evidenceNote: string;

@@ -27,7 +27,11 @@ use eqforbeginner_dsp_core::phase4::{
 };
 use eqforbeginner_dsp_core::phase6::{
     compare_stereo_filter_responses, design_native_rate_filters, native_fft_size, Phase6Config,
-    Phase6DesignIntent, Phase6NativeResult, PHASE6_ALGORITHM_VERSION,
+    Phase6DesignIntent, Phase6NativeResult, PHASE6_ALGORITHM_VERSION, ROON_NATIVE_SAMPLE_RATES,
+};
+use eqforbeginner_dsp_core::secs::{
+    design_secs_stereo_filter, secs_next_fast_len, secs_resample_poly, SecsConfig,
+    SecsResolutionMode, SECS_ALGORITHM_VERSION, SECS_AUTO_DELAY_MAX_MS, SECS_AUTO_DELAY_MIN_MS,
 };
 use eqforbeginner_dsp_core::smoothing::gaussian_log_frequency_smooth_at_db;
 use eqforbeginner_dsp_core::spatial::weighted_energy_average_db;
@@ -83,6 +87,10 @@ pub const LIVE_MEASUREMENT_PROJECT_VERSION: &str = "similarrew-live-project-v5";
 pub const LIVE_CLOSED_LOOP_VERSION: &str = "live-closed-loop-validation-v4";
 pub const LIVE_NATIVE_BINDING_VERSION: &str = "verified-trial-native48-response-binding-v1";
 pub const LIVE_HEADROOM_VERSION: &str = "validation-signal-and-response-peak-v3";
+/// SECS packages add a program-material peak-growth basis on top of v3: a
+/// full-band mixed-phase filter grows broadband time-domain peaks by several
+/// dB even at a ~0 dB response peak (see `secs_program_peak_growth_db`).
+pub const SECS_HEADROOM_VERSION: &str = "validation-signal-and-response-peak-v3+program-peak-v1";
 pub const LIVE_RESULT_PLOT_VERSION: &str = "measured-fr-result-plot-v2";
 pub const LIVE_RESULT_PLOT_SMOOTHING_FWHM_OCTAVES: f64 = 1.0 / 12.0;
 pub const LIVE_CAPTURE_ENDPOINT_VERSION: &str = "known-marker-capture-endpoint-v4";
@@ -560,6 +568,218 @@ pub struct LiveDesignSummary {
     pub warning: String,
 }
 
+/// User-adjustable SECS parameters, mirroring the SECS.py control panel.
+/// Defaults are the SECS.py "Flat" preset the stage-2 build hard-coded.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LiveSecsDesignSettings {
+    /// Magnitude-inversion boost ceiling, dB (SECS.py "Boost", 0-24).
+    pub max_boost_db: f64,
+    /// Spectral tilt, dB/octave (SECS.py "Tilt", -5..5).
+    pub tilt_db_per_octave: f64,
+    /// Bass-shelf boost, dB (SECS.py "Bass", 0-24).
+    pub bass_boost_db: f64,
+    /// Bass-shelf corner, Hz (SECS.py "dB @", 20-300).
+    pub bass_frequency_hz: f64,
+    /// Correction sharpness (SECS.py "Low Res"/"Normal"/"High Res").
+    pub resolution: LiveSecsResolution,
+    /// Minimum-phase curtain start, Hz (SECS.py "Curtain", 100-5000).
+    pub curtain_hz: f64,
+    /// Normal = mixed phase with target delay; Low/Zero = minimum phase only.
+    pub latency_mode: LiveSecsLatencyMode,
+    /// `None` runs the automatic 2-10 ms delay search; `Some` fixes it
+    /// (normal latency mode only).
+    pub fixed_delay_ms: Option<f64>,
+    /// Multi-position extension (not in SECS.py): feed the magnitude side of
+    /// the design a seat-weighted RMS average of every accepted baseline
+    /// position instead of P0 alone. The excess-phase correction and its
+    /// confidence guard always stay on the P0 pair. Falls back to P0-only
+    /// automatically when P0 is the only accepted seat.
+    pub multi_position: bool,
+    /// House-curve extension (not in SECS.py): which app target curve the
+    /// adaptive SECS target follows. `Flat` keeps the SECS-native flat base
+    /// ideal; the other values overlay the same curve set the Phase 4 design
+    /// offers, re-anchored to 0 dB at 500 Hz. Defaults to `Flat` so settings
+    /// stored before this field existed keep meaning what they ran.
+    #[serde(default)]
+    pub target_curve: LiveSecsTargetCurve,
+}
+
+impl Default for LiveSecsDesignSettings {
+    fn default() -> Self {
+        Self {
+            max_boost_db: 6.0,
+            tilt_db_per_octave: 0.0,
+            bass_boost_db: 0.0,
+            bass_frequency_hz: 80.0,
+            resolution: LiveSecsResolution::Normal,
+            curtain_hz: 300.0,
+            latency_mode: LiveSecsLatencyMode::Normal,
+            fixed_delay_ms: None,
+            multi_position: true,
+            target_curve: LiveSecsTargetCurve::Flat,
+        }
+    }
+}
+
+/// The app target curve a SECS design steers toward. Serialized names match
+/// the Phase 4 target selector values plus `flat` for the SECS-native target.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveSecsTargetCurve {
+    #[default]
+    Flat,
+    Bk,
+    Harman,
+    Custom,
+}
+
+impl LiveSecsTargetCurve {
+    /// Resolve to the overlay curve the dsp-core design takes; `Custom`
+    /// requires the session's imported target, exactly like Phase 4.
+    fn overlay(self, custom_target: Option<&TargetEntry>) -> Result<Option<TargetCurve>, String> {
+        Ok(match self {
+            Self::Flat => None,
+            Self::Bk => Some(TargetCurve::preset(TargetPreset::BkStyle)),
+            Self::Harman => Some(TargetCurve::preset(TargetPreset::HarmanStyle)),
+            Self::Custom => Some(target_from_name("custom", custom_target)?),
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveSecsResolution {
+    Low,
+    Normal,
+    High,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveSecsLatencyMode {
+    Normal,
+    Low,
+    Zero,
+}
+
+/// Range validation mirroring the SECS.py spin-box limits. Rejects instead of
+/// clamping so the stored provenance always shows what actually ran.
+fn validate_secs_settings(settings: &LiveSecsDesignSettings) -> Result<(), String> {
+    for (label, value) in [
+        ("maxBoostDb", settings.max_boost_db),
+        ("tiltDbPerOctave", settings.tilt_db_per_octave),
+        ("bassBoostDb", settings.bass_boost_db),
+        ("bassFrequencyHz", settings.bass_frequency_hz),
+        ("curtainHz", settings.curtain_hz),
+    ] {
+        if !value.is_finite() {
+            return Err(format!("SECS setting {label} must be finite"));
+        }
+    }
+    if !(0.0..=24.0).contains(&settings.max_boost_db) {
+        return Err("SECS boost ceiling must be between 0 and 24 dB".to_string());
+    }
+    if !(-5.0..=5.0).contains(&settings.tilt_db_per_octave) {
+        return Err("SECS tilt must be between -5 and +5 dB/octave".to_string());
+    }
+    if !(0.0..=24.0).contains(&settings.bass_boost_db) {
+        return Err("SECS bass boost must be between 0 and 24 dB".to_string());
+    }
+    if !(20.0..=300.0).contains(&settings.bass_frequency_hz) {
+        return Err("SECS bass corner must be between 20 and 300 Hz".to_string());
+    }
+    if !(100.0..=5_000.0).contains(&settings.curtain_hz) {
+        return Err("SECS curtain must be between 100 and 5000 Hz".to_string());
+    }
+    match settings.fixed_delay_ms {
+        None => {}
+        Some(delay) => {
+            if settings.latency_mode != LiveSecsLatencyMode::Normal {
+                return Err(
+                    "a fixed SECS delay only applies in the normal latency mode".to_string()
+                );
+            }
+            if !delay.is_finite()
+                || !(SECS_AUTO_DELAY_MIN_MS..=SECS_AUTO_DELAY_MAX_MS).contains(&delay)
+            {
+                return Err(format!(
+                    "SECS fixed delay must be between {SECS_AUTO_DELAY_MIN_MS} and {SECS_AUTO_DELAY_MAX_MS} ms"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The SECS design configuration a settings choice produces at one rate.
+fn secs_config_for(settings: &LiveSecsDesignSettings, sample_rate_hz: u32) -> SecsConfig {
+    SecsConfig {
+        sample_rate_hz,
+        max_boost_db: settings.max_boost_db,
+        target_delay_ms: settings.fixed_delay_ms.unwrap_or(SECS_AUTO_DELAY_MIN_MS),
+        tilt_db_per_octave: settings.tilt_db_per_octave,
+        bass_boost_db: settings.bass_boost_db,
+        bass_frequency_hz: settings.bass_frequency_hz,
+        resolution: match settings.resolution {
+            LiveSecsResolution::Low => SecsResolutionMode::Gentle,
+            LiveSecsResolution::Normal => SecsResolutionMode::Balanced,
+            LiveSecsResolution::High => SecsResolutionMode::Precise,
+        },
+        taps: ((SECS_AUTO_DELAY_MAX_MS + 500.0) * f64::from(sample_rate_hz) / 1000.0) as usize,
+        hf_min_phase_reference_hz: settings.curtain_hz,
+        low_latency: settings.latency_mode == LiveSecsLatencyMode::Low,
+        zero_latency: settings.latency_mode == LiveSecsLatencyMode::Zero,
+        // The callers attach the resolved curve for `settings.target_curve`
+        // and the 2.1 shared-sub-band crossover; both need session state a
+        // pure settings-to-config mapping deliberately does not see.
+        target_overlay: None,
+        shared_low_frequency_hz: None,
+    }
+}
+
+/// Summary of a predicted-only SECS trial design (advanced option).
+///
+/// SECS is the ported single-point full-band algorithm from
+/// `eqforbeginner_dsp_core::secs`. It designs from the central P0 pair only,
+/// so this summary deliberately does not reuse `LiveDesignSummary`: the
+/// Phase 4 fields (position count, protected dips, bounded boost) would claim
+/// guarantees the SECS path does not provide.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveSecsDesignSummary {
+    pub settings: LiveSecsDesignSettings,
+    pub algorithm_version: String,
+    pub position_id: String,
+    /// Seats whose magnitudes entered the design (1 = P0 alone).
+    pub position_count: usize,
+    /// True when the magnitude side actually used the multi-position
+    /// average (requires the option on and more than one accepted seat).
+    pub multi_position_applied: bool,
+    /// 2.1 extension: the bass-management crossover below which the L/R
+    /// correction was commonized (one shared subwoofer reproduces both
+    /// channels there). `None` on 2.0 projects.
+    pub shared_sub_band_hz: Option<f64>,
+    pub sample_rate_hz: u32,
+    pub taps: usize,
+    pub auto_delay_ms: f64,
+    pub low_cutoff_hz: f64,
+    pub high_cutoff_hz: f64,
+    pub preamp_db: f64,
+    pub channel_balance_trim_db: f64,
+    pub input_phase_score: f64,
+    pub left_raw_rmse_db: f64,
+    pub left_predicted_rmse_db: f64,
+    pub right_raw_rmse_db: f64,
+    pub right_predicted_rmse_db: f64,
+    pub trial_wav_path: String,
+    pub trial_zip_path: String,
+    /// Predicted-only raw/target/predicted display curves (verified curves
+    /// empty until a real remeasurement exists).
+    pub frequency_response: LiveFrequencyResponsePlot,
+    pub warning: String,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LiveFrequencyResponsePlot {
@@ -628,6 +848,10 @@ pub struct LiveExportSummary {
     pub recommended_headroom_db: f64,
     pub measured_true_peak_ratio_db: f64,
     pub maximum_filter_response_gain_db: f64,
+    /// Worst peak growth of full-scale program-material proxies through any
+    /// rate member (SECS packages; 0.0 on the Phase 4 path, whose bounded
+    /// cut-only minimum-phase filters the v3 basis already covers).
+    pub program_material_peak_growth_db: f64,
     pub fir_worst_case_peak_bound_db: f64,
     /// L1-bound-based figure that no signal can ever exceed; the default
     /// recommendation uses the response peak instead (headroom v3).
@@ -636,7 +860,9 @@ pub struct LiveExportSummary {
     pub final_48k_binding_maximum_relative_group_delay_difference_ms: f64,
     pub native_rate_count: usize,
     pub cross_rate_passed: bool,
-    pub verification: LiveVerificationSummary,
+    /// `None` when the user explicitly skipped closed-loop verification
+    /// (SECS predicted-only export).
+    pub verification: Option<LiveVerificationSummary>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -751,6 +977,49 @@ struct LiveDesign {
     user_declared_active_at_unix_ms: Option<u64>,
 }
 
+/// Runtime record of the last SECS trial (never persisted; regenerated per
+/// session exactly like `LiveDesign`). Carries what the closed loop and the
+/// per-rate final export need: the played 48 kHz taps, the trial-WAV hash the
+/// verification captures bind to, and the absolute SECS target.
+#[derive(Clone, Debug)]
+struct LiveSecsDesign {
+    summary: LiveSecsDesignSummary,
+    settings: LiveSecsDesignSettings,
+    /// The resolved house-curve overlay the trial actually ran with. The
+    /// final export reuses this copy instead of re-resolving from the
+    /// session so a custom target re-imported after verification cannot
+    /// silently change the exported design.
+    target_overlay: Option<TargetCurve>,
+    /// The 2.1 bass-management crossover the shared-sub-band commonization
+    /// ran with (`None` on 2.0 or when no confirmed subwoofer setup
+    /// existed). Stored so the export reuses the exact trial value.
+    shared_low_frequency_hz: Option<f64>,
+    evidence_sha256: String,
+    left_taps: Vec<f64>,
+    right_taps: Vec<f64>,
+    target_frequencies_hz: Vec<f64>,
+    target_magnitude: Vec<f64>,
+    user_declared_active_at_unix_ms: Option<u64>,
+}
+
+/// The current trial's identity, whichever design path produced it: the
+/// trial-WAV SHA that verification captures must bind to, and the user's
+/// declared-active timestamp.
+fn current_trial_binding(session: &LiveSession) -> Option<(&str, Option<u64>)> {
+    if let Some(design) = session.design.as_ref() {
+        return Some((
+            design.evidence_sha256.as_str(),
+            design.user_declared_active_at_unix_ms,
+        ));
+    }
+    session.secs_design.as_ref().map(|secs| {
+        (
+            secs.evidence_sha256.as_str(),
+            secs.user_declared_active_at_unix_ms,
+        )
+    })
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct LiveCaptureEvidence {
     session_id: String,
@@ -783,6 +1052,7 @@ struct LiveSession {
     sweeps: BTreeMap<LiveChannel, LiveSweepReference>,
     measurements: BTreeMap<(LiveCaptureKind, String, LiveChannel), StoredMeasurement>,
     design: Option<LiveDesign>,
+    secs_design: Option<LiveSecsDesign>,
     last_export: Option<LiveExportSummary>,
 }
 
@@ -842,9 +1112,11 @@ fn validate_position_id(position_id: &str, kind: LiveCaptureKind) -> Result<Stri
         ));
     }
     let allowed: BTreeSet<&str> = match kind {
-        LiveCaptureKind::Baseline => ["P0", "P0_END", "P1", "P2", "P3", "P4", "P5"]
-            .into_iter()
-            .collect(),
+        LiveCaptureKind::Baseline => [
+            "P0", "P0_END", "P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8",
+        ]
+        .into_iter()
+        .collect(),
         // Closed-loop verification is a central-seat experiment: the filter is
         // judged where it was designed to be judged.
         LiveCaptureKind::Verification => ["P0"].into_iter().collect(),
@@ -1032,10 +1304,10 @@ fn validate_capture_evidence(
             ));
         }
         LiveCaptureKind::Verification => {
-            let current_design = session.design.as_ref().ok_or_else(|| {
+            let (current_sha256, _) = current_trial_binding(session).ok_or_else(|| {
                 "trial design disappeared during verification capture".to_string()
             })?;
-            if evidence.design_sha256.as_deref() != Some(current_design.evidence_sha256.as_str()) {
+            if evidence.design_sha256.as_deref() != Some(current_sha256) {
                 return Err(
                     "verification capture is not bound to the current trial filter".to_string(),
                 );
@@ -1105,16 +1377,14 @@ fn validate_stored_evidence(
             ))
         }
         LiveCaptureKind::Verification => {
-            let design = session
-                .design
-                .as_ref()
+            let (current_sha256, declared_at) = current_trial_binding(session)
                 .ok_or_else(|| "trial design is absent".to_string())?;
-            if design.user_declared_active_at_unix_ms.is_none() {
+            if declared_at.is_none() {
                 return Err(
                     "the user has not declared the exact trial filter active in Roon".to_string(),
                 );
             }
-            if evidence.design_sha256.as_deref() != Some(design.evidence_sha256.as_str()) {
+            if evidence.design_sha256.as_deref() != Some(current_sha256) {
                 return Err(
                     "stored verification measurement belongs to a different trial filter"
                         .to_string(),
@@ -1269,6 +1539,7 @@ impl LiveMeasurementState {
             sweeps: BTreeMap::new(),
             measurements: BTreeMap::new(),
             design: None,
+            secs_design: None,
             last_export: None,
         };
         *self
@@ -2507,8 +2778,8 @@ mod tests {
         .unwrap_err()
         .contains("level shift"));
 
-        // Returning a microphone stand to the center after six surrounding
-        // measurements naturally changes modal detail. This must remain a
+        // Returning a microphone stand to the center after the eight
+        // surrounding measurements naturally changes modal detail. This must remain a
         // useful second center sample rather than demand jig-level placement.
         let realistically_repositioned = initial
             .iter()
@@ -2633,6 +2904,163 @@ mod tests {
         )
         .unwrap_err()
         .contains("evidence changed"));
+    }
+
+    #[test]
+    fn program_peak_growth_matches_known_filters() {
+        // Identity filter: no growth.
+        let growth = secs_program_peak_growth_db(48_000, &[1.0]).unwrap();
+        assert!(growth.abs() < 1e-9, "identity growth {growth}");
+        // Two equal taps 10 ms apart: the response peak is +3.01 dB and
+        // dense program material reaches nearly the same time-domain
+        // growth, so the measured figure must land just below it.
+        let mut comb = vec![0.0; 481];
+        comb[0] = std::f64::consts::FRAC_1_SQRT_2;
+        comb[480] = std::f64::consts::FRAC_1_SQRT_2;
+        let growth = secs_program_peak_growth_db(48_000, &comb).unwrap();
+        assert!((2.5..=3.02).contains(&growth), "comb growth {growth}");
+    }
+
+    #[test]
+    fn secs_settings_are_range_validated_and_a_21_project_is_not_refused() {
+        // Range validation runs before any session state is touched.
+        let state = LiveMeasurementState::default();
+        let boost = LiveSecsDesignSettings {
+            max_boost_db: 30.0,
+            ..LiveSecsDesignSettings::default()
+        };
+        assert!(state
+            .design_secs_trial(boost)
+            .unwrap_err()
+            .contains("0 and 24"));
+        let delay = LiveSecsDesignSettings {
+            fixed_delay_ms: Some(1.0),
+            ..LiveSecsDesignSettings::default()
+        };
+        assert!(state
+            .design_secs_trial(delay)
+            .unwrap_err()
+            .contains("2 and 10"));
+        let conflict = LiveSecsDesignSettings {
+            latency_mode: LiveSecsLatencyMode::Zero,
+            fixed_delay_ms: Some(5.0),
+            ..LiveSecsDesignSettings::default()
+        };
+        assert!(state
+            .design_secs_trial(conflict)
+            .unwrap_err()
+            .contains("normal latency"));
+        // The custom target curve needs an imported target, like Phase 4.
+        assert!(LiveSecsTargetCurve::Custom
+            .overlay(None)
+            .unwrap_err()
+            .contains("import a valid custom target"));
+        assert!(LiveSecsTargetCurve::Flat.overlay(None).unwrap().is_none());
+
+        // A 2.1 project is no longer refused outright (bass management is
+        // linear, so per-channel correction of the combined main+sub capture
+        // is exact at the seat): SECS proceeds to the ordinary evidence
+        // requirements, which here fail on the missing calibration/sweeps.
+        let temporary = tempdir().unwrap();
+        let state = LiveMeasurementState::default();
+        state
+            .start_session_with_mode(temporary.path(), LiveSystemMode::SingleSub21)
+            .unwrap();
+        let error = state
+            .design_secs_trial(LiveSecsDesignSettings::default())
+            .unwrap_err();
+        assert!(
+            !error.contains("2.0 stereo"),
+            "2.1 must not be refused: {error}"
+        );
+        assert!(
+            error.contains("calibration and both measurement sweeps"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_21_secs_design_commonizes_below_the_confirmed_crossover() {
+        let temporary = tempdir().unwrap();
+        let state = LiveMeasurementState::default();
+        state
+            .start_session_with_mode(temporary.path(), LiveSystemMode::SingleSub21)
+            .unwrap();
+        state
+            .import_calibration("umik.txt", "10 0\n24000 0\n")
+            .unwrap();
+        let wav = test_sweep_wav();
+        state.import_sweep(LiveChannel::Left, &wav).unwrap();
+        state.import_sweep(LiveChannel::Right, &wav).unwrap();
+        state
+            .record_subwoofer_setup(LiveSubwooferSetupRequest {
+                crossover_hz: 90.0,
+                main_delay_ms: 7.1,
+                polarity_degrees: 0,
+                sub_level_db: 0.0,
+                confirmed_on_hardware: true,
+            })
+            .unwrap();
+        for channel in [LiveChannel::Left, LiveChannel::Right] {
+            let (_, _, sweep, calibration, evidence, _) = state
+                .begin_capture(
+                    LiveCaptureKind::Baseline,
+                    channel,
+                    "P0",
+                    "synthetic::input",
+                    0,
+                )
+                .unwrap();
+            let capture = synthetic_capture(&sweep.samples, &[0.2]);
+            let summary = analyze_and_store_capture(
+                &state,
+                LiveCaptureKind::Baseline,
+                channel,
+                "P0".into(),
+                &sweep,
+                &calibration,
+                &evidence,
+                &capture,
+            )
+            .unwrap();
+            state.finish_capture();
+            assert!(summary.accepted, "{:?}", summary.issue_codes);
+        }
+        let fixture = SyntheticRoomFixture::phase1_48k().unwrap();
+        {
+            let mut guard = state.session.lock().unwrap();
+            let session = guard.as_mut().unwrap();
+            for (channel, impulse) in [
+                (LiveChannel::Left, &fixture.left_impulses[0]),
+                (LiveChannel::Right, &fixture.right_impulses[0]),
+            ] {
+                let stored = session
+                    .measurements
+                    .get_mut(&(LiveCaptureKind::Baseline, "P0".to_string(), channel))
+                    .unwrap();
+                stored.calibrated_impulse_samples = impulse.clone();
+            }
+        }
+        let secs = state
+            .design_secs_trial(LiveSecsDesignSettings::default())
+            .unwrap();
+        // The confirmed crossover drives the shared-sub-band commonization
+        // and is echoed for the UI and reused verbatim by the export.
+        assert_eq!(secs.shared_sub_band_hz, Some(90.0));
+        {
+            let guard = state.session.lock().unwrap();
+            let stored = guard.as_ref().unwrap().secs_design.clone().unwrap();
+            assert_eq!(stored.shared_low_frequency_hz, Some(90.0));
+        }
+        let readme = {
+            let bytes = fs::read(&secs.trial_zip_path).unwrap();
+            let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+            let mut text = String::new();
+            std::io::Read::read_to_string(&mut archive.by_name("README.txt").unwrap(), &mut text)
+                .unwrap();
+            text
+        };
+        assert!(readme.contains("active below 90 Hz"), "{readme}");
     }
 
     #[test]
@@ -3967,6 +4395,510 @@ mod tests {
     }
 
     #[test]
+    fn the_secs_advanced_option_verifies_and_exports_through_its_own_closed_loop() {
+        let temporary = tempdir().unwrap();
+        let state = LiveMeasurementState::default();
+        state.start_session(temporary.path()).unwrap();
+        state
+            .import_calibration("umik.txt", "10 0\n24000 0\n")
+            .unwrap();
+        let wav = test_sweep_wav();
+        state.import_sweep(LiveChannel::Left, &wav).unwrap();
+        state.import_sweep(LiveChannel::Right, &wav).unwrap();
+        for channel in [LiveChannel::Left, LiveChannel::Right] {
+            let (_, _, sweep, calibration, evidence, _) = state
+                .begin_capture(
+                    LiveCaptureKind::Baseline,
+                    channel,
+                    "P0",
+                    "synthetic::input",
+                    0,
+                )
+                .unwrap();
+            let capture = synthetic_capture(&sweep.samples, &[0.2]);
+            let summary = analyze_and_store_capture(
+                &state,
+                LiveCaptureKind::Baseline,
+                channel,
+                "P0".into(),
+                &sweep,
+                &calibration,
+                &evidence,
+                &capture,
+            )
+            .unwrap();
+            state.finish_capture();
+            assert!(summary.accepted, "{:?}", summary.issue_codes);
+        }
+        let fixture = SyntheticRoomFixture::phase1_48k().unwrap();
+        // A real capture's absolute level is an arbitrary anchor (the
+        // 2026-07-30 live room sat near -25 dB), while the raw fixture
+        // happens to sit inside the validator's [-12.05, +3] bounded-
+        // correction window. Anchor the fixture well outside that window so
+        // a regression that feeds an absolute response into the validator's
+        // correction argument fails loudly here instead of only in a real
+        // room. The anchor is positive on purpose: it trips the
+        // PositiveCorrectionGain gate, which the SECS loop does NOT exempt
+        // (the exempted ExcessiveAttenuation gate could not guard this).
+        let absolute_anchor_scale = 10f64.powf(25.0 / 20.0);
+        {
+            let mut guard = state.session.lock().unwrap();
+            let session = guard.as_mut().unwrap();
+            for (channel, impulse) in [
+                (LiveChannel::Left, &fixture.left_impulses[0]),
+                (LiveChannel::Right, &fixture.right_impulses[0]),
+            ] {
+                let impulse: Vec<f64> = impulse
+                    .iter()
+                    .map(|sample| sample * absolute_anchor_scale)
+                    .collect();
+                let response = frequency_response(&impulse, 48_000, 32_768).unwrap();
+                let indices = response
+                    .frequencies_hz
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, frequency)| {
+                        (*frequency > 0.0 && *frequency <= 20_000.0).then_some(index)
+                    })
+                    .collect::<Vec<_>>();
+                let stored = session
+                    .measurements
+                    .get_mut(&(LiveCaptureKind::Baseline, "P0".to_string(), channel))
+                    .unwrap();
+                stored.frequencies_hz = indices
+                    .iter()
+                    .map(|index| response.frequencies_hz[*index])
+                    .collect();
+                stored.magnitude_db = indices
+                    .iter()
+                    .map(|index| response.magnitude_db[*index])
+                    .collect();
+                stored.calibrated_impulse_samples = impulse.clone();
+            }
+        }
+
+        let secs = state
+            .design_secs_trial(LiveSecsDesignSettings::default())
+            .unwrap();
+        assert_eq!(secs.algorithm_version, SECS_ALGORITHM_VERSION);
+        assert_eq!(secs.position_id, "P0");
+        assert!(secs.warning.contains("Predicted-only"));
+        assert!(Path::new(&secs.trial_wav_path).is_file());
+        assert!(Path::new(&secs.trial_zip_path).is_file());
+        assert!(
+            (SECS_AUTO_DELAY_MIN_MS..=SECS_AUTO_DELAY_MAX_MS).contains(&secs.auto_delay_ms),
+            "auto delay {} outside the coarse grid",
+            secs.auto_delay_ms
+        );
+        // Multi-position is on by default but only P0 is accepted, so the
+        // average falls back to the plain single-point path.
+        assert!(secs.settings.multi_position);
+        assert_eq!(secs.position_count, 1);
+        assert!(!secs.multi_position_applied);
+        // 2.0 project: no shared sub band.
+        assert!(secs.shared_sub_band_hz.is_none());
+        // The design summary already carries the predicted-only result plot;
+        // verified curves stay empty until a real remeasurement exists.
+        let design_plot = &secs.frequency_response;
+        assert!(!design_plot.frequencies_hz.is_empty());
+        assert_eq!(
+            design_plot.raw_left_db.len(),
+            design_plot.frequencies_hz.len()
+        );
+        assert_eq!(
+            design_plot.predicted_average_db.len(),
+            design_plot.frequencies_hz.len()
+        );
+        assert_eq!(
+            design_plot.target_average_db.len(),
+            design_plot.frequencies_hz.len()
+        );
+        assert!(design_plot.verified_left_db.is_empty());
+        assert!(design_plot.verified_average_db.is_empty());
+
+        // Without a verification capture the export must refuse.
+        let premature = state.finalize_export().unwrap_err();
+        assert!(premature.contains("verification"), "{premature}");
+
+        // Verification captures demand the declaration first.
+        let undeclared = state
+            .begin_capture(
+                LiveCaptureKind::Verification,
+                LiveChannel::Left,
+                "P0",
+                "synthetic::input",
+                0,
+            )
+            .err()
+            .unwrap();
+        assert!(
+            undeclared.contains("declare the exact trial filter"),
+            "{undeclared}"
+        );
+        assert!(state.set_trial_activation(true).unwrap());
+
+        // The predicted trial ZIP can be saved for listening evaluation.
+        let secs_download_path = temporary.path().join("downloaded-secs-trial.zip");
+        let download = state
+            .save_zip_artifact(LiveZipArtifactKind::Trial, &secs_download_path)
+            .unwrap();
+        assert_eq!(download.artifact_kind, LiveZipArtifactKind::Trial);
+        assert_eq!(
+            fs::read(&secs_download_path).unwrap(),
+            fs::read(&secs.trial_zip_path).unwrap()
+        );
+
+        // Install P0 verification captures that measure exactly the predicted
+        // response (baseline + played filter), bound to the trial SHA - the
+        // same pattern the Phase 4 e2e uses.
+        let (left_taps, right_taps, secs_sha256) = {
+            let guard = state.session.lock().unwrap();
+            let session = guard.as_ref().unwrap();
+            let record = session.secs_design.as_ref().unwrap();
+            (
+                record.left_taps.clone(),
+                record.right_taps.clone(),
+                record.evidence_sha256.clone(),
+            )
+        };
+        let analysis_fft_size =
+            eqforbeginner_dsp_core::measurement::SweepDeconvolutionConfig::default()
+                .analysis_fft_size;
+        {
+            let mut guard = state.session.lock().unwrap();
+            let session = guard.as_mut().unwrap();
+            let calibration_sha256 = session.calibration.as_ref().unwrap().summary.sha256.clone();
+            for (channel, taps) in [
+                (LiveChannel::Left, &left_taps),
+                (LiveChannel::Right, &right_taps),
+            ] {
+                let response = frequency_response(taps, 48_000, analysis_fft_size).unwrap();
+                let mut verified = session
+                    .measurements
+                    .get(&(LiveCaptureKind::Baseline, "P0".to_string(), channel))
+                    .unwrap()
+                    .clone();
+                verified.summary.kind = LiveCaptureKind::Verification;
+                // Simulate the full-band SECS filter's marker-band
+                // attenuation (measured -1.2 dB on the 2026-07-30 live
+                // session): the response-based session gate must not read
+                // this as a volume change. The retired marker-RMS gate did,
+                // which made SECS verification impossible to pass.
+                verified.summary.start_marker_rms_dbfs = verified
+                    .summary
+                    .start_marker_rms_dbfs
+                    .map(|value| value - 1.2);
+                verified.magnitude_db = verified
+                    .frequencies_hz
+                    .iter()
+                    .zip(&verified.magnitude_db)
+                    .map(|(hz, raw)| {
+                        raw + secs_interp_linear(
+                            *hz,
+                            &response.frequencies_hz,
+                            &response.magnitude_db,
+                        )
+                    })
+                    .collect();
+                verified.evidence = LiveCaptureEvidence {
+                    session_id: session.id.clone(),
+                    generation: session.evidence_generation,
+                    system_mode: session.system_mode,
+                    subwoofer_setup: session.subwoofer_setup.clone(),
+                    subwoofer_search: session.subwoofer_search.clone(),
+                    calibration_sha256: calibration_sha256.clone(),
+                    sweep_sha256: session.sweeps[&channel].summary.sha256.clone(),
+                    design_sha256: Some(secs_sha256.clone()),
+                    input_device_id: "synthetic::input".to_string(),
+                    input_channel_index: 0,
+                };
+                session.measurements.insert(
+                    (LiveCaptureKind::Verification, "P0".to_string(), channel),
+                    verified,
+                );
+            }
+        }
+
+        // A capture bound to a different trial SHA is rejected.
+        {
+            let mut guard = state.session.lock().unwrap();
+            guard
+                .as_mut()
+                .unwrap()
+                .measurements
+                .get_mut(&(
+                    LiveCaptureKind::Verification,
+                    "P0".to_string(),
+                    LiveChannel::Left,
+                ))
+                .unwrap()
+                .evidence
+                .design_sha256 = Some("stale-secs-trial".to_string());
+        }
+        assert!(state
+            .verification_summary()
+            .unwrap_err()
+            .contains("different trial filter"));
+        {
+            let mut guard = state.session.lock().unwrap();
+            guard
+                .as_mut()
+                .unwrap()
+                .measurements
+                .get_mut(&(
+                    LiveCaptureKind::Verification,
+                    "P0".to_string(),
+                    LiveChannel::Left,
+                ))
+                .unwrap()
+                .evidence
+                .design_sha256 = Some(secs_sha256.clone());
+        }
+
+        // A real volume change is still caught: a uniform +1 dB on the
+        // verified response beyond the filter trips the response-based
+        // session-level gate.
+        {
+            let mut guard = state.session.lock().unwrap();
+            let verified = guard
+                .as_mut()
+                .unwrap()
+                .measurements
+                .get_mut(&(
+                    LiveCaptureKind::Verification,
+                    "P0".to_string(),
+                    LiveChannel::Left,
+                ))
+                .unwrap();
+            for value in verified.magnitude_db.iter_mut() {
+                *value += 1.0;
+            }
+        }
+        let shifted = state.verification_summary().unwrap();
+        assert!(!shifted.passed);
+        assert!(
+            shifted
+                .issues
+                .iter()
+                .any(|issue| issue.starts_with("left_session_gain_shifted:+1.00")),
+            "{:?}",
+            shifted.issues
+        );
+        {
+            let mut guard = state.session.lock().unwrap();
+            let verified = guard
+                .as_mut()
+                .unwrap()
+                .measurements
+                .get_mut(&(
+                    LiveCaptureKind::Verification,
+                    "P0".to_string(),
+                    LiveChannel::Left,
+                ))
+                .unwrap();
+            for value in verified.magnitude_db.iter_mut() {
+                *value -= 1.0;
+            }
+        }
+
+        let verification = state.verification_summary().unwrap();
+        assert!(verification.passed, "{:?}", verification.issues);
+        assert!(verification
+            .algorithm_version
+            .contains(SECS_ALGORITHM_VERSION));
+        for scale in [
+            verification.left_applied_correction_scale,
+            verification.right_applied_correction_scale,
+        ] {
+            let scale = scale.expect("the room fixture correction carries a fittable scale");
+            assert!((0.99..=1.01).contains(&scale), "applied scale {scale}");
+        }
+
+        // (a)-mode export: six per-rate SECS re-runs, the 48 kHz member byte-
+        // bound to the verified trial, and a validated six-rate Roon ZIP.
+        let exported = state.finalize_export().unwrap();
+        assert_eq!(exported.native_rate_count, 6);
+        assert!(exported.cross_rate_passed);
+        assert!(exported
+            .algorithm_version
+            .contains(SECS_NATIVE_RERUN_VERSION));
+        assert_eq!(
+            exported.final_48k_binding_maximum_magnitude_difference_db,
+            0.0
+        );
+        assert_eq!(
+            exported.final_48k_binding_maximum_relative_group_delay_difference_ms,
+            0.0
+        );
+        assert!(exported.zip_path.contains("secs"));
+        assert!(Path::new(&exported.zip_path).is_file());
+        assert!(Path::new(&exported.project_path).is_file());
+        assert!(exported.recommended_headroom_db.is_finite());
+        assert!(exported.verification.as_ref().unwrap().passed);
+        assert!(exported.zip_path.contains("_secs_verified_"));
+        // The program-material peak-growth basis must be measured and must
+        // drive the recommendation (a full-band mixed-phase filter grows
+        // broadband peaks even at a ~0 dB response peak).
+        assert!(exported.program_material_peak_growth_db > 0.0);
+        assert!(
+            exported.recommended_headroom_db
+                >= exported.program_material_peak_growth_db + HEADROOM_SAFETY_MARGIN_DB - 0.11,
+            "recommended {} vs growth {}",
+            exported.recommended_headroom_db,
+            exported.program_material_peak_growth_db
+        );
+        let final_download_path = temporary.path().join("downloaded-secs-final.zip");
+        let final_download = state
+            .save_zip_artifact(LiveZipArtifactKind::Final, &final_download_path)
+            .unwrap();
+        assert_eq!(final_download.artifact_kind, LiveZipArtifactKind::Final);
+        assert_eq!(
+            fs::read(&final_download_path).unwrap(),
+            fs::read(&exported.zip_path).unwrap()
+        );
+
+        // A Phase 4 design supersedes the SECS trial and clears the export...
+        let target_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../assets/targets/Harman-6dB_REW.txt");
+        let target_text = fs::read_to_string(target_path).unwrap();
+        state
+            .import_target("Harman-6dB_REW.txt", &target_text)
+            .unwrap();
+        let phase4 = state.design_trial("custom").unwrap();
+        assert!(phase4.numerical_passed);
+        {
+            let guard = state.session.lock().unwrap();
+            let session = guard.as_ref().unwrap();
+            assert!(session.design.is_some());
+            assert!(session.secs_design.is_none());
+            assert!(session.last_export.is_none());
+        }
+        // The verification skip is a SECS-only escape hatch; the Phase 4
+        // export keeps its measured-verification promise.
+        let refused = state.finalize_export_skipping_verification().unwrap_err();
+        assert!(refused.contains("Phase 4"), "{refused}");
+
+        // ...and a fresh SECS design demands a fresh declaration. This one
+        // runs with custom advanced settings, which must be honored and
+        // echoed back verbatim (the export path reuses this stored copy).
+        // Determinism of a repeated identical design is already proven
+        // stronger by the export's 48 kHz byte binding above.
+        let custom = LiveSecsDesignSettings {
+            max_boost_db: 4.0,
+            tilt_db_per_octave: -0.5,
+            resolution: LiveSecsResolution::High,
+            curtain_hz: 500.0,
+            fixed_delay_ms: Some(5.0),
+            ..LiveSecsDesignSettings::default()
+        };
+        let secs_again = state.design_secs_trial(custom).unwrap();
+        assert_eq!(secs_again.settings, custom);
+        assert_eq!(secs_again.auto_delay_ms, 5.0);
+        let undeclared_again = state
+            .begin_capture(
+                LiveCaptureKind::Verification,
+                LiveChannel::Left,
+                "P0",
+                "synthetic::input",
+                0,
+            )
+            .err()
+            .unwrap();
+        assert!(
+            undeclared_again.contains("declare the exact trial filter"),
+            "{undeclared_again}"
+        );
+
+        // Multi-position wiring: with a second accepted seat present the
+        // magnitude average engages and the summary reports it. P1 here is a
+        // clone of P0, so the average equals P0's own magnitude and the
+        // design remains physically the same filter.
+        {
+            let mut guard = state.session.lock().unwrap();
+            let session = guard.as_mut().unwrap();
+            for channel in [LiveChannel::Left, LiveChannel::Right] {
+                let mut seat = session
+                    .measurements
+                    .get(&(LiveCaptureKind::Baseline, "P0".to_string(), channel))
+                    .unwrap()
+                    .clone();
+                seat.summary.position_id = "P1".to_string();
+                session
+                    .measurements
+                    .insert((LiveCaptureKind::Baseline, "P1".to_string(), channel), seat);
+            }
+        }
+        let multi = state
+            .design_secs_trial(LiveSecsDesignSettings::default())
+            .unwrap();
+        assert!(multi.multi_position_applied);
+        assert_eq!(multi.position_count, 2);
+        let single = LiveSecsDesignSettings {
+            multi_position: false,
+            ..LiveSecsDesignSettings::default()
+        };
+        let single_summary = state.design_secs_trial(single).unwrap();
+        assert!(!single_summary.multi_position_applied);
+        assert_eq!(single_summary.position_count, 1);
+
+        // Target-curve wiring: a Harman-style overlay must be echoed, stored
+        // for the export path, and actually steer the design away from the
+        // flat-target filter; the custom value resolves to the curve imported
+        // above. (P1 is a P0 clone, so the taps difference below is
+        // attributable to the overlay alone.)
+        let flat_taps = {
+            let guard = state.session.lock().unwrap();
+            let session = guard.as_ref().unwrap();
+            let secs = session.secs_design.as_ref().unwrap();
+            assert!(secs.target_overlay.is_none());
+            secs.left_taps.clone()
+        };
+        let followed = state
+            .design_secs_trial(LiveSecsDesignSettings {
+                target_curve: LiveSecsTargetCurve::Harman,
+                ..LiveSecsDesignSettings::default()
+            })
+            .unwrap();
+        assert_eq!(followed.settings.target_curve, LiveSecsTargetCurve::Harman);
+        let followed_taps = {
+            let guard = state.session.lock().unwrap();
+            let session = guard.as_ref().unwrap();
+            let secs = session.secs_design.as_ref().unwrap();
+            assert!(secs.target_overlay.is_some());
+            secs.left_taps.clone()
+        };
+        assert_ne!(flat_taps, followed_taps);
+        let custom_followed = state
+            .design_secs_trial(LiveSecsDesignSettings {
+                target_curve: LiveSecsTargetCurve::Custom,
+                ..LiveSecsDesignSettings::default()
+            })
+            .unwrap();
+        assert_eq!(
+            custom_followed.settings.target_curve,
+            LiveSecsTargetCurve::Custom
+        );
+
+        // User-requested predicted-only export: no verification captures
+        // exist for this fresh trial, the package is still built, and every
+        // label carries the predicted-only state.
+        let unverified = state.finalize_export_skipping_verification().unwrap();
+        assert!(unverified.verification.is_none());
+        assert!(unverified.zip_path.contains("_secs_predicted_"));
+        assert!(unverified.program_material_peak_growth_db > 0.0);
+        let project_text = fs::read_to_string(&unverified.project_path).unwrap();
+        assert!(project_text.contains("predicted-only-verification-skipped-by-user"));
+        assert!(project_text.contains("none-predicted-only"));
+        // The predicted-only package stays downloadable - its labels, not a
+        // gate, carry the unverified state.
+        let predicted_download_path = temporary.path().join("downloaded-secs-predicted.zip");
+        let predicted_download = state
+            .save_zip_artifact(LiveZipArtifactKind::Final, &predicted_download_path)
+            .unwrap();
+        assert_eq!(predicted_download.artifact_kind, LiveZipArtifactKind::Final);
+    }
+
+    #[test]
     fn live_project_reuses_phase4_then_requires_measured_verification_for_phase6_zip() {
         let temporary = tempdir().unwrap();
         let state = LiveMeasurementState::default();
@@ -4205,26 +5137,23 @@ mod tests {
         let exported = state.finalize_export().unwrap();
         assert_eq!(exported.native_rate_count, 6);
         assert!(exported.cross_rate_passed);
-        assert!(exported.verification.passed);
+        let exported_verification = exported.verification.as_ref().unwrap();
+        assert!(exported_verification.passed);
         assert_eq!(
-            exported.verification.algorithm_version,
+            exported_verification.algorithm_version,
             LIVE_CLOSED_LOOP_VERSION
         );
         assert_eq!(
-            exported
-                .verification
-                .prediction_verification_smoothing_fwhm_octaves,
+            exported_verification.prediction_verification_smoothing_fwhm_octaves,
             eqforbeginner_dsp_core::validation::LOG_FREQUENCY_SMOOTHING_EFFECTIVE_FWHM_OCTAVES
         );
-        assert!(exported
-            .verification
+        assert!(exported_verification
             .left_unsmoothed_predicted_verified_rmse_db
             .is_finite());
-        assert!(exported
-            .verification
+        assert!(exported_verification
             .right_unsmoothed_predicted_verified_rmse_db
             .is_finite());
-        let plot = &exported.verification.frequency_response;
+        let plot = &exported_verification.frequency_response;
         assert_eq!(plot.algorithm_version, LIVE_RESULT_PLOT_VERSION);
         assert_eq!(
             plot.display_smoothing_fwhm_octaves,
@@ -4847,11 +5776,411 @@ fn fitted_applied_correction_scale(
     Some(cross / correction_energy)
 }
 
+/// Closed-loop judgment for a SECS trial. Mirrors the v4 magnitude loop
+/// structure deliberately: the improvement judgment runs on gate-smoothed
+/// (1/12-octave) curves scored as the RMS of per-octave-cell RMSE, and the
+/// judged band stays 20-650 Hz. That choice is load-bearing for real use: a
+/// centimeter-scale microphone reposition between the baseline and the
+/// verification capture moves narrow structure by several dB (measured on
+/// this hardware, HANDOFF 2026-07-29) and shreds the HF comb entirely, so an
+/// unsmoothed or full-band comparison would demand a reproduction the physics
+/// cannot deliver. Correctness is carried instead by the applied-scale fit
+/// ([0.6, 1.4] - catches an unloaded, doubled, or inverted filter), the
+/// session-gain marker gate, the smoothed 3 dB agreement ceiling, and the
+/// SHA binding of every verification capture to the exact trial WAV.
+fn validate_secs_closed_loop(
+    session: &LiveSession,
+    secs: &LiveSecsDesign,
+) -> Result<LiveVerificationSummary, String> {
+    let raw_left = p0_measurement(session, LiveCaptureKind::Baseline, LiveChannel::Left)?;
+    let raw_right = p0_measurement(session, LiveCaptureKind::Baseline, LiveChannel::Right)?;
+    let verified_left = p0_measurement(session, LiveCaptureKind::Verification, LiveChannel::Left)?;
+    let verified_right =
+        p0_measurement(session, LiveCaptureKind::Verification, LiveChannel::Right)?;
+    let frequencies_hz = raw_left.frequencies_hz.clone();
+    for measurement in [raw_right, verified_left, verified_right] {
+        if measurement.frequencies_hz != frequencies_hz {
+            return Err(format!(
+                "measurement grid changed for {} {}",
+                measurement.summary.kind.as_str(),
+                measurement.summary.channel.as_str()
+            ));
+        }
+    }
+    // The predicted response is the baseline plus the played filter's
+    // magnitude, evaluated on the exact measurement grid.
+    let analysis_fft_size =
+        eqforbeginner_dsp_core::measurement::SweepDeconvolutionConfig::default().analysis_fft_size;
+    let filter_db_on_grid = |taps: &[f64]| -> Result<Vec<f64>, String> {
+        let response = frequency_response(taps, PROJECT_SAMPLE_RATE_HZ, analysis_fft_size)
+            .map_err(|error| format!("SECS filter response failed: {error}"))?;
+        Ok(frequencies_hz
+            .iter()
+            .map(|hz| secs_interp_linear(*hz, &response.frequencies_hz, &response.magnitude_db))
+            .collect())
+    };
+    let left_filter_db = filter_db_on_grid(&secs.left_taps)?;
+    let right_filter_db = filter_db_on_grid(&secs.right_taps)?;
+    let target_db: Vec<f64> = frequencies_hz
+        .iter()
+        .map(|hz| {
+            20.0 * (secs_interp_linear(*hz, &secs.target_frequencies_hz, &secs.target_magnitude)
+                + 1e-12)
+                .log10()
+        })
+        .collect();
+    let predicted_left: Vec<f64> = raw_left
+        .magnitude_db
+        .iter()
+        .zip(&left_filter_db)
+        .map(|(raw, filter)| raw + filter)
+        .collect();
+    let predicted_right: Vec<f64> = raw_right
+        .magnitude_db
+        .iter()
+        .zip(&right_filter_db)
+        .map(|(raw, filter)| raw + filter)
+        .collect();
+
+    // Session-gain gate, SECS variant. The Phase 4 loop compares the
+    // >=650 Hz start-marker RMS between captures, which is valid there
+    // because the Phase 4 filter is unity above 650 Hz. The SECS filter is
+    // full-band, so with the trial active the captured marker level shifts
+    // by the filter's own marker-band response even at perfectly constant
+    // volume - measured -1.2 dB on the 2026-07-30 live session, which made
+    // the marker gate a guaranteed false positive. Estimate the session
+    // level shift on the deconvolved responses instead, with the filter's
+    // contribution removed: median over 650 Hz - 20 kHz of
+    // (verified - baseline - filter). The median stays robust against the
+    // comb structure a centimeter of microphone reposition adds up there,
+    // and for a >650 Hz-unity filter this reduces to the plain
+    // verified-minus-baseline shift the Phase 4 gate measures. The +-0.5 dB
+    // allowance is unchanged.
+    let mut session_gain_issues = Vec::new();
+    for (label, raw, verified, filter_db) in [
+        ("left", raw_left, verified_left, &left_filter_db),
+        ("right", raw_right, verified_right, &right_filter_db),
+    ] {
+        let mut offsets: Vec<f64> = frequencies_hz
+            .iter()
+            .enumerate()
+            .filter(|(_, hz)| (650.0..=20_000.0).contains(*hz))
+            .map(|(index, _)| {
+                verified.magnitude_db[index] - raw.magnitude_db[index] - filter_db[index]
+            })
+            .filter(|value| value.is_finite())
+            .collect();
+        let shift_db = median(&mut offsets).ok_or_else(|| {
+            format!("the SECS {label} session-level band has no finite response bins")
+        })?;
+        if shift_db.abs() > MAXIMUM_VERIFICATION_MARKER_LEVEL_SHIFT_DB {
+            session_gain_issues.push(format!(
+                "{label}_session_gain_shifted:{shift_db:+.2}dB/allowed{MAXIMUM_VERIFICATION_MARKER_LEVEL_SHIFT_DB:.2}dB"
+            ));
+        }
+    }
+
+    let thresholds = ValidationThresholds::default();
+    // The realized-correction argument must be the FILTER's response, like
+    // the Phase 4 loop passes (`left_realized_response_db`): the validator
+    // derives its bounded-correction safety gates from it. The stage-3 port
+    // passed the absolute predicted response (raw + filter) here instead,
+    // whose extrema are room properties (an -80 dB high-frequency notch, an
+    // arbitrary calibration anchor), so ExcessiveAttenuation fired on every
+    // real-room measurement while the synthetic fixture - whose absolute
+    // level accidentally sits inside the [-12.05, +3] window - kept the
+    // regression green (found on the 2026-07-30 live session).
+    let left_report = validate_frequency_prediction(
+        &frequencies_hz,
+        std::slice::from_ref(&raw_left.magnitude_db),
+        std::slice::from_ref(&verified_left.magnitude_db),
+        &[1.0],
+        &target_db,
+        &left_filter_db,
+        None,
+        &thresholds,
+    )
+    .map_err(|error| format!("left SECS closed-loop validation failed: {error}"))?;
+    let right_report = validate_frequency_prediction(
+        &frequencies_hz,
+        std::slice::from_ref(&raw_right.magnitude_db),
+        std::slice::from_ref(&verified_right.magnitude_db),
+        &[1.0],
+        &target_db,
+        &right_filter_db,
+        None,
+        &thresholds,
+    )
+    .map_err(|error| format!("right SECS closed-loop validation failed: {error}"))?;
+
+    let agreement_indices = frequencies_hz
+        .iter()
+        .enumerate()
+        .filter_map(|(index, frequency)| {
+            (PREDICTION_VERIFICATION_LOW_HZ..=PREDICTION_VERIFICATION_HIGH_HZ)
+                .contains(frequency)
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    if agreement_indices.is_empty() {
+        return Err("SECS closed-loop agreement band has no response bins".to_string());
+    }
+    let agreement_frequencies_hz = agreement_indices
+        .iter()
+        .map(|index| frequencies_hz[*index])
+        .collect::<Vec<_>>();
+    let select_agreement_band = |values: &[f64]| {
+        agreement_indices
+            .iter()
+            .map(|index| values[*index])
+            .collect::<Vec<_>>()
+    };
+    let predicted_left_agreement = select_agreement_band(&predicted_left);
+    let predicted_right_agreement = select_agreement_band(&predicted_right);
+    let verified_left_agreement = select_agreement_band(&verified_left.magnitude_db);
+    let verified_right_agreement = select_agreement_band(&verified_right.magnitude_db);
+    let raw_left_agreement = select_agreement_band(&raw_left.magnitude_db);
+    let raw_right_agreement = select_agreement_band(&raw_right.magnitude_db);
+    let left_applied_correction_scale = fitted_applied_correction_scale(
+        &agreement_frequencies_hz,
+        &raw_left_agreement,
+        &predicted_left_agreement,
+        &verified_left_agreement,
+    );
+    let right_applied_correction_scale = fitted_applied_correction_scale(
+        &agreement_frequencies_hz,
+        &raw_right_agreement,
+        &predicted_right_agreement,
+        &verified_right_agreement,
+    );
+    let left_unsmoothed_predicted_verified_rmse_db =
+        rmse_between(&predicted_left_agreement, &verified_left_agreement)?;
+    let right_unsmoothed_predicted_verified_rmse_db =
+        rmse_between(&predicted_right_agreement, &verified_right_agreement)?;
+    let left_predicted_verified_rmse_db = log_frequency_smoothed_rmse_db(
+        &agreement_frequencies_hz,
+        &predicted_left_agreement,
+        &verified_left_agreement,
+    )
+    .map_err(|error| format!("left SECS prediction-agreement scoring failed: {error}"))?;
+    let right_predicted_verified_rmse_db = log_frequency_smoothed_rmse_db(
+        &agreement_frequencies_hz,
+        &predicted_right_agreement,
+        &verified_right_agreement,
+    )
+    .map_err(|error| format!("right SECS prediction-agreement scoring failed: {error}"))?;
+
+    let smoothed_cell_rmse = |values_db: &[f64]| -> Option<f64> {
+        let smoothed = log_frequency_smoothed_curve(&frequencies_hz, values_db);
+        octave_cell_rmse_db(&frequencies_hz, &smoothed, &target_db)
+    };
+    let left_gate_raw_rmse_db = smoothed_cell_rmse(&raw_left.magnitude_db);
+    let left_gate_verified_rmse_db = smoothed_cell_rmse(&verified_left.magnitude_db);
+    let right_gate_raw_rmse_db = smoothed_cell_rmse(&raw_right.magnitude_db);
+    let right_gate_verified_rmse_db = smoothed_cell_rmse(&verified_right.magnitude_db);
+    let left_gate_predicted_rmse_db = smoothed_cell_rmse(&predicted_left);
+    let right_gate_predicted_rmse_db = smoothed_cell_rmse(&predicted_right);
+
+    let mut issues = Vec::new();
+    let mut improvement_passed = [true, true];
+    for (index, (channel, report, gate_raw, gate_verified)) in [
+        (
+            LiveChannel::Left,
+            &left_report,
+            left_gate_raw_rmse_db,
+            left_gate_verified_rmse_db,
+        ),
+        (
+            LiveChannel::Right,
+            &right_report,
+            right_gate_raw_rmse_db,
+            right_gate_verified_rmse_db,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for issue in &report.issues {
+            match issue {
+                ValidationIssue::OverallRmseDidNotImprove { .. } => {
+                    // Replaced below by the smoothed octave-cell judgment.
+                }
+                ValidationIssue::ExcessiveAttenuation { .. } => {
+                    // Not applicable to SECS: the 12.05 dB ceiling encodes
+                    // the Phase 4 bounded-gain design contract, while SECS
+                    // cuts are unbounded by design (disclosed on the toggle
+                    // and in STATUS). Whether a deep cut was justified is
+                    // judged by the measured improvement, agreement, and
+                    // applied-scale gates instead. PositiveCorrectionGain is
+                    // deliberately NOT exempted: the SECS peak normalization
+                    // keeps the filter at or below 0 dB, so any positive
+                    // gain means the normalization itself broke.
+                }
+                other => issues.push(format!("{}_verification:{other:?}", channel.as_str())),
+            }
+        }
+        match (gate_raw, gate_verified) {
+            (Some(raw_db), Some(verified_db)) => {
+                let predicted_db = match index {
+                    0 => left_gate_predicted_rmse_db,
+                    _ => right_gate_predicted_rmse_db,
+                };
+                let improved_on_raw = verified_db < raw_db;
+                let delivered_prediction =
+                    predicted_db.is_some_and(|predicted_db| verified_db <= predicted_db);
+                if !improved_on_raw && !delivered_prediction {
+                    improvement_passed[index] = false;
+                    issues.push(format!(
+                        "{}_verification:SmoothedOctaveRmseDidNotImprove {{ raw_db: {raw_db:.4}, verified_db: {verified_db:.4}, predicted_db: {} }}",
+                        channel.as_str(),
+                        predicted_db.map_or("unavailable".to_string(), |value| format!("{value:.4}")),
+                    ));
+                }
+            }
+            _ => {
+                if let Some(original) = report
+                    .issues
+                    .iter()
+                    .find(|issue| matches!(issue, ValidationIssue::OverallRmseDidNotImprove { .. }))
+                {
+                    improvement_passed[index] = false;
+                    issues.push(format!("{}_verification:{original:?}", channel.as_str()));
+                }
+            }
+        }
+    }
+    issues.extend(session_gain_issues);
+    for (label, scale) in [
+        ("left", left_applied_correction_scale),
+        ("right", right_applied_correction_scale),
+    ] {
+        if let Some(scale) = scale {
+            if !(MINIMUM_APPLIED_CORRECTION_SCALE..=MAXIMUM_APPLIED_CORRECTION_SCALE)
+                .contains(&scale)
+            {
+                issues.push(format!(
+                    "{label}_applied_correction_scale:{scale:.2}/allowed{MINIMUM_APPLIED_CORRECTION_SCALE:.2}-{MAXIMUM_APPLIED_CORRECTION_SCALE:.2}"
+                ));
+            }
+        }
+    }
+    if left_predicted_verified_rmse_db > MAXIMUM_PREDICTED_VERIFIED_RMSE_DB {
+        issues.push(format!(
+            "left_smoothed_predicted_verified_rmse:{left_predicted_verified_rmse_db:.3}dB"
+        ));
+    }
+    if right_predicted_verified_rmse_db > MAXIMUM_PREDICTED_VERIFIED_RMSE_DB {
+        issues.push(format!(
+            "right_smoothed_predicted_verified_rmse:{right_predicted_verified_rmse_db:.3}dB"
+        ));
+    }
+    // Mirrors the issue-mapping exemptions above: the overall-RMSE verdict is
+    // replaced by the octave-cell judgment, and ExcessiveAttenuation encodes
+    // the Phase 4 bounded-gain contract that SECS deliberately does not have.
+    let non_improvement_issues_pass = |report: &ValidationReport| {
+        report.issues.iter().all(|issue| {
+            matches!(
+                issue,
+                ValidationIssue::OverallRmseDidNotImprove { .. }
+                    | ValidationIssue::ExcessiveAttenuation { .. }
+            )
+        })
+    };
+    let left_passed = non_improvement_issues_pass(&left_report)
+        && improvement_passed[0]
+        && left_predicted_verified_rmse_db <= MAXIMUM_PREDICTED_VERIFIED_RMSE_DB;
+    let right_passed = non_improvement_issues_pass(&right_report)
+        && improvement_passed[1]
+        && right_predicted_verified_rmse_db <= MAXIMUM_PREDICTED_VERIFIED_RMSE_DB;
+
+    // Result plot with the same display smoothing as the Phase 4 loop. The
+    // SECS target is shared by both channels (the right filter is balanced
+    // onto the left reference), and there are no protected dips or bounded
+    // boost markers to draw.
+    let plot_frequencies_hz = result_plot_frequency_grid(&frequencies_hz, 420)?;
+    let smooth = |values: &[f64], label: &str| {
+        gaussian_log_frequency_smooth_at_db(
+            &frequencies_hz,
+            values,
+            &plot_frequencies_hz,
+            LIVE_RESULT_PLOT_SMOOTHING_FWHM_OCTAVES,
+        )
+        .map_err(|error| format!("could not smooth {label} for the SECS result plot: {error}"))
+    };
+    let raw_left_plot = smooth(&raw_left.magnitude_db, "raw P0 L")?;
+    let raw_right_plot = smooth(&raw_right.magnitude_db, "raw P0 R")?;
+    let raw_average_plot = energy_average_pair(&raw_left_plot, &raw_right_plot)?;
+    let target_plot =
+        interpolate_log_frequency_grid(&frequencies_hz, &target_db, &plot_frequencies_hz).map_err(
+            |error| format!("could not interpolate the SECS target for the result plot: {error}"),
+        )?;
+    let predicted_left_plot = smooth(&predicted_left, "predicted P0 L")?;
+    let predicted_right_plot = smooth(&predicted_right, "predicted P0 R")?;
+    let predicted_average_plot = energy_average_pair(&predicted_left_plot, &predicted_right_plot)?;
+    let verified_left_plot = smooth(&verified_left.magnitude_db, "verified P0 L")?;
+    let verified_right_plot = smooth(&verified_right.magnitude_db, "verified P0 R")?;
+    let verified_average_plot = energy_average_pair(&verified_left_plot, &verified_right_plot)?;
+    let frequency_response = LiveFrequencyResponsePlot {
+        algorithm_version: LIVE_RESULT_PLOT_VERSION,
+        display_smoothing_fwhm_octaves: LIVE_RESULT_PLOT_SMOOTHING_FWHM_OCTAVES,
+        frequencies_hz: plot_frequencies_hz.clone(),
+        raw_left_db: raw_left_plot,
+        raw_right_db: raw_right_plot,
+        raw_average_db: raw_average_plot,
+        target_left_db: target_plot.clone(),
+        target_right_db: target_plot.clone(),
+        target_average_db: target_plot,
+        predicted_left_db: predicted_left_plot,
+        predicted_right_db: predicted_right_plot,
+        predicted_average_db: predicted_average_plot,
+        verified_left_db: verified_left_plot,
+        verified_right_db: verified_right_plot,
+        verified_average_db: verified_average_plot,
+        // SECS corrects the full displayed band; the judged band above is
+        // still 20-650 Hz (see the function comment).
+        correction_low_hz: 20.0,
+        correction_high_hz: 20_000.0,
+        taper_end_hz: 20_000.0,
+        protected_dip_frequencies_hz: Vec::new(),
+        corrected_peak_frequencies_hz: Vec::new(),
+    };
+    Ok(LiveVerificationSummary {
+        algorithm_version: format!("{SECS_ALGORITHM_VERSION}+{LIVE_CLOSED_LOOP_VERSION}"),
+        passed: left_passed && right_passed && issues.is_empty(),
+        left_passed,
+        right_passed,
+        left_raw_rmse_db: left_report.metrics.raw_rmse_db,
+        left_verified_rmse_db: left_report.metrics.predicted_rmse_db,
+        right_raw_rmse_db: right_report.metrics.raw_rmse_db,
+        right_verified_rmse_db: right_report.metrics.predicted_rmse_db,
+        left_predicted_verified_rmse_db,
+        right_predicted_verified_rmse_db,
+        left_unsmoothed_predicted_verified_rmse_db,
+        right_unsmoothed_predicted_verified_rmse_db,
+        left_gate_raw_rmse_db,
+        left_gate_verified_rmse_db,
+        right_gate_raw_rmse_db,
+        right_gate_verified_rmse_db,
+        prediction_verification_smoothing_fwhm_octaves:
+            eqforbeginner_dsp_core::validation::LOG_FREQUENCY_SMOOTHING_EFFECTIVE_FWHM_OCTAVES,
+        maximum_allowed_predicted_verified_rmse_db: MAXIMUM_PREDICTED_VERIFIED_RMSE_DB,
+        left_applied_correction_scale,
+        right_applied_correction_scale,
+        issues,
+        frequency_response,
+    })
+}
+
 fn validate_closed_loop(session: &LiveSession) -> Result<LiveVerificationSummary, String> {
-    let design = session
-        .design
-        .as_ref()
-        .ok_or_else(|| "create a Phase 4 trial filter before verification".to_string())?;
+    let design = match session.design.as_ref() {
+        Some(design) => design,
+        None => {
+            if let Some(secs) = session.secs_design.as_ref() {
+                return validate_secs_closed_loop(session, secs);
+            }
+            return Err("create a Phase 4 trial filter before verification".to_string());
+        }
+    };
     let design_length = design.result.design_frequencies_hz.len();
     let raw_left = p0_measurement(session, LiveCaptureKind::Baseline, LiveChannel::Left)?;
     let raw_right = p0_measurement(session, LiveCaptureKind::Baseline, LiveChannel::Right)?;
@@ -5239,6 +6568,223 @@ fn fir_worst_case_peak_bound_db(taps: &[f64]) -> Result<f64, String> {
     Ok(20.0 * l1_norm.log10())
 }
 
+/// Version of the (a)-mode SECS native-rate strategy: each Roon rate is a
+/// fresh SECS design on the P0 impulse resampled to that rate, with the
+/// verified trial's automatic delay locked.
+const SECS_NATIVE_RERUN_VERSION: &str = "secs-native-rerun-v1";
+
+/// Gross-corruption backstop for the SECS package: smoothed, level-aligned
+/// RMSE over 20-500 Hz between each rate's filter response and the verified
+/// 48 kHz member.
+///
+/// This is deliberately NOT a precision gate. Measured on the synthetic room
+/// fixture (2026-07-29): the legitimate cross-rate disagreement is 1.20 dB
+/// (narrow modal cuts realize differently on each rate's analysis grid -
+/// physics, not error), while a simulated rate-wiring bug (response axis off
+/// by 160/147) measures 1.42 dB - the two are not separable by any spectral
+/// threshold. Accuracy is therefore guaranteed by construction instead:
+/// the resampler and design are pinned to their Python references by parity
+/// fixtures, the 48 kHz member is byte-bound to the verified trial, the
+/// delay lock and per-rate tap counts are asserted structurally, and the
+/// per-rate agreement numbers are recorded as diagnostics. This ceiling only
+/// fails closed on catastrophic corruption (NaN-adjacent output, half-band
+/// garbage), which sits far above both figures.
+const SECS_CROSS_RATE_SANITY_RMSE_DB: f64 = 6.0;
+
+fn gcd_u32(mut a: u32, mut b: u32) -> u32 {
+    while b != 0 {
+        let remainder = a % b;
+        a = b;
+        b = remainder;
+    }
+    a
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SecsNativeRateRecord {
+    sample_rate_hz: u32,
+    taps: usize,
+    /// The rate's own normalization before level alignment.
+    preamp_db: f64,
+    /// Gain applied to align this member's 20-500 Hz level to the verified
+    /// 48 kHz member (0 for the 48 kHz member itself).
+    level_alignment_db: f64,
+    /// Diagnostic: smoothed, level-aligned 20-500 Hz RMSE against the
+    /// verified 48 kHz response (0 for the 48 kHz member itself).
+    smoothed_agreement_rmse_db: f64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FinalSecsProjectSnapshot {
+    project_version: &'static str,
+    session_id: String,
+    system_mode: LiveSystemMode,
+    system_declaration_path: String,
+    subwoofer_setup: Option<LiveSubwooferSetupSummary>,
+    subwoofer_search: Option<LiveSubwooferSearchSummary>,
+    subwoofer_optimization: Option<LiveSubwooferOptimizationSummary>,
+    verification_state: &'static str,
+    correction_algorithm: &'static str,
+    deconvolution_algorithm: &'static str,
+    calibration_algorithm: &'static str,
+    closed_loop_algorithm: &'static str,
+    native_rate_algorithm: &'static str,
+    headroom_algorithm: &'static str,
+    design: LiveSecsDesignSummary,
+    verified_trial_wav_sha256: String,
+    trial_activation_attestation: &'static str,
+    trial_activation_declared_at_unix_ms: Option<u64>,
+    /// `None` records that the user skipped closed-loop verification; the
+    /// package then never claims a measured result anywhere.
+    verification: Option<LiveVerificationSummary>,
+    recommended_headroom_db: f64,
+    measured_true_peak_ratio_db: f64,
+    maximum_filter_response_gain_db: f64,
+    program_material_peak_growth_db: f64,
+    fir_worst_case_peak_bound_db: f64,
+    absolute_safe_headroom_db: f64,
+    final_48k_binding_maximum_magnitude_difference_db: f64,
+    final_48k_binding_maximum_relative_group_delay_difference_ms: f64,
+    cross_rate_sanity_limit_rmse_db: f64,
+    native_rates: Vec<SecsNativeRateRecord>,
+    calibration: CalibrationImportSummary,
+    sweeps: Vec<LiveSweepImportSummary>,
+    captures: Vec<LiveCaptureSummary>,
+    final_zip: String,
+}
+
+/// Program-material peak-growth basis for the SECS headroom.
+///
+/// The v3 basis measures the registered sweep and the maximum
+/// frequency-response gain. A sweep is a single frequency at every instant
+/// and the peak-normalized SECS filter has a ~0 dB response peak, but a
+/// full-band mixed-phase filter rearranges the partials of broadband program
+/// material in time: the mathematical bound is the L1 norm (+16..+17.5 dB on
+/// the 2026-07-30 live package) and real content lands several dB of growth.
+/// On that live package the v3 basis recommended 1.3 dB while real playback
+/// still clipped at 3 dB; deterministic program proxies measured +2.8..+6.4
+/// dB of true-peak growth depending on the rate member. This function
+/// convolves one member's taps with those full-scale proxies and returns the
+/// worst sample-peak growth in dB:
+/// - low-frequency square waves (40/60/90/150 Hz), the measured worst case,
+/// - decaying kick bursts (35/50/80/120 Hz),
+/// - hard-clipped fixed-seed noise as a dense-master stand-in.
+///
+/// Everything is deterministic (fixed xorshift seed, no clock), so the same
+/// package always reports the same headroom.
+fn secs_program_peak_growth_db(sample_rate_hz: u32, taps: &[f64]) -> Result<f64, String> {
+    let rate = f64::from(sample_rate_hz);
+    let mut signals: Vec<Vec<f64>> = Vec::new();
+
+    // Low-frequency square waves, long enough for the full filter length
+    // (~0.51 s) to build the output peak up.
+    let mut squares = Vec::new();
+    for frequency_hz in [40.0f64, 60.0, 90.0, 150.0] {
+        let samples = (0.75 * rate) as usize;
+        for index in 0..samples {
+            let phase = (2.0 * std::f64::consts::PI * frequency_hz * index as f64 / rate).sin();
+            squares.push(0.98 * if phase >= 0.0 { 1.0 } else { -1.0 });
+        }
+    }
+    signals.push(squares);
+
+    // Kick-drum-like decaying sine bursts.
+    let mut kicks = Vec::new();
+    for frequency_hz in [35.0f64, 50.0, 80.0, 120.0] {
+        let samples = (0.4 * rate) as usize;
+        for index in 0..samples {
+            let t = index as f64 / rate;
+            kicks.push((2.0 * std::f64::consts::PI * frequency_hz * t).sin() * (-t / 0.12).exp());
+        }
+        kicks.extend(std::iter::repeat_n(0.0, (0.05 * rate) as usize));
+    }
+    signals.push(kicks);
+
+    // Hard-clipped noise from a fixed-seed xorshift64* generator.
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut noise = Vec::with_capacity((1.5 * rate) as usize);
+    for _ in 0..(1.5 * rate) as usize {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let uniform =
+            (state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64 / (1u64 << 53) as f64;
+        noise.push(((uniform * 2.0 - 1.0) * 1.5).clamp(-1.0, 1.0));
+    }
+    signals.push(noise);
+
+    let mut worst_growth_db = 0.0f64;
+    for signal in &signals {
+        let input_peak = signal.iter().fold(0.0f64, |peak, v| peak.max(v.abs()));
+        if input_peak <= 0.0 {
+            return Err("program-proxy signal has zero peak".to_string());
+        }
+        let filtered = fft_convolve(signal, taps)
+            .map_err(|error| format!("program-proxy convolution failed: {error}"))?;
+        let output_peak = filtered.iter().fold(0.0f64, |peak, v| peak.max(v.abs()));
+        worst_growth_db = worst_growth_db.max(20.0 * (output_peak / input_peak).log10());
+    }
+    Ok(worst_growth_db)
+}
+
+/// Headroom v3 for a SECS package, computed from the verified 48 kHz taps
+/// directly (the Phase 4 variant reads them out of the Phase 6 native set).
+fn secs_validation_signal_headroom_db(
+    session: &LiveSession,
+    left_taps: &[f64],
+    right_taps: &[f64],
+) -> Result<LiveHeadroomMetrics, String> {
+    let mut maximum_ratio_db = f64::NEG_INFINITY;
+    let mut maximum_fir_bound_db = f64::NEG_INFINITY;
+    let mut maximum_response_gain_db = f64::NEG_INFINITY;
+    for (channel, taps) in [
+        (LiveChannel::Left, left_taps),
+        (LiveChannel::Right, right_taps),
+    ] {
+        let reference = &session
+            .sweeps
+            .get(&channel)
+            .ok_or_else(|| format!("{} sweep disappeared", channel.as_str()))?
+            .samples;
+        let input_peak = oversampled_true_peak(reference, TRUE_PEAK_OVERSAMPLE)?;
+        let filtered = fft_convolve(reference, taps)
+            .map_err(|error| format!("validation-signal convolution failed: {error}"))?;
+        let output_peak = oversampled_true_peak(&filtered, TRUE_PEAK_OVERSAMPLE)?;
+        if input_peak <= 0.0 {
+            return Err(format!("{} sweep has zero true peak", channel.as_str()));
+        }
+        maximum_ratio_db = maximum_ratio_db.max(20.0 * (output_peak / input_peak).log10());
+        maximum_fir_bound_db = maximum_fir_bound_db.max(fir_worst_case_peak_bound_db(taps)?);
+        let response = frequency_response(
+            taps,
+            PROJECT_SAMPLE_RATE_HZ,
+            taps.len().next_power_of_two() * 4,
+        )
+        .map_err(|error| format!("headroom response evaluation failed: {error}"))?;
+        let channel_maximum = response
+            .magnitude_db
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max);
+        maximum_response_gain_db = maximum_response_gain_db.max(channel_maximum);
+    }
+    let round_up = |value: f64| (value * 10.0).ceil() / 10.0;
+    let recommended = round_up(
+        maximum_ratio_db.max(maximum_response_gain_db).max(0.0) + HEADROOM_SAFETY_MARGIN_DB,
+    );
+    let absolute_safe =
+        round_up(maximum_ratio_db.max(maximum_fir_bound_db).max(0.0) + HEADROOM_SAFETY_MARGIN_DB);
+    Ok(LiveHeadroomMetrics {
+        validation_signal_true_peak_ratio_db: maximum_ratio_db,
+        maximum_filter_response_gain_db: maximum_response_gain_db,
+        fir_worst_case_peak_bound_db: maximum_fir_bound_db,
+        recommended_headroom_db: recommended,
+        absolute_safe_headroom_db: absolute_safe,
+    })
+}
+
 fn validation_signal_headroom_db(
     session: &LiveSession,
     native: &Phase6NativeResult,
@@ -5346,21 +6892,34 @@ fn live_zip_artifact_source(
 ) -> Result<(PathBuf, Option<String>), String> {
     match artifact_kind {
         LiveZipArtifactKind::Trial => {
-            let design = session.design.as_ref().ok_or_else(|| {
-                "create the predicted trial before downloading its ZIP".to_string()
-            })?;
-            if !design.summary.numerical_passed {
-                return Err(
-                    "the current predicted trial did not pass numerical validation".to_string(),
-                );
+            if let Some(design) = session.design.as_ref() {
+                if !design.summary.numerical_passed {
+                    return Err(
+                        "the current predicted trial did not pass numerical validation".to_string(),
+                    );
+                }
+                return Ok((PathBuf::from(&design.summary.trial_zip_path), None));
             }
-            Ok((PathBuf::from(&design.summary.trial_zip_path), None))
+            if let Some(secs) = session.secs_design.as_ref() {
+                // SECS trials are predicted-only by definition; there is no
+                // numerical gate to check before handing over the ZIP.
+                return Ok((PathBuf::from(&secs.summary.trial_zip_path), None));
+            }
+            Err("create the predicted trial before downloading its ZIP".to_string())
         }
         LiveZipArtifactKind::Final => {
             let exported = session.last_export.as_ref().ok_or_else(|| {
                 "create the verified final package before downloading its ZIP".to_string()
             })?;
-            if !exported.cross_rate_passed || !exported.verification.passed {
+            // A predicted-only SECS package (verification: None) is a valid
+            // download - its labels carry the unverified state. A PRESENT
+            // but failed verification still blocks.
+            if !exported.cross_rate_passed
+                || exported
+                    .verification
+                    .as_ref()
+                    .is_some_and(|verification| !verification.passed)
+            {
                 return Err("the current final package did not pass export validation".to_string());
             }
             Ok((
@@ -5544,6 +7103,18 @@ impl LiveMeasurementState {
     }
 
     pub fn finalize_export(&self) -> Result<LiveExportSummary, String> {
+        self.finalize_export_inner(false)
+    }
+
+    /// User-requested predicted-only export: skips the closed-loop
+    /// verification requirement for the experimental SECS path and labels
+    /// every artifact accordingly. The Phase 4 path deliberately has no
+    /// skip - measured verification is its core promise.
+    pub fn finalize_export_skipping_verification(&self) -> Result<LiveExportSummary, String> {
+        self.finalize_export_inner(true)
+    }
+
+    fn finalize_export_inner(&self, skip_verification: bool) -> Result<LiveExportSummary, String> {
         let active = self
             .active_capture
             .lock()
@@ -5566,12 +7137,34 @@ impl LiveMeasurementState {
                 .ok_or_else(|| "live artifact counter overflowed".to_string())?;
             (session.clone(), index)
         };
+        if skip_verification {
+            if session.design.is_some() {
+                return Err(
+                    "skipping verification is only available for the experimental SECS path; the Phase 4 export keeps its measured-verification requirement"
+                        .to_string(),
+                );
+            }
+            let secs = session.secs_design.clone().ok_or_else(|| {
+                "design a SECS trial filter before a predicted-only export".to_string()
+            })?;
+            return self.finalize_secs_export(&session, &secs, artifact_index, None);
+        }
         let verification = validate_closed_loop(&session)?;
         if !verification.passed {
             return Err(format!(
                 "closed-loop verification did not pass: {}",
                 verification.issues.join(", ")
             ));
+        }
+        if session.design.is_none() {
+            if let Some(secs) = session.secs_design.clone() {
+                return self.finalize_secs_export(
+                    &session,
+                    &secs,
+                    artifact_index,
+                    Some(verification),
+                );
+            }
         }
         let design = session
             .design
@@ -5818,9 +7411,12 @@ impl LiveMeasurementState {
             absolute_safe_headroom_db,
             final_48k_binding_maximum_magnitude_difference_db,
             final_48k_binding_maximum_relative_group_delay_difference_ms,
+            // The Phase 4 filter is bounded cut-only minimum phase, whose
+            // broadband peak growth the v3 sweep basis already covers.
+            program_material_peak_growth_db: 0.0,
             native_rate_count: native.filters.len(),
             cross_rate_passed: native.cross_rate_passed,
-            verification,
+            verification: Some(verification),
         };
         let mut guard = self
             .session
@@ -5836,6 +7432,524 @@ impl LiveMeasurementState {
                 .as_ref()
                 .map(|current_design| current_design.evidence_sha256.as_str())
                 != Some(design.evidence_sha256.as_str())
+        {
+            return Err(
+                "live measurement evidence changed during final export; discard the stale package and export again"
+                    .to_string(),
+            );
+        }
+        current.last_export = Some(summary.clone());
+        Ok(summary)
+    }
+
+    /// (a)-mode SECS final export: resample the accepted P0 pair to each Roon
+    /// native rate with the same polyphase resampler SECS.py itself uses,
+    /// re-run the SECS design per rate with the verified trial's automatic
+    /// delay locked, and package the six results. The 48 kHz member must
+    /// reproduce the verified trial byte for byte (identical inputs through a
+    /// deterministic design), which is the strongest possible trial-to-final
+    /// response binding, and every other rate must agree with it over the
+    /// 20-500 Hz band it was verified in.
+    /// `verification: None` is the user-requested skip path: the package is
+    /// built from the predicted-only trial and every label (file name,
+    /// README, snapshot state) says so - an unverified package is never
+    /// presented as a verified one.
+    fn finalize_secs_export(
+        &self,
+        session: &LiveSession,
+        secs: &LiveSecsDesign,
+        artifact_index: u64,
+        verification: Option<LiveVerificationSummary>,
+    ) -> Result<LiveExportSummary, String> {
+        // The declared-active attestation exists to bind verification
+        // captures; the skip path has none, so it stays optional there.
+        let trial_activation_declared_at_unix_ms = if verification.is_some() {
+            Some(secs.user_declared_active_at_unix_ms.ok_or_else(|| {
+                "the exact trial filter is not declared active in Roon".to_string()
+            })?)
+        } else {
+            secs.user_declared_active_at_unix_ms
+        };
+        let left = p0_measurement(session, LiveCaptureKind::Baseline, LiveChannel::Left)?;
+        let right = p0_measurement(session, LiveCaptureKind::Baseline, LiveChannel::Right)?;
+        if left.calibrated_impulse_samples.is_empty() || right.calibrated_impulse_samples.is_empty()
+        {
+            return Err(
+                "the stored P0 measurements carry no impulse samples; remeasure P0".to_string(),
+            );
+        }
+        let locked_delay_ms = secs.summary.auto_delay_ms;
+
+        struct SecsRateDesign {
+            sample_rate_hz: u32,
+            taps: usize,
+            preamp_db: f64,
+            level_alignment_db: f64,
+            left_taps: Vec<f64>,
+            right_taps: Vec<f64>,
+            comparison_left_db: Vec<f64>,
+            comparison_right_db: Vec<f64>,
+        }
+        // 96 log-spaced points across the verified 20-500 Hz band for the
+        // cross-rate agreement check.
+        let comparison_frequencies_hz: Vec<f64> = (0..96)
+            .map(|index| (20.0f64.ln() + (500.0f64 / 20.0).ln() * index as f64 / 95.0).exp())
+            .collect();
+        // The multi-position average, when the verified trial used one, is
+        // rebuilt per rate from the same seats resampled the same way. With
+        // the trial's seat set unchanged (the evidence-generation check on
+        // store guarantees it), the 48 kHz member reproduces the trial's
+        // average bit for bit and the byte binding below stays intact.
+        let seats = if secs.settings.multi_position {
+            secs_seat_impulses(session)?
+        } else {
+            Vec::new()
+        };
+        let use_average = secs.settings.multi_position && seats.len() > 1;
+        let mut rate_designs = Vec::with_capacity(ROON_NATIVE_SAMPLE_RATES.len());
+        for sample_rate_hz in ROON_NATIVE_SAMPLE_RATES {
+            let resample = |samples: &[f64], label: &str| -> Result<Vec<f64>, String> {
+                if sample_rate_hz == PROJECT_SAMPLE_RATE_HZ {
+                    return Ok(samples.to_vec());
+                }
+                let divisor = gcd_u32(sample_rate_hz, PROJECT_SAMPLE_RATE_HZ);
+                secs_resample_poly(
+                    samples,
+                    sample_rate_hz / divisor,
+                    PROJECT_SAMPLE_RATE_HZ / divisor,
+                )
+                .map_err(|error| format!("{label} resample to {sample_rate_hz} Hz failed: {error}"))
+            };
+            let mut left_ir = resample(&left.calibrated_impulse_samples, "left P0")?;
+            let mut right_ir = resample(&right.calibrated_impulse_samples, "right P0")?;
+            // SECS.py zero-pads the loaded impulse to a fast FFT length.
+            let padded_length = secs_next_fast_len(left_ir.len());
+            left_ir.resize(padded_length, 0.0);
+            right_ir.resize(padded_length, 0.0);
+            let averaged_magnitudes = if use_average {
+                let mut rate_seats = Vec::with_capacity(seats.len());
+                for (id, weight, seat_left, seat_right) in &seats {
+                    rate_seats.push((
+                        id.clone(),
+                        *weight,
+                        resample(seat_left, "seat")?,
+                        resample(seat_right, "seat")?,
+                    ));
+                }
+                Some(secs_average_magnitudes(&rate_seats, padded_length)?)
+            } else {
+                None
+            };
+            let magnitude_overrides = averaged_magnitudes
+                .as_ref()
+                .map(|(left, right)| (left.as_slice(), right.as_slice()));
+            // Exactly the settings the verified trial ran with, at this
+            // rate, and with the trial's delay choice locked (in the
+            // low/zero latency modes the design forces delay 0 itself).
+            let mut config = secs_config_for(&secs.settings, sample_rate_hz);
+            config.target_delay_ms = locked_delay_ms;
+            config.target_overlay = secs.target_overlay.clone();
+            config.shared_low_frequency_hz = secs.shared_low_frequency_hz;
+            let taps = config.taps;
+            // The delay is locked to the verified trial's choice so every
+            // rate carries the same latency and pre-ringing budget.
+            let design = design_secs_stereo_filter(
+                &left_ir,
+                &right_ir,
+                &config,
+                Some(std::slice::from_ref(&locked_delay_ms)),
+                magnitude_overrides,
+            )
+            .map_err(|error| format!("SECS design at {sample_rate_hz} Hz failed: {error}"))?;
+            if (design.auto_delay_ms - locked_delay_ms).abs() > 1e-9 {
+                return Err(format!(
+                    "SECS design at {sample_rate_hz} Hz drifted from the locked delay"
+                ));
+            }
+            rate_designs.push(SecsRateDesign {
+                sample_rate_hz,
+                taps,
+                preamp_db: design.preamp_db,
+                level_alignment_db: 0.0,
+                left_taps: design.left_taps,
+                right_taps: design.right_taps,
+                comparison_left_db: Vec::new(),
+                comparison_right_db: Vec::new(),
+            });
+        }
+
+        // Compute each member's response over the verified band.
+        for design in rate_designs.iter_mut() {
+            let sample_rate_hz = design.sample_rate_hz;
+            let comparison = |taps_signal: &[f64]| -> Result<Vec<f64>, String> {
+                let fft_size = taps_signal.len().next_power_of_two();
+                let response =
+                    frequency_response(taps_signal, sample_rate_hz, fft_size).map_err(|error| {
+                        format!("SECS response at {sample_rate_hz} Hz failed: {error}")
+                    })?;
+                Ok(comparison_frequencies_hz
+                    .iter()
+                    .map(|hz| {
+                        secs_interp_linear(*hz, &response.frequencies_hz, &response.magnitude_db)
+                    })
+                    .collect())
+            };
+            design.comparison_left_db = comparison(&design.left_taps)?;
+            design.comparison_right_db = comparison(&design.right_taps)?;
+        }
+
+        // Level continuity across sample rates. Each per-rate design carries
+        // its own normalization scalar and its own target anchor (both drift
+        // slightly with the analysis grid), so self-normalized members would
+        // play the corrected band at levels differing by up to ~1 dB and
+        // loudness would step when Roon switches sample rates. Align every
+        // member to the verified 48 kHz member by the mean 20-500 Hz response
+        // difference (one scalar per rate, both channels together, so the
+        // rate's own L/R balance is preserved). The 48 kHz member itself is
+        // never touched - byte identity with the verified trial. Any response
+        // peak above 0 dB this creates is charged to the headroom below.
+        let (reference_left, reference_right) = {
+            let reference = rate_designs
+                .iter()
+                .find(|design| design.sample_rate_hz == PROJECT_SAMPLE_RATE_HZ)
+                .ok_or_else(|| "SECS native set has no 48 kHz member".to_string())?;
+            (
+                reference.comparison_left_db.clone(),
+                reference.comparison_right_db.clone(),
+            )
+        };
+        let mut cross_rate_diagnostics = Vec::with_capacity(rate_designs.len());
+        for design in rate_designs.iter_mut() {
+            if design.sample_rate_hz == PROJECT_SAMPLE_RATE_HZ {
+                cross_rate_diagnostics.push((design.sample_rate_hz, 0.0));
+                continue;
+            }
+            let point_count = (reference_left.len() + reference_right.len()) as f64;
+            let alignment_db = (reference_left
+                .iter()
+                .zip(&design.comparison_left_db)
+                .chain(reference_right.iter().zip(&design.comparison_right_db))
+                .map(|(reference, member)| reference - member)
+                .sum::<f64>())
+                / point_count;
+            let gain = 10f64.powf(alignment_db / 20.0);
+            for tap in design
+                .left_taps
+                .iter_mut()
+                .chain(design.right_taps.iter_mut())
+            {
+                *tap *= gain;
+            }
+            for value in design
+                .comparison_left_db
+                .iter_mut()
+                .chain(design.comparison_right_db.iter_mut())
+            {
+                *value += alignment_db;
+            }
+            design.level_alignment_db = alignment_db;
+
+            // Recorded diagnostic + gross-corruption backstop on the
+            // smoothed, aligned curves (see SECS_CROSS_RATE_SANITY_RMSE_DB
+            // for why this is not a precision gate).
+            let smoothed_reference_left =
+                log_frequency_smoothed_curve(&comparison_frequencies_hz, &reference_left);
+            let smoothed_reference_right =
+                log_frequency_smoothed_curve(&comparison_frequencies_hz, &reference_right);
+            let smoothed_member_left = log_frequency_smoothed_curve(
+                &comparison_frequencies_hz,
+                &design.comparison_left_db,
+            );
+            let smoothed_member_right = log_frequency_smoothed_curve(
+                &comparison_frequencies_hz,
+                &design.comparison_right_db,
+            );
+            let left_rmse = rmse_between(&smoothed_member_left, &smoothed_reference_left)?;
+            let right_rmse = rmse_between(&smoothed_member_right, &smoothed_reference_right)?;
+            let worst = left_rmse.max(right_rmse);
+            cross_rate_diagnostics.push((design.sample_rate_hz, worst));
+            if worst > SECS_CROSS_RATE_SANITY_RMSE_DB {
+                return Err(format!(
+                    "SECS {} Hz member is grossly corrupted: {worst:.3} dB smoothed RMSE against the verified 48 kHz response over 20-500 Hz (backstop {SECS_CROSS_RATE_SANITY_RMSE_DB:.1} dB)",
+                    design.sample_rate_hz
+                ));
+            }
+        }
+
+        let package_directory = session
+            .root
+            .join("final")
+            .join(format!("package-secs-{artifact_index:06}"));
+        fs::create_dir_all(&package_directory).map_err(|error| {
+            format!(
+                "could not create final package directory {}: {error}",
+                package_directory.display()
+            )
+        })?;
+        let mut wav_paths = Vec::with_capacity(rate_designs.len());
+        let mut member_48k_sha256 = None;
+        for design in &rate_designs {
+            let path = package_directory.join(format!(
+                "EQforBeginner_{}_stereo.wav",
+                design.sample_rate_hz
+            ));
+            let fir = StereoFir {
+                sample_rate: design.sample_rate_hz,
+                left: design.left_taps.iter().map(|tap| *tap as f32).collect(),
+                right: design.right_taps.iter().map(|tap| *tap as f32).collect(),
+            };
+            write_stereo_wav(&path, &fir)
+                .map_err(|error| format!("could not write SECS native filter: {error}"))?;
+            if design.sample_rate_hz == PROJECT_SAMPLE_RATE_HZ {
+                let bytes = fs::read(&path)
+                    .map_err(|error| format!("could not hash the SECS 48 kHz member: {error}"))?;
+                member_48k_sha256 = Some(sha256_hex(&bytes));
+            }
+            wav_paths.push(path);
+        }
+        // Byte-identical binding: the exported 48 kHz member must be the
+        // exact trial WAV (the one the user verified, or - on the skip
+        // path - the one the trial ZIP shipped).
+        let member_48k_sha256 =
+            member_48k_sha256.ok_or_else(|| "SECS package lost its 48 kHz member".to_string())?;
+        if member_48k_sha256 != secs.evidence_sha256 {
+            return Err(
+                "final 48 kHz SECS member no longer matches the session's trial WAV".to_string(),
+            );
+        }
+        let final_48k_binding_maximum_magnitude_difference_db = 0.0;
+        let final_48k_binding_maximum_relative_group_delay_difference_ms = 0.0;
+        let worst_cross_rate_rmse_db = cross_rate_diagnostics
+            .iter()
+            .map(|(_, rmse)| *rmse)
+            .fold(0.0f64, f64::max);
+        let reference = rate_designs
+            .iter()
+            .find(|design| design.sample_rate_hz == PROJECT_SAMPLE_RATE_HZ)
+            .ok_or_else(|| "SECS native set has no 48 kHz member".to_string())?;
+
+        let headroom = secs_validation_signal_headroom_db(
+            session,
+            &reference.left_taps,
+            &reference.right_taps,
+        )?;
+        let measured_true_peak_ratio_db = headroom.validation_signal_true_peak_ratio_db;
+        // Level alignment can lift a non-48k member's response peak above
+        // 0 dB - by exactly its alignment when that member's own
+        // normalization was engaged (its normalized peak is then 0 dB), and
+        // by less otherwise. Charge that bound and every member's L1 to the
+        // headroom figures instead of trusting only the 48 kHz member.
+        let mut maximum_filter_response_gain_db = headroom.maximum_filter_response_gain_db;
+        let mut worst_fir_peak_bound_db = headroom.fir_worst_case_peak_bound_db;
+        // Program-material peak growth per member: the dominant headroom
+        // term for a full-band mixed-phase filter (see the function comment;
+        // the v3 sweep/response basis alone under-recommended by ~5 dB on
+        // the 2026-07-30 live package and real playback clipped).
+        let mut program_peak_growth_db = 0.0f64;
+        for design in &rate_designs {
+            maximum_filter_response_gain_db =
+                maximum_filter_response_gain_db.max(design.level_alignment_db.max(0.0));
+            for taps in [&design.left_taps, &design.right_taps] {
+                worst_fir_peak_bound_db =
+                    worst_fir_peak_bound_db.max(fir_worst_case_peak_bound_db(taps)?);
+                program_peak_growth_db = program_peak_growth_db
+                    .max(secs_program_peak_growth_db(design.sample_rate_hz, taps)?);
+            }
+        }
+        let fir_worst_case_peak_bound_db = worst_fir_peak_bound_db;
+        let round_up = |value: f64| (value * 10.0).ceil() / 10.0;
+        let recommended_headroom_db = round_up(
+            measured_true_peak_ratio_db
+                .max(maximum_filter_response_gain_db)
+                .max(program_peak_growth_db)
+                .max(0.0)
+                + HEADROOM_SAFETY_MARGIN_DB,
+        );
+        let absolute_safe_headroom_db = round_up(
+            measured_true_peak_ratio_db
+                .max(fir_worst_case_peak_bound_db)
+                .max(0.0)
+                + HEADROOM_SAFETY_MARGIN_DB,
+        );
+
+        let verified = verification.is_some();
+        let zip_path = session.root.join("final").join(format!(
+            "EQforBeginner_{}_secs_{}_{artifact_index:06}.zip",
+            session.id,
+            if verified { "verified" } else { "predicted" },
+        ));
+        let algorithm_version = if verified {
+            format!(
+                "{SECS_ALGORITHM_VERSION}+{LIVE_CLOSED_LOOP_VERSION}+{SECS_NATIVE_RERUN_VERSION}"
+            )
+        } else {
+            format!("{SECS_ALGORITHM_VERSION}+predicted-only+{SECS_NATIVE_RERUN_VERSION}")
+        };
+        let verification_readme_line = if verified {
+            "Closed-loop P0 L/R verification: passed (judged 20-650 Hz on smoothed\n\
+             curves; high frequencies are excluded from the judgment because a\n\
+             centimeter of microphone reposition changes them beyond any filter's\n\
+             control)."
+        } else {
+            "Closed-loop P0 L/R verification: NOT RUN - the user chose to skip it.\n\
+             This package is PREDICTED-ONLY: nothing here has been confirmed by a\n\
+             measurement made with the filter active."
+        };
+        let delay_wording = if verified {
+            "verified"
+        } else {
+            "trial's automatic"
+        };
+        let readme = format!(
+            "EQforBeginner {} developer-beta convolution (SECS advanced option)\n\
+             Project: {}\n\
+             Algorithm: {SECS_ALGORITHM_VERSION} - single-point (P0) full-band correction\n\
+             ported from the open-source SECS project.\n\
+             Correction: mixed phase (excess-phase inversion with per-band pre-ringing\n\
+             limits) plus minimum-phase magnitude EQ toward an adaptive target;\n\
+             designed from the central P0 pair only. Other seats are not part of\n\
+             this design's evidence.\n\
+             {verification_readme_line}\n\
+             Native rates: 44.1, 48, 88.2, 96, 176.4, 192 kHz - each designed from the\n\
+             same P0 measurement resampled to that rate, with the {delay_wording} delay of\n\
+             {locked_delay_ms:.1} ms locked. The 48 kHz member is byte-identical to the\n\
+             trial WAV. Other rates are level-aligned to it over 20-500 Hz so\n\
+             loudness does not step when Roon switches sample rates; their smoothed\n\
+             20-500 Hz agreement with the trial response is recorded in project.json\n\
+             (worst member: {worst_cross_rate_rmse_db:.2} dB - narrow modal cuts\n\
+             legitimately realize slightly differently on each rate's analysis grid).\n\
+             Any member response peak above 0 dB created by the level alignment is\n\
+             included in the recommended headroom.\n\
+             Recommended Roon headroom: {recommended_headroom_db:.1} dB\n\
+             Headroom basis (v3+program-peak-v1): the largest of the 4x-oversampled\n\
+             registered-sweep ratio ({measured_true_peak_ratio_db:.3} dB), the filter's\n\
+             maximum frequency-response gain ({maximum_filter_response_gain_db:.3} dB),\n\
+             and the measured peak growth of full-scale program-material proxies\n\
+             through every rate member ({program_peak_growth_db:.3} dB - a full-band\n\
+             mixed-phase filter grows broadband peaks in time even at a 0 dB response\n\
+             peak), plus {HEADROOM_SAFETY_MARGIN_DB:.1} dB inter-sample safety margin.\n\
+             The L1 worst-case bound ({fir_worst_case_peak_bound_db:.3} dB) gives the\n\
+             mathematically absolute-safe setting of {absolute_safe_headroom_db:.1} dB.\n\
+             Disable every previous convolution, load only this ZIP, set the recommended\n\
+             headroom, and watch Roon's clipping indicator.\n",
+            if verified {
+                "verified"
+            } else {
+                "PREDICTED-ONLY (verification skipped)"
+            },
+            session.id,
+        );
+        create_roon_six_rate_zip(&zip_path, &wav_paths, &algorithm_version, &readme)
+            .map_err(|error| format!("could not create final SECS six-rate Roon ZIP: {error}"))?;
+        validate_roon_six_rate_zip(&zip_path)
+            .map_err(|error| format!("final SECS Roon ZIP readback failed: {error}"))?;
+        let zip_bytes = fs::read(&zip_path)
+            .map_err(|error| format!("could not hash final SECS Roon ZIP: {error}"))?;
+        let zip_sha256 = sha256_hex(&zip_bytes);
+        let calibration = session
+            .calibration
+            .as_ref()
+            .ok_or_else(|| "calibration disappeared before export".to_string())?
+            .summary
+            .clone();
+        let project = FinalSecsProjectSnapshot {
+            project_version: LIVE_MEASUREMENT_PROJECT_VERSION,
+            session_id: session.id.clone(),
+            system_mode: session.system_mode,
+            system_declaration_path: session.system_declaration_path.display().to_string(),
+            subwoofer_setup: session.subwoofer_setup.clone(),
+            subwoofer_search: session.subwoofer_search.clone(),
+            subwoofer_optimization: session.subwoofer_optimization.clone(),
+            verification_state: if verified {
+                "hardware-remeasured-secs-mixed-phase"
+            } else {
+                "predicted-only-verification-skipped-by-user"
+            },
+            correction_algorithm: SECS_ALGORITHM_VERSION,
+            deconvolution_algorithm: KNOWN_SWEEP_DECONVOLUTION_VERSION,
+            calibration_algorithm: UMIK_CALIBRATION_PARSER_VERSION,
+            closed_loop_algorithm: LIVE_CLOSED_LOOP_VERSION,
+            native_rate_algorithm: SECS_NATIVE_RERUN_VERSION,
+            headroom_algorithm: SECS_HEADROOM_VERSION,
+            design: secs.summary.clone(),
+            verified_trial_wav_sha256: secs.evidence_sha256.clone(),
+            trial_activation_attestation: if trial_activation_declared_at_unix_ms.is_some() {
+                "user-declared-manual-roon"
+            } else {
+                "none-predicted-only"
+            },
+            trial_activation_declared_at_unix_ms,
+            verification: verification.clone(),
+            recommended_headroom_db,
+            measured_true_peak_ratio_db,
+            maximum_filter_response_gain_db,
+            program_material_peak_growth_db: program_peak_growth_db,
+            fir_worst_case_peak_bound_db,
+            absolute_safe_headroom_db,
+            final_48k_binding_maximum_magnitude_difference_db,
+            final_48k_binding_maximum_relative_group_delay_difference_ms,
+            cross_rate_sanity_limit_rmse_db: SECS_CROSS_RATE_SANITY_RMSE_DB,
+            native_rates: rate_designs
+                .iter()
+                .zip(&cross_rate_diagnostics)
+                .map(|(design, (_, agreement_rmse_db))| SecsNativeRateRecord {
+                    sample_rate_hz: design.sample_rate_hz,
+                    taps: design.taps,
+                    preamp_db: design.preamp_db,
+                    level_alignment_db: design.level_alignment_db,
+                    smoothed_agreement_rmse_db: *agreement_rmse_db,
+                })
+                .collect(),
+            calibration,
+            sweeps: session
+                .sweeps
+                .values()
+                .map(|sweep| sweep.summary.clone())
+                .collect(),
+            captures: session
+                .measurements
+                .values()
+                .map(|measurement| measurement.summary.clone())
+                .collect(),
+            final_zip: zip_path.display().to_string(),
+        };
+        let project_path = package_directory.join("project.json");
+        write_new_file(
+            &project_path,
+            &serde_json::to_vec_pretty(&project)
+                .map_err(|error| format!("could not serialize final SECS project: {error}"))?,
+        )?;
+        let summary = LiveExportSummary {
+            zip_path: zip_path.display().to_string(),
+            project_path: project_path.display().to_string(),
+            zip_sha256,
+            algorithm_version,
+            recommended_headroom_db,
+            measured_true_peak_ratio_db,
+            maximum_filter_response_gain_db,
+            program_material_peak_growth_db: program_peak_growth_db,
+            fir_worst_case_peak_bound_db,
+            absolute_safe_headroom_db,
+            final_48k_binding_maximum_magnitude_difference_db,
+            final_48k_binding_maximum_relative_group_delay_difference_ms,
+            native_rate_count: rate_designs.len(),
+            cross_rate_passed: true,
+            verification,
+        };
+        let mut guard = self
+            .session
+            .lock()
+            .map_err(|_| "live session state lock was poisoned".to_string())?;
+        let current = guard
+            .as_mut()
+            .ok_or_else(|| "live project was closed during final export".to_string())?;
+        if current.id != session.id
+            || current.evidence_generation != session.evidence_generation
+            || current
+                .secs_design
+                .as_ref()
+                .map(|current_secs| current_secs.evidence_sha256.as_str())
+                != Some(secs.evidence_sha256.as_str())
         {
             return Err(
                 "live measurement evidence changed during final export; discard the stale package and export again"
@@ -6322,10 +8436,10 @@ impl LiveMeasurementState {
             }
         }
         if kind == LiveCaptureKind::Verification {
-            let design = session.design.as_ref().ok_or_else(|| {
+            let (_, declared_at) = current_trial_binding(session).ok_or_else(|| {
                 "create the 48 kHz trial filter before verification capture".to_string()
             })?;
-            if design.user_declared_active_at_unix_ms.is_none() {
+            if declared_at.is_none() {
                 return Err(
                     "declare the exact trial filter active in Roon before verification capture"
                         .to_string(),
@@ -6357,12 +8471,10 @@ impl LiveMeasurementState {
                 | LiveCaptureKind::SubOnly
                 | LiveCaptureKind::Baseline => None,
                 LiveCaptureKind::Verification => Some(
-                    session
-                        .design
-                        .as_ref()
+                    current_trial_binding(session)
                         .expect("verification design checked above")
-                        .evidence_sha256
-                        .clone(),
+                        .0
+                        .to_string(),
                 ),
             },
             input_device_id: input_device_id.to_string(),
@@ -6426,10 +8538,13 @@ impl LiveMeasurementState {
         let session = guard
             .as_mut()
             .ok_or_else(|| "start a live project before declaring the trial".to_string())?;
-        let design = session.design.as_mut().ok_or_else(|| {
-            "create the 48 kHz trial filter before declaring it active".to_string()
-        })?;
-        design.user_declared_active_at_unix_ms = declared_at;
+        if let Some(design) = session.design.as_mut() {
+            design.user_declared_active_at_unix_ms = declared_at;
+        } else if let Some(secs) = session.secs_design.as_mut() {
+            secs.user_declared_active_at_unix_ms = declared_at;
+        } else {
+            return Err("create the 48 kHz trial filter before declaring it active".to_string());
+        }
         session
             .measurements
             .retain(|(kind, _, _), _| *kind != LiveCaptureKind::Verification);
@@ -8639,8 +10754,11 @@ fn position_sort_key(position_id: &str) -> (u8, &str) {
         "P3" => (3, position_id),
         "P4" => (4, position_id),
         "P5" => (5, position_id),
-        "P0_END" => (6, position_id),
-        _ => (7, position_id),
+        "P6" => (6, position_id),
+        "P7" => (7, position_id),
+        "P8" => (8, position_id),
+        "P0_END" => (9, position_id),
+        _ => (10, position_id),
     }
 }
 
@@ -9070,6 +11188,9 @@ impl LiveMeasurementState {
         session
             .measurements
             .retain(|(kind, _, _), _| *kind != LiveCaptureKind::Verification);
+        // The two design paths are mutually exclusive: a fresh Phase 4 trial
+        // supersedes any SECS trial so exactly one current trial exists.
+        session.secs_design = None;
         session.design = Some(LiveDesign {
             summary: summary.clone(),
             target_name: config.target.name().to_string(),
@@ -9085,4 +11206,556 @@ impl LiveMeasurementState {
         advance_evidence_generation(session)?;
         Ok(summary)
     }
+
+    /// Design a predicted-only SECS trial from the accepted central P0 pair
+    /// (advanced option).
+    ///
+    /// This runs the ported single-point SECS algorithm
+    /// (`eqforbeginner_dsp_core::secs`) instead of the bounded Phase 4
+    /// design: full-band adaptive-target magnitude correction plus
+    /// pre-ringing-limited excess-phase inversion, designed from P0 only.
+    /// Stage 2 wiring is deliberate about its limits: the trial ZIP is
+    /// emitted for listening, but declaration, closed-loop verification, and
+    /// final export stay locked while a SECS trial is the current one.
+    pub fn design_secs_trial(
+        &self,
+        settings: LiveSecsDesignSettings,
+    ) -> Result<LiveSecsDesignSummary, String> {
+        validate_secs_settings(&settings)?;
+        let active = self
+            .active_capture
+            .lock()
+            .map_err(|_| "live capture state lock was poisoned".to_string())?;
+        if active.is_some() {
+            return Err("finish the active microphone capture before filter design".to_string());
+        }
+        let (
+            left_impulse,
+            right_impulse,
+            left_response,
+            right_response,
+            seats,
+            target_overlay,
+            shared_low_frequency_hz,
+            root,
+            artifact_index,
+            session_id,
+            evidence_generation,
+            system_mode,
+            subwoofer_setup,
+        ) = {
+            let mut guard = self
+                .session
+                .lock()
+                .map_err(|_| "live session state lock was poisoned".to_string())?;
+            let session = guard
+                .as_mut()
+                .ok_or_else(|| "start a live project before filter design".to_string())?;
+            // 2.1 projects are allowed (2026-07-30 review). Bass management
+            // is linear, and the 2.1 baseline captures the combined
+            // main+sub path per channel, so correcting each channel's
+            // measured transfer function independently is exact at the seat
+            // by superposition - program channel-correlation does not enter.
+            // (The stage-2 refusal argued otherwise and was wrong.) The
+            // remaining nuance - the sub band is one shared driver, so an
+            // L/R disagreement there is noise on the same path (11.8 dB of
+            // spurious split measured at 37 Hz on the first live 2.1
+            // package) - is handled by the shared-sub-band commonization
+            // below the confirmed crossover, the SECS analog of Phase 4's
+            // common-low-bass constraint.
+            if session.calibration.is_none()
+                || ![LiveChannel::Left, LiveChannel::Right]
+                    .iter()
+                    .all(|channel| session.sweeps.contains_key(channel))
+            {
+                return Err(
+                    "calibration and both measurement sweeps are required before design"
+                        .to_string(),
+                );
+            }
+            let left = p0_measurement(session, LiveCaptureKind::Baseline, LiveChannel::Left)?;
+            let right = p0_measurement(session, LiveCaptureKind::Baseline, LiveChannel::Right)?;
+            if left.calibrated_impulse_samples.is_empty()
+                || right.calibrated_impulse_samples.is_empty()
+            {
+                return Err(
+                    "the stored P0 measurements carry no impulse samples; remeasure P0 with this build"
+                        .to_string(),
+                );
+            }
+            let left_impulse = left.calibrated_impulse_samples.clone();
+            let right_impulse = right.calibrated_impulse_samples.clone();
+            // Deconvolved responses for the predicted-only result plot.
+            let left_response = (left.frequencies_hz.clone(), left.magnitude_db.clone());
+            let right_response = (right.frequencies_hz.clone(), right.magnitude_db.clone());
+            let seats = if settings.multi_position {
+                secs_seat_impulses(session)?
+            } else {
+                Vec::new()
+            };
+            let target_overlay = settings
+                .target_curve
+                .overlay(session.custom_target.as_ref())?;
+            // 2.1: one shared subwoofer reproduces both channels below the
+            // confirmed crossover; the design commonizes L/R there.
+            let shared_low_frequency_hz = match session.system_mode {
+                LiveSystemMode::SingleSub21 => session
+                    .subwoofer_setup
+                    .as_ref()
+                    .map(|setup| setup.crossover_hz),
+                _ => None,
+            };
+            let index = session.next_artifact_index;
+            session.next_artifact_index = session
+                .next_artifact_index
+                .checked_add(1)
+                .ok_or_else(|| "live artifact counter overflowed".to_string())?;
+            (
+                left_impulse,
+                right_impulse,
+                left_response,
+                right_response,
+                seats,
+                target_overlay,
+                shared_low_frequency_hz,
+                session.root.clone(),
+                index,
+                session.id.clone(),
+                session.evidence_generation,
+                session.system_mode,
+                session.subwoofer_setup.clone(),
+            )
+        };
+
+        // The user's advanced-option settings drive the design; a fixed
+        // delay narrows the search to that single candidate, and the
+        // low/zero latency modes design minimum phase only.
+        let mut config = secs_config_for(&settings, PROJECT_SAMPLE_RATE_HZ);
+        config.target_overlay = target_overlay.clone();
+        config.shared_low_frequency_hz = shared_low_frequency_hz;
+        let taps = config.taps;
+        let fixed_delay = settings.fixed_delay_ms;
+        // Multi-position magnitude: seat-weighted RMS average on the P0 FFT
+        // grid. With only P0 accepted this is exactly the P0 magnitude, so
+        // the plain path is used and the summary reports one position.
+        let (averaged_magnitudes, position_count) = if settings.multi_position && seats.len() > 1 {
+            for (id, _, seat_left, seat_right) in &seats {
+                if seat_left.len() != left_impulse.len() || seat_right.len() != right_impulse.len()
+                {
+                    return Err(format!(
+                        "seat {id} impulse grid differs from P0; remeasure the session with one build"
+                    ));
+                }
+            }
+            (
+                Some(secs_average_magnitudes(&seats, left_impulse.len())?),
+                seats.len(),
+            )
+        } else {
+            (None, 1)
+        };
+        let magnitude_overrides = averaged_magnitudes
+            .as_ref()
+            .map(|(left, right)| (left.as_slice(), right.as_slice()));
+        let design = design_secs_stereo_filter(
+            &left_impulse,
+            &right_impulse,
+            &config,
+            fixed_delay.as_ref().map(std::slice::from_ref),
+            magnitude_overrides,
+        )
+        .map_err(|error| format!("SECS design failed: {error}"))?;
+
+        // Honest predicted numbers over the product band: RMSE of P0 against
+        // the SECS target before and after applying the designed filter. The
+        // SECS target is absolute (anchored on its own reference magnitude),
+        // and the left target also judges the right channel because SECS
+        // balances the right filter onto the left reference.
+        let response_fft_size = left_impulse.len().max(taps).next_power_of_two();
+        let secs_target_db_at = |hz: f64| -> f64 {
+            let magnitude =
+                secs_interp_linear(hz, &design.target_frequencies_hz, &design.target_magnitude);
+            20.0 * (magnitude + 1e-12).log10()
+        };
+        let banded_rmse = |impulse: &[f64], taps_signal: &[f64]| -> Result<(f64, f64), String> {
+            let raw = frequency_response(impulse, PROJECT_SAMPLE_RATE_HZ, response_fft_size)
+                .map_err(|error| format!("SECS raw response failed: {error}"))?;
+            let filter = frequency_response(taps_signal, PROJECT_SAMPLE_RATE_HZ, response_fft_size)
+                .map_err(|error| format!("SECS filter response failed: {error}"))?;
+            let mut raw_squares = 0.0;
+            let mut predicted_squares = 0.0;
+            let mut bins = 0usize;
+            for (index, frequency) in raw.frequencies_hz.iter().enumerate() {
+                if *frequency < 20.0 || *frequency > 500.0 {
+                    continue;
+                }
+                let target_db = secs_target_db_at(*frequency);
+                let raw_error = raw.magnitude_db[index] - target_db;
+                let predicted_error =
+                    raw.magnitude_db[index] + filter.magnitude_db[index] - target_db;
+                raw_squares += raw_error * raw_error;
+                predicted_squares += predicted_error * predicted_error;
+                bins += 1;
+            }
+            if bins == 0 {
+                return Err("no 20-500 Hz bins available for the SECS summary".to_string());
+            }
+            Ok((
+                (raw_squares / bins as f64).sqrt(),
+                (predicted_squares / bins as f64).sqrt(),
+            ))
+        };
+        let (left_raw_rmse_db, left_predicted_rmse_db) =
+            banded_rmse(&left_impulse, &design.left_taps)?;
+        let (right_raw_rmse_db, right_predicted_rmse_db) =
+            banded_rmse(&right_impulse, &design.right_taps)?;
+
+        // Predicted-only result plot: raw, target, and predicted curves on
+        // the same display grid the closed-loop chart uses. The verified
+        // curves stay EMPTY - they exist only after a real remeasurement
+        // with this filter active, and the chart hides the verified toggle
+        // while they are absent.
+        let analysis_fft_size =
+            eqforbeginner_dsp_core::measurement::SweepDeconvolutionConfig::default()
+                .analysis_fft_size;
+        let filter_db_on = |taps_signal: &[f64], grid: &[f64]| -> Result<Vec<f64>, String> {
+            let response =
+                frequency_response(taps_signal, PROJECT_SAMPLE_RATE_HZ, analysis_fft_size)
+                    .map_err(|error| format!("SECS filter response failed: {error}"))?;
+            Ok(grid
+                .iter()
+                .map(|hz| secs_interp_linear(*hz, &response.frequencies_hz, &response.magnitude_db))
+                .collect())
+        };
+        let (left_grid_hz, left_raw_db) = &left_response;
+        let (right_grid_hz, right_raw_db) = &right_response;
+        let left_filter_db = filter_db_on(&design.left_taps, left_grid_hz)?;
+        let right_filter_db = filter_db_on(&design.right_taps, right_grid_hz)?;
+        let predicted_left_db: Vec<f64> = left_raw_db
+            .iter()
+            .zip(&left_filter_db)
+            .map(|(raw, filter)| raw + filter)
+            .collect();
+        let predicted_right_db: Vec<f64> = right_raw_db
+            .iter()
+            .zip(&right_filter_db)
+            .map(|(raw, filter)| raw + filter)
+            .collect();
+        let target_db_grid: Vec<f64> = left_grid_hz
+            .iter()
+            .map(|hz| {
+                20.0 * (secs_interp_linear(
+                    *hz,
+                    &design.target_frequencies_hz,
+                    &design.target_magnitude,
+                ) + 1e-12)
+                    .log10()
+            })
+            .collect();
+        let plot_frequencies_hz = result_plot_frequency_grid(left_grid_hz, 420)?;
+        let smooth = |grid: &[f64], values: &[f64], label: &str| {
+            gaussian_log_frequency_smooth_at_db(
+                grid,
+                values,
+                &plot_frequencies_hz,
+                LIVE_RESULT_PLOT_SMOOTHING_FWHM_OCTAVES,
+            )
+            .map_err(|error| format!("could not smooth {label} for the SECS design plot: {error}"))
+        };
+        let raw_left_plot = smooth(left_grid_hz, left_raw_db, "raw P0 L")?;
+        let raw_right_plot = smooth(right_grid_hz, right_raw_db, "raw P0 R")?;
+        let raw_average_plot = energy_average_pair(&raw_left_plot, &raw_right_plot)?;
+        let target_plot =
+            interpolate_log_frequency_grid(left_grid_hz, &target_db_grid, &plot_frequencies_hz)
+                .map_err(|error| {
+                    format!("could not interpolate the SECS target for the design plot: {error}")
+                })?;
+        let predicted_left_plot = smooth(left_grid_hz, &predicted_left_db, "predicted P0 L")?;
+        let predicted_right_plot = smooth(right_grid_hz, &predicted_right_db, "predicted P0 R")?;
+        let predicted_average_plot =
+            energy_average_pair(&predicted_left_plot, &predicted_right_plot)?;
+        let frequency_response_plot = LiveFrequencyResponsePlot {
+            algorithm_version: LIVE_RESULT_PLOT_VERSION,
+            display_smoothing_fwhm_octaves: LIVE_RESULT_PLOT_SMOOTHING_FWHM_OCTAVES,
+            frequencies_hz: plot_frequencies_hz,
+            raw_left_db: raw_left_plot,
+            raw_right_db: raw_right_plot,
+            raw_average_db: raw_average_plot,
+            target_left_db: target_plot.clone(),
+            target_right_db: target_plot.clone(),
+            target_average_db: target_plot,
+            predicted_left_db: predicted_left_plot,
+            predicted_right_db: predicted_right_plot,
+            predicted_average_db: predicted_average_plot,
+            verified_left_db: Vec::new(),
+            verified_right_db: Vec::new(),
+            verified_average_db: Vec::new(),
+            correction_low_hz: 20.0,
+            correction_high_hz: 20_000.0,
+            taper_end_hz: 20_000.0,
+            protected_dip_frequencies_hz: Vec::new(),
+            corrected_peak_frequencies_hz: Vec::new(),
+        };
+
+        let trial_wav_path = root
+            .join("trial")
+            .join(format!("trial-secs-{artifact_index:06}-48000-stereo.wav"));
+        let trial_zip_path = root
+            .join("trial")
+            .join(format!("trial-secs-{artifact_index:06}-roon.zip"));
+        let trial_fir = StereoFir {
+            sample_rate: PROJECT_SAMPLE_RATE_HZ,
+            left: design.left_taps.iter().map(|tap| *tap as f32).collect(),
+            right: design.right_taps.iter().map(|tap| *tap as f32).collect(),
+        };
+        write_stereo_wav(&trial_wav_path, &trial_fir)
+            .map_err(|error| format!("could not write 48 kHz SECS trial convolution: {error}"))?;
+        let trial_wav_sha256 =
+            sha256_hex(&fs::read(&trial_wav_path).map_err(|error| {
+                format!("could not hash 48 kHz SECS trial convolution: {error}")
+            })?);
+        let readme = format!(
+            "EQforBeginner developer live trial (SECS advanced option)\n\
+             State: predicted-only; not a final package.\n\
+             Load this ZIP in one Roon convolution slot, keep volume and microphone gain\n\
+             fixed, then perform the required P0 L/R verification measurements.\n\
+             Algorithm: {SECS_ALGORITHM_VERSION} - single-point (P0) full-band correction\n\
+             ported from the open-source SECS project.\n\
+             Correction: mixed phase (excess-phase inversion with per-band pre-ringing\n\
+             limits) plus minimum-phase magnitude EQ toward an adaptive target.\n\
+             Settings: boost cap +{:.1} dB, tilt {:.1} dB/oct, bass +{:.1} dB @ {:.0} Hz,\n\
+             resolution {:?}, curtain {:.0} Hz, latency {:?}, target delay {:.1} ms\n\
+             ({}).\n\
+             Target curve: {}.\n\
+             In a 2.1 project this corrects each channel's combined main+sub path as\n\
+             measured; below the confirmed crossover the L/R correction is commonized\n\
+             (one shared subwoofer reproduces both channels there): {}.\n\
+             The filter is pre-normalized to a 0 dB spectral peak (applied\n\
+             attenuation {:.2} dB), so no extra convolution preamp is required.\n",
+            settings.max_boost_db,
+            settings.tilt_db_per_octave,
+            settings.bass_boost_db,
+            settings.bass_frequency_hz,
+            settings.resolution,
+            settings.curtain_hz,
+            settings.latency_mode,
+            design.auto_delay_ms,
+            if settings.fixed_delay_ms.is_some() {
+                "fixed by the user"
+            } else {
+                "automatic search"
+            },
+            match target_overlay.as_ref() {
+                Some(curve) => format!("{} ({})", curve.name(), curve.version()),
+                None => "SECS adaptive flat target".to_string(),
+            },
+            match shared_low_frequency_hz {
+                Some(crossover_hz) =>
+                    format!("active below {crossover_hz:.0} Hz (fading out half an octave above)"),
+                None => "not active (2.0 project, or no confirmed subwoofer setup)".to_string(),
+            },
+            design.preamp_db,
+        );
+        create_roon_zip(
+            &trial_zip_path,
+            std::slice::from_ref(&trial_wav_path),
+            SECS_ALGORITHM_VERSION,
+            &readme,
+        )
+        .map_err(|error| format!("could not create SECS trial Roon ZIP: {error}"))?;
+
+        let summary = LiveSecsDesignSummary {
+            settings,
+            algorithm_version: SECS_ALGORITHM_VERSION.to_string(),
+            position_id: "P0".to_string(),
+            position_count,
+            multi_position_applied: magnitude_overrides.is_some(),
+            shared_sub_band_hz: shared_low_frequency_hz,
+            sample_rate_hz: PROJECT_SAMPLE_RATE_HZ,
+            taps,
+            auto_delay_ms: design.auto_delay_ms,
+            low_cutoff_hz: design.low_cutoff_hz,
+            high_cutoff_hz: design.high_cutoff_hz,
+            preamp_db: design.preamp_db,
+            channel_balance_trim_db: design.channel_balance_trim_db,
+            input_phase_score: design.input_phase_score,
+            left_raw_rmse_db,
+            left_predicted_rmse_db,
+            right_raw_rmse_db,
+            right_predicted_rmse_db,
+            trial_wav_path: trial_wav_path.display().to_string(),
+            trial_zip_path: trial_zip_path.display().to_string(),
+            frequency_response: frequency_response_plot,
+            warning:
+                "Predicted-only SECS trial designed from P0 alone. Final export stays locked until a new P0 L/R capture is made with this exact filter active in Roon."
+                    .to_string(),
+        };
+
+        let mut guard = self
+            .session
+            .lock()
+            .map_err(|_| "live session state lock was poisoned".to_string())?;
+        let session = guard
+            .as_mut()
+            .ok_or_else(|| "live project was closed during design".to_string())?;
+        if session.id != session_id
+            || session.evidence_generation != evidence_generation
+            || session.system_mode != system_mode
+            || session.subwoofer_setup != subwoofer_setup
+        {
+            return Err(
+                "live measurement evidence changed during filter design; discard the stale trial and design again"
+                    .to_string(),
+            );
+        }
+        session
+            .measurements
+            .retain(|(kind, _, _), _| *kind != LiveCaptureKind::Verification);
+        // Mutual exclusion mirrors design_trial: the SECS trial replaces any
+        // Phase 4 trial so exactly one current trial exists.
+        session.design = None;
+        session.secs_design = Some(LiveSecsDesign {
+            summary: summary.clone(),
+            settings,
+            target_overlay,
+            shared_low_frequency_hz,
+            evidence_sha256: trial_wav_sha256,
+            left_taps: design.left_taps,
+            right_taps: design.right_taps,
+            target_frequencies_hz: design.target_frequencies_hz,
+            target_magnitude: design.target_magnitude,
+            user_declared_active_at_unix_ms: None,
+        });
+        advance_evidence_generation(session)?;
+        Ok(summary)
+    }
+}
+
+/// Accepted baseline seats carrying impulse evidence, in a deterministic
+/// order, with the Phase 4 seat weights (P0 and P0_END weigh 1.0 each when
+/// the end repeat exists, P0 alone weighs 2.0, every surrounding seat 1.0).
+/// Seats whose pair is incomplete or predates impulse storage are skipped,
+/// mirroring the magnitude design's seat collection.
+/// One accepted baseline seat's identity, weight, and impulse pair.
+type SecsSeatImpulse = (String, f64, Vec<f64>, Vec<f64>);
+
+fn secs_seat_impulses(session: &LiveSession) -> Result<Vec<SecsSeatImpulse>, String> {
+    let mut ids: Vec<String> = session
+        .measurements
+        .keys()
+        .filter(|(kind, _, _)| *kind == LiveCaptureKind::Baseline)
+        .map(|(_, id, _)| id.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    ids.sort_by(|left, right| position_sort_key(left).cmp(&position_sort_key(right)));
+    let has_end_repeat = ids.iter().any(|id| id == "P0_END");
+    let mut seats = Vec::new();
+    for id in ids {
+        let left =
+            session
+                .measurements
+                .get(&(LiveCaptureKind::Baseline, id.clone(), LiveChannel::Left));
+        let right =
+            session
+                .measurements
+                .get(&(LiveCaptureKind::Baseline, id.clone(), LiveChannel::Right));
+        let (Some(left), Some(right)) = (left, right) else {
+            continue;
+        };
+        if !left.summary.accepted
+            || !right.summary.accepted
+            || left.calibrated_impulse_samples.is_empty()
+            || right.calibrated_impulse_samples.is_empty()
+        {
+            continue;
+        }
+        validate_stored_evidence(session, left)?;
+        validate_stored_evidence(session, right)?;
+        let weight = match id.as_str() {
+            "P0" | "P0_END" if has_end_repeat => 1.0,
+            "P0" => 2.0,
+            _ => 1.0,
+        };
+        seats.push((
+            id,
+            weight,
+            left.calibrated_impulse_samples.clone(),
+            right.calibrated_impulse_samples.clone(),
+        ));
+    }
+    Ok(seats)
+}
+
+/// Seat-weighted RMS (power-domain) magnitude average per channel on the
+/// `fft_size` grid, the same spatial statistic the Phase 4 design and the
+/// Dirac patent use for the magnitude side of a multi-position correction.
+fn secs_average_magnitudes(
+    seats: &[SecsSeatImpulse],
+    fft_size: usize,
+) -> Result<(Vec<f64>, Vec<f64>), String> {
+    if seats.is_empty() {
+        return Err("no accepted seats available for the SECS average".to_string());
+    }
+    let magnitude = |samples: &[f64]| -> Result<Vec<f64>, String> {
+        if samples.len() > fft_size {
+            return Err(format!(
+                "seat impulse length {} exceeds the SECS FFT grid {fft_size}",
+                samples.len()
+            ));
+        }
+        let mut buffer = vec![Complex::new(0.0, 0.0); fft_size];
+        for (slot, sample) in buffer.iter_mut().zip(samples.iter()) {
+            slot.re = *sample;
+        }
+        FftPlanner::<f64>::new()
+            .plan_fft_forward(fft_size)
+            .process(&mut buffer);
+        Ok(buffer.iter().map(|value| value.norm()).collect())
+    };
+    let mut left_power = vec![0.0f64; fft_size];
+    let mut right_power = vec![0.0f64; fft_size];
+    let mut total_weight = 0.0f64;
+    for (_, weight, left, right) in seats {
+        let left_magnitude = magnitude(left)?;
+        let right_magnitude = magnitude(right)?;
+        for index in 0..fft_size {
+            left_power[index] += weight * left_magnitude[index] * left_magnitude[index];
+            right_power[index] += weight * right_magnitude[index] * right_magnitude[index];
+        }
+        total_weight += weight;
+    }
+    if total_weight <= 0.0 {
+        return Err("SECS seat weights sum to zero".to_string());
+    }
+    Ok((
+        left_power
+            .iter()
+            .map(|power| (power / total_weight).sqrt())
+            .collect(),
+        right_power
+            .iter()
+            .map(|power| (power / total_weight).sqrt())
+            .collect(),
+    ))
+}
+
+/// Clamped linear interpolation used by the SECS trial summary.
+fn secs_interp_linear(x: f64, xs: &[f64], ys: &[f64]) -> f64 {
+    if xs.is_empty() {
+        return 0.0;
+    }
+    if x <= xs[0] {
+        return ys[0];
+    }
+    if x >= xs[xs.len() - 1] {
+        return ys[ys.len() - 1];
+    }
+    let upper = xs.partition_point(|value| *value < x).max(1);
+    let lower = upper - 1;
+    let span = xs[upper] - xs[lower];
+    if span <= 0.0 {
+        return ys[lower];
+    }
+    ys[lower] + (ys[upper] - ys[lower]) * (x - xs[lower]) / span
 }

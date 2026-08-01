@@ -815,6 +815,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-dialog",
  "tempfile",
+ "zip",
 ]
 
 [[package]]
@@ -823,6 +824,7 @@ version = "0.1.0"
 dependencies = [
  "rustfft",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

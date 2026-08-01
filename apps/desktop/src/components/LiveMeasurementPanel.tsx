@@ -25,8 +25,13 @@ import {
   type LiveCaptureKind,
   type LiveCaptureSummary,
   type LiveChannel,
+  SECS_DEFAULT_SETTINGS,
   type LiveDesignSummary,
   type LiveExportSummary,
+  type LiveSecsDesignSettings,
+  type LiveSecsDesignSummary,
+  type LiveSecsLatencyMode,
+  type LiveSecsResolution,
   type LiveMeasurementCacheRestoreSummary,
   type LiveReferenceChannel,
   type LiveSessionSummary,
@@ -49,6 +54,7 @@ import {
 } from "../lib/wirelessSweep";
 import { MeasurementPositionGuide } from "./MeasurementPositionGuide";
 import { FinalMeasurementResults } from "./FinalMeasurementResults";
+import { MeasuredFrequencyResponseChart } from "./MeasuredFrequencyResponseChart";
 
 export type LiveTargetKind = "bk" | "harman" | "custom";
 
@@ -166,6 +172,19 @@ export function LiveMeasurementPanel({
   const [cacheRestore, setCacheRestore] =
     useState<LiveMeasurementCacheRestoreSummary | null>(null);
   const [design, setDesign] = useState<LiveDesignSummary | null>(null);
+  const [secsMode, setSecsMode] = useState(false);
+  const [secsSettings, setSecsSettings] = useState<LiveSecsDesignSettings>(
+    SECS_DEFAULT_SETTINGS,
+  );
+  // On: the SECS design overlays the target curve chosen in the main target
+  // selector. Off: the SECS-native flat adaptive target.
+  const [secsFollowTarget, setSecsFollowTarget] = useState(true);
+  // Explicit opt-in to export a SECS package without the closed loop; the
+  // result is labeled predicted-only everywhere.
+  const [secsSkipVerification, setSecsSkipVerification] = useState(false);
+  const [secsDesign, setSecsDesign] = useState<LiveSecsDesignSummary | null>(
+    null,
+  );
   const [trialDeclared, setTrialDeclared] = useState(false);
   const [verification, setVerification] =
     useState<LiveVerificationSummary | null>(null);
@@ -255,9 +274,14 @@ export function LiveMeasurementPanel({
       case "design":
         return baselineP0Ready;
       case "verify":
-        return design !== null;
+        return design !== null || secsDesign !== null;
       case "export":
-        return verification?.passed === true;
+        // The SECS predicted-only opt-in unlocks the export stage without a
+        // passed verification; the exported package is labeled accordingly.
+        return (
+          verification?.passed === true ||
+          (secsDesign !== null && secsSkipVerification)
+        );
       default:
         return false;
     }
@@ -705,11 +729,30 @@ export function LiveMeasurementPanel({
     setTrialDownload(null);
     setFinalDownload(null);
     try {
-      const result = await invoke<LiveDesignSummary>(
-        "design_live_trial_filter",
-        { target },
-      );
-      setDesign(result);
+      if (secsMode) {
+        // The SECS advanced option designs from P0 only and stays
+        // predicted-only: the backend keeps declaration, verification, and
+        // export locked while a SECS trial is the current one. "Follow the
+        // app target" resolves to the main selector's curve at design time.
+        const result = await invoke<LiveSecsDesignSummary>(
+          "design_live_secs_trial_filter",
+          {
+            settings: {
+              ...secsSettings,
+              targetCurve: secsFollowTarget ? target : "flat",
+            },
+          },
+        );
+        setSecsDesign(result);
+        setDesign(null);
+      } else {
+        const result = await invoke<LiveDesignSummary>(
+          "design_live_trial_filter",
+          { target },
+        );
+        setDesign(result);
+        setSecsDesign(null);
+      }
       setTrialDeclared(false);
       setVerification(null);
       setExported(null);
@@ -720,7 +763,7 @@ export function LiveMeasurementPanel({
   };
 
   const setTrialActivation = async (activeInRoon: boolean) => {
-    if (!design || busy !== null) return;
+    if ((!design && !secsDesign) || busy !== null) return;
     setBusy("declaration");
     setError("");
     try {
@@ -760,13 +803,18 @@ export function LiveMeasurementPanel({
   };
 
   const exportFinal = async () => {
-    if (!verification?.passed || busy !== null) return;
+    // The SECS path may export predicted-only when the user explicitly
+    // opted to skip verification; the backend labels the package as such.
+    const skipVerification =
+      secsDesign !== null && !verification?.passed && secsSkipVerification;
+    if ((!verification?.passed && !skipVerification) || busy !== null) return;
     setBusy("export");
     setError("");
     setFinalDownload(null);
     try {
       const result = await invoke<LiveExportSummary>(
         "export_live_roon_convolution",
+        { skipVerification },
       );
       setExported(result);
       setBusy(null);
@@ -778,7 +826,7 @@ export function LiveMeasurementPanel({
   const downloadZip = async (artifactKind: LiveZipArtifactKind) => {
     if (
       busy !== null ||
-      (artifactKind === "trial" && design === null) ||
+      (artifactKind === "trial" && design === null && secsDesign === null) ||
       (artifactKind === "final" && exported === null)
     ) return;
     setBusy(artifactKind === "trial" ? "trial_download" : "final_download");
@@ -1640,6 +1688,164 @@ export function LiveMeasurementPanel({
         {baselinePairs < LIVE_BASELINE_POSITIONS.length && (
           <p className="live-warning">{copy.incompleteBaselineWarning}</p>
         )}
+        <details className="live-advanced-options">
+          <summary>{copy.secsAdvancedTitle}</summary>
+          <label className="live-declaration">
+            <input
+              type="checkbox"
+              checked={secsMode}
+              disabled={busy !== null}
+              onChange={(event) => setSecsMode(event.target.checked)}
+            />
+            <span>{copy.secsToggleLabel}</span>
+          </label>
+          <p className="live-warning">{copy.secsToggleNote}</p>
+          {secsMode && (
+            <fieldset className="live-secs-settings" disabled={busy !== null}>
+              <legend>{copy.secsSettingsTitle}</legend>
+              <label className="live-secs-settings__toggle">
+                <input
+                  type="checkbox"
+                  checked={secsSettings.multiPosition}
+                  onChange={(event) =>
+                    setSecsSettings((current) => ({
+                      ...current,
+                      multiPosition: event.target.checked,
+                    }))
+                  }
+                />
+                <span>{copy.secsMultiPosition}</span>
+              </label>
+              <label className="live-secs-settings__toggle">
+                <input
+                  type="checkbox"
+                  checked={secsFollowTarget}
+                  onChange={(event) =>
+                    setSecsFollowTarget(event.target.checked)
+                  }
+                />
+                <span>{copy.secsFollowTarget}</span>
+              </label>
+              <label className="live-secs-settings__toggle live-secs-skip-verification">
+                <input
+                  type="checkbox"
+                  checked={secsSkipVerification}
+                  onChange={(event) =>
+                    setSecsSkipVerification(event.target.checked)
+                  }
+                />
+                <span>{copy.secsSkipVerification}</span>
+              </label>
+              {secsSkipVerification && (
+                <p className="live-warning">
+                  {copy.secsSkipVerificationNote}
+                </p>
+              )}
+              {(
+                [
+                  ["secsMaxBoost", "maxBoostDb", 0, 24, 0.5],
+                  ["secsTilt", "tiltDbPerOctave", -5, 5, 0.5],
+                  ["secsBassBoost", "bassBoostDb", 0, 24, 0.5],
+                  ["secsBassFrequency", "bassFrequencyHz", 20, 300, 5],
+                  ["secsCurtain", "curtainHz", 100, 5000, 10],
+                ] as const
+              ).map(([labelKey, field, min, max, step]) => (
+                <label key={field}>
+                  <span>{copy[labelKey]}</span>
+                  <input
+                    type="number"
+                    min={min}
+                    max={max}
+                    step={step}
+                    value={secsSettings[field]}
+                    onChange={(event) => {
+                      const value = Number(event.target.value);
+                      if (Number.isFinite(value)) {
+                        setSecsSettings((current) => ({
+                          ...current,
+                          [field]: value,
+                        }));
+                      }
+                    }}
+                  />
+                </label>
+              ))}
+              <label>
+                <span>{copy.secsResolution}</span>
+                <select
+                  value={secsSettings.resolution}
+                  onChange={(event) =>
+                    setSecsSettings((current) => ({
+                      ...current,
+                      resolution: event.target.value as LiveSecsResolution,
+                    }))
+                  }
+                >
+                  <option value="low">{copy.secsResolutionLow}</option>
+                  <option value="normal">{copy.secsResolutionNormal}</option>
+                  <option value="high">{copy.secsResolutionHigh}</option>
+                </select>
+              </label>
+              <label>
+                <span>{copy.secsLatency}</span>
+                <select
+                  value={secsSettings.latencyMode}
+                  onChange={(event) => {
+                    const latencyMode = event.target
+                      .value as LiveSecsLatencyMode;
+                    setSecsSettings((current) => ({
+                      ...current,
+                      latencyMode,
+                      fixedDelayMs:
+                        latencyMode === "normal" ? current.fixedDelayMs : null,
+                    }));
+                  }}
+                >
+                  <option value="normal">{copy.secsLatencyNormal}</option>
+                  <option value="low">{copy.secsLatencyLow}</option>
+                  <option value="zero">{copy.secsLatencyZero}</option>
+                </select>
+              </label>
+              <label>
+                <span>{copy.secsDelayMode}</span>
+                <select
+                  value={secsSettings.fixedDelayMs === null ? "auto" : "fixed"}
+                  disabled={secsSettings.latencyMode !== "normal"}
+                  onChange={(event) =>
+                    setSecsSettings((current) => ({
+                      ...current,
+                      fixedDelayMs: event.target.value === "auto" ? null : 6,
+                    }))
+                  }
+                >
+                  <option value="auto">{copy.secsDelayAuto}</option>
+                  <option value="fixed">{copy.secsDelayFixed}</option>
+                </select>
+              </label>
+              {secsSettings.fixedDelayMs !== null && (
+                <label>
+                  <span>{copy.secsDelayFixed}</span>
+                  <input
+                    type="number"
+                    min={2}
+                    max={10}
+                    step={0.1}
+                    value={secsSettings.fixedDelayMs}
+                    onChange={(event) => {
+                      const value = Number(event.target.value);
+                      if (Number.isFinite(value)) {
+                        setSecsSettings((current) => ({
+                          ...current,
+                          fixedDelayMs: value,
+                        }));
+                      }
+                    }}
+                  />
+                </label>
+              )}
+            </fieldset>
+          )}
+        </details>
         <button
           className="button button--primary"
           type="button"
@@ -1651,7 +1857,11 @@ export function LiveMeasurementPanel({
           }
           onClick={() => void designTrial()}
         >
-          {busy === "design" ? copy.designing : copy.designButton}
+          {busy === "design"
+            ? secsMode
+              ? copy.secsDesigning
+              : copy.designing
+            : copy.designButton}
         </button>
         {design && (
           <div className="live-result live-result--trial">
@@ -1708,6 +1918,61 @@ export function LiveMeasurementPanel({
             </label>
           </div>
         )}
+        {secsDesign && (
+          <div className="live-result live-result--trial live-result--secs">
+            <div className="live-result__heading">
+              <strong>{copy.secsTrialReady}</strong>
+              <span>{secsDesign.algorithmVersion}</span>
+            </div>
+            <dl className="live-metrics">
+              <div><dt>{copy.positionsUsed}</dt><dd>{secsDesign.multiPositionApplied ? `${secsDesign.positionId} +${secsDesign.positionCount - 1}` : secsDesign.positionId}</dd></div>
+              <div><dt>{copy.secsTargetCurve}</dt><dd>{secsDesign.settings.targetCurve === "flat" ? copy.secsTargetFlat : copy.targetLabels[secsDesign.settings.targetCurve]}</dd></div>
+              {secsDesign.sharedSubBandHz !== null && (
+                <div><dt>{copy.secsSharedSubBand}</dt><dd>{copy.secsSharedSubBandValue.replace("{hz}", secsDesign.sharedSubBandHz.toFixed(0))}</dd></div>
+              )}
+              <div><dt>{copy.leftRmse}</dt><dd>{formatMetric(secsDesign.leftPredictedRmseDb, "dB")}</dd></div>
+              <div><dt>{copy.rightRmse}</dt><dd>{formatMetric(secsDesign.rightPredictedRmseDb, "dB")}</dd></div>
+              <div><dt>{copy.secsAutoDelay}</dt><dd>{formatMetric(secsDesign.autoDelayMs, "ms")}</dd></div>
+              <div><dt>{copy.secsLowCutoff}</dt><dd>{formatMetric(secsDesign.lowCutoffHz, "Hz")}</dd></div>
+              <div><dt>{copy.secsHighCutoff}</dt><dd>{formatMetric(secsDesign.highCutoffHz, "Hz")}</dd></div>
+              <div><dt>{copy.secsPreamp}</dt><dd>{formatMetric(secsDesign.preampDb, "dB")}</dd></div>
+              <div><dt>{copy.secsBalanceTrim}</dt><dd>{formatMetric(secsDesign.channelBalanceTrimDb, "dB")}</dd></div>
+              <div><dt>{copy.secsPhaseScore}</dt><dd>{formatMetric(secsDesign.inputPhaseScore, "")}</dd></div>
+              <div><dt>{copy.secsSettingsSummary}</dt><dd>{`+${secsDesign.settings.maxBoostDb} dB · ${secsDesign.settings.tiltDbPerOctave} dB/oct · +${secsDesign.settings.bassBoostDb} dB@${secsDesign.settings.bassFrequencyHz} Hz · ${secsDesign.settings.resolution} · ${secsDesign.settings.curtainHz} Hz · ${secsDesign.settings.latencyMode}${secsDesign.settings.fixedDelayMs != null ? ` · ${secsDesign.settings.fixedDelayMs} ms` : ""}`}</dd></div>
+            </dl>
+            <div className="live-result__improvement">
+              <span>{copy.predictedImprovement}</span>
+              <strong>
+                {`L ${formatMetric(secsDesign.leftRawRmseDb - secsDesign.leftPredictedRmseDb, "dB")} · R ${formatMetric(secsDesign.rightRawRmseDb - secsDesign.rightPredictedRmseDb, "dB")}`}
+              </strong>
+            </div>
+            <dl className="live-paths">
+              <div><dt>{copy.trialZip}</dt><dd>{secsDesign.trialZipPath}</dd></div>
+              <div><dt>{copy.trialWav}</dt><dd>{secsDesign.trialWavPath}</dd></div>
+            </dl>
+            <ZipDownloadControl
+              label={copy.downloadTrialZip}
+              savingLabel={copy.savingZip}
+              savedTemplate={copy.zipSaved}
+              saving={busy === "trial_download"}
+              disabled={busy !== null}
+              saved={trialDownload}
+              onDownload={() => void downloadZip("trial")}
+            />
+            <p className="live-warning">{secsDesign.warning}</p>
+            <label className="live-declaration">
+              <input
+                type="checkbox"
+                checked={trialDeclared}
+                disabled={busy !== null}
+                onChange={(event) =>
+                  void setTrialActivation(event.target.checked)
+                }
+              />
+              <span>{copy.trialDeclaration}</span>
+            </label>
+          </div>
+        )}
       </section>
       )}
 
@@ -1720,6 +1985,9 @@ export function LiveMeasurementPanel({
             <p>{copy.verifyBody}</p>
           </div>
         </div>
+        {secsDesign && secsSkipVerification && !verification?.passed && (
+          <p className="live-warning">{copy.secsSkipVerificationVerifyHint}</p>
+        )}
         <div className="live-verification-captures">
           {LIVE_CHANNELS.map((channel) => (
             <CaptureCell
@@ -1732,7 +2000,7 @@ export function LiveMeasurementPanel({
                 `capture:${captureKey("verification", "P0", channel)}`
               }
               disabled={
-                !design ||
+                (!design && !secsDesign) ||
                 !trialDeclared ||
                 !inputDeviceId ||
                 inputChannelIndex === null ||
@@ -1814,26 +2082,56 @@ export function LiveMeasurementPanel({
             <p>{copy.exportBody}</p>
           </div>
         </div>
-        {design && verification?.passed && (
+        {(design || secsDesign) && verification?.passed && (
           <FinalMeasurementResults
             copy={copy}
             chartCopy={chartCopy}
             design={design}
+            secsDesign={secsDesign}
             verification={verification}
             exported={exported}
+          />
+        )}
+        {secsDesign && !verification?.passed && secsSkipVerification && (
+          <p className="live-warning">{copy.secsSkipVerificationNote}</p>
+        )}
+        {secsDesign && !verification?.passed && (
+          // Predicted-only correction result: raw, target, and predicted
+          // curves from the design; there is no verified curve to draw.
+          <MeasuredFrequencyResponseChart
+            copy={chartCopy}
+            data={secsDesign.frequencyResponse}
           />
         )}
         <button
           className="button button--primary"
           type="button"
-          disabled={!verification?.passed || busy !== null}
+          disabled={
+            (!verification?.passed &&
+              !(secsDesign && secsSkipVerification)) ||
+            busy !== null
+          }
           onClick={() => void exportFinal()}
         >
           {busy === "export" ? copy.exporting : copy.exportButton}
         </button>
         {exported && (
-          <div className="live-result live-result--passed" role="status">
-            <strong>{copy.exportReady}</strong>
+          <div
+            className={
+              exported.verification
+                ? "live-result live-result--passed"
+                : "live-result live-result--warning"
+            }
+            role="status"
+          >
+            <strong>
+              {exported.verification
+                ? copy.exportReady
+                : copy.exportReadyUnverified}
+            </strong>
+            {!exported.verification && (
+              <p className="live-warning">{copy.exportUnverifiedWarning}</p>
+            )}
             <dl className="live-paths">
               <div><dt>{copy.finalZip}</dt><dd>{exported.zipPath}</dd></div>
               <div><dt>{copy.projectFile}</dt><dd>{exported.projectPath}</dd></div>

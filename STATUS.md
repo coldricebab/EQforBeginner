@@ -19,6 +19,60 @@ intentionally absent rather than hidden behind a mock.
 | 4 — closed-loop verification | Partial, live gate implemented | The live adapter reuses the bounded-gain / minimum-phase / protected-dip / spatial design with B&K-style, Harman-style, or imported custom targets, emits a predicted-only trial ZIP, and requires new accepted P0 L/R captures made after the user declares that exact trial active in Roon. `live-closed-loop-validation-v4` judges improvement on 1/12-octave-smoothed curves scored as the RMS of per-octave-cell RMSE, keeps a ≤3 dB smoothed predicted-versus-verified agreement gate over 20–650 Hz, fits an applied-correction scale to catch an unloaded or doubled filter, and retains the unsmoothed residual as a diagnostic. A failure guides redesign and reverification instead of shipping. Automatic L/R swap detection is absent. |
 | 5 — Roon package | Partial, verified-live export implemented | A project whose closed loop passes can run the native-rate redesign, response-bind its final 48 kHz member to the verified trial (0.05 dB / 0.02 ms), write and read back the six-rate minimum-phase Roon ZIP, persist a final project record and hash, and calculate bounded headroom. Trial and final stages expose native save dialogs that revalidate and byte-check only the current session's package. Windows execution, installer validation, Developer ID signing, and notarization are absent. |
 
+An experimental **SECS advanced option** (an open-source single-point full-band
+algorithm ported with its author's permission, `secs-port-v1`) can design a
+full-band mixed-phase trial from the accepted central P0 pair, deliberately
+bypassing the multi-seat safety design. The SECS.py control set (boost
+ceiling, tilt, bass shelf, resolution, curtain, latency mode, fixed or
+automatic delay) is exposed in the advanced options, range-validated by the
+backend, and the exact settings are stored and reused by the final export.
+A multi-position option (on by default, an extension over SECS.py) feeds the
+magnitude side a seat-weighted RMS average of every accepted baseline seat -
+the same spatial statistic as the Phase 4 design - while the excess-phase
+correction and its confidence guard stay strictly on the P0 pair; with only
+P0 accepted it falls back to the plain single-point path.
+A target-curve option (another extension; on by default in the UI) overlays
+the app's selected target curve - B&K-style, Harman-style, or the imported
+custom curve, re-anchored to 0 dB at 500 Hz - onto the SECS adaptive target,
+so the correction steers toward the same house curve the Phase 4 design uses
+instead of in-room flat; unchecked reproduces the SECS-native flat target,
+and the final export reuses the stored copy of the resolved curve.
+2.1 projects are supported: bass management is linear, so correcting each
+channel's combined main+sub capture independently is exact at the measured
+seat. Below the confirmed crossover - where one shared subwoofer reproduces
+both channels and a measured L/R difference is noise on the same path (an
+11.8 dB spurious split was measured at 37 Hz on the first live 2.1 package) -
+the magnitude AND excess-phase corrections are commonized across L/R, fading
+out half an octave above the crossover; this is the SECS analog of Phase 4's
+common-low-bass constraint and also keeps the filters phase-matched where
+bass management sums the channels into the subwoofer. It follows the same
+closed-loop discipline as the main path: the trial is predicted-only until the
+user declares it active in Roon and a new P0 L/R capture passes the smoothed
+20-650 Hz judgment (improvement or delivered prediction, 3 dB agreement,
+applied-scale [0.6, 1.4], session-gain gate; Phase 4's 12.05 dB attenuation
+ceiling is documented as not applied because SECS cuts are unbounded by
+design, while the +3 dB positive-gain gate stays live to guard the peak
+normalization); high frequencies are excluded
+from the judgment because centimeter-scale microphone repositioning dominates
+them. Final export then re-runs SECS per native rate on the P0 impulse
+resampled with a scipy-`resample_poly`-parity resampler, locks the verified
+delay, byte-binds the 48 kHz member to the verified trial WAV, level-aligns
+the other rates to it (recorded per rate, charged to headroom), and records
+per-rate smoothed agreement diagnostics. The SECS headroom adds a
+program-material peak-growth basis to v3 (full-scale square/kick/clipped-noise
+proxies convolved through every rate member), because the sweep basis
+under-recommended by ~5 dB on the first real package and playback clipped. A
+passing verification renders the same measured before/after chart as the
+Phase 4 path; before any verification the design already renders a
+predicted-only chart (raw/target/predicted, with the verified curve hidden
+rather than faked). The user may explicitly skip verification and export a
+predicted-only package; it is labeled as such in the file name, README, and
+project record, and is never presented as verified. Numerical parity with the
+Python reference is pinned by `crates/dsp-core/tests/secs_parity.rs` against
+`testdata/secs-parity.json`. The first real microphone/Roon run passed the
+SECS closed loop and produced a verified package on 2026-07-30 (one room, one
+system); broader listening evaluation is ongoing.
+
 ## Verification actually run
 
 Deterministic suites, on macOS, at the commit that opens this beta:

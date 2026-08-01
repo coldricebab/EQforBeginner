@@ -136,11 +136,11 @@ microphone-motion classification are not implemented; they remain human beta-tes
 checks.
 
 At design time only accepted common-grid L/R pairs are retained. Baseline P0 L/R is
-mandatory. P1-P5 and P0_END are optional; missing pairs are not invented. P0 has weight
+mandatory. P1-P8 and P0_END are optional; missing pairs are not invented. P0 has weight
 2 unless P0_END exists, in which case both center measurements have weight 1.
 When both central pairs exist, each channel must keep its absolute 200-500 Hz median
 level shift within 1.0 dB. Its level-removed 20-500 Hz shape RMSE must remain within a
-loose 6.0 dB gross-change bound. This accommodates hand repositioning after P1-P5 while
+loose 6.0 dB gross-change bound. This accommodates hand repositioning after P1-P8 while
 still rejecting a clearly different signal path or listening region. Failure blocks
 design; this gate does not qualify timing or exact P0 replacement.
 
@@ -522,3 +522,79 @@ physical output-level/SPL checks, and a Roon import/clipping smoke test on macOS
 Windows. Public Roon
 documentation does not define every extra metadata-file behavior, so structural
 validation alone cannot promote this developer-beta package to a public release.
+
+## SECS advanced-option gates (experimental)
+
+The SECS path (`secs-port-v1`, ported single-point full-band algorithm) keeps
+the same closed-loop discipline as the main path while never claiming its
+multi-seat guarantees.
+
+- Trial: predicted-only, designed from the accepted central P0 pair in 2.0
+  projects only. Verification captures bind to the trial WAV SHA-256 and
+  require the user's declared-active attestation, exactly like Phase 4.
+- Closed loop (`secs-port-v1+live-closed-loop-validation-v4`): judged on
+  1/12-octave gate-smoothed curves as the RMS of per-octave-cell RMSE against
+  the SECS target over 20-500 Hz, with the v4 dual branch (verified beats raw,
+  or delivers the predicted figure). Smoothed predicted-versus-verified
+  agreement stays capped at 3 dB over 20-650 Hz, and the applied-correction
+  scale must fit inside [0.6, 1.4]. The session-gain gate is response-based
+  rather than marker-based: because the SECS filter is full-band, the trial
+  itself shifts the captured >=650 Hz marker level by its own response
+  (measured -1.2 dB live), so the marker comparison the Phase 4 loop uses
+  would false-positive on every SECS verification. Instead the session level
+  shift is the median over 650 Hz - 20 kHz of (verified - baseline - filter),
+  which cancels the filter's contribution exactly and stays robust to
+  microphone-reposition combing; the +-0.5 dB allowance is unchanged.
+  The validator's bounded-correction extrema gates see the FILTER's response
+  (the Phase 4 convention; a 2026-07-30 live session found the port passing
+  the absolute predicted response there, which fired ExcessiveAttenuation on
+  every real room). Of those two gates, ExcessiveAttenuation (12.05 dB) is
+  exempted for SECS - it encodes the Phase 4 bounded-gain contract, while
+  SECS cuts are unbounded by design and their justification is judged by the
+  measured improvement, agreement, and applied-scale gates instead.
+  PositiveCorrectionGain (+3 dB) stays live: the SECS peak normalization
+  keeps the filter at or below 0 dB, so any positive gain means the
+  normalization broke. The e2e fixture is anchored +25 dB outside the
+  bounded-correction window so a recurrence of the absolute-response wiring
+  trips the non-exempted gate. Frequencies above the judged band are deliberately excluded:
+  centimeter-scale microphone repositioning between captures dominates them,
+  so a full-band comparison would demand a reproduction the physics cannot
+  deliver. Correctness above the judged band rests on the SHA-bound filter,
+  the applied-scale fit, and listening.
+- Export (`secs-native-rerun-v1`, "(a)" strategy): each Roon native rate is a
+  fresh SECS design on the P0 impulse resampled with a resampler pinned to
+  scipy `resample_poly` by the parity fixture, with the verified automatic
+  delay locked. The 48 kHz member must be byte-identical to the verified
+  trial WAV. Other members are level-aligned to it by their mean 20-500 Hz
+  response difference (recorded per rate and charged to the headroom bound);
+  their smoothed 20-500 Hz agreement with the verified response is recorded
+  as a diagnostic with only a 6 dB gross-corruption backstop, because the
+  measured gap between legitimate narrow-mode grid variation (1.20 dB on the
+  synthetic fixture) and a simulated rate-wiring bug (1.42 dB) is too small
+  for any spectral threshold to separate - that class is covered by the
+  parity fixtures and structural assertions instead.
+- Headroom (`validation-signal-and-response-peak-v3+program-peak-v1`): the
+  v3 sweep/response basis structurally under-recommends for a full-band
+  mixed-phase filter - a sweep is a single frequency at every instant and
+  the peak-normalized filter has a ~0 dB response peak, yet the 2026-07-30
+  live package grew real program peaks by +3..+6.4 dB and clipped at the
+  v3-recommended 1.3 dB. SECS packages therefore also convolve every rate
+  member with deterministic full-scale program proxies (low-frequency
+  square waves, kick bursts, hard-clipped fixed-seed noise) and take the
+  worst peak growth as an additional basis term. The L1 absolute-safe bound
+  is unchanged.
+- 2.1 shared sub band: with a confirmed crossover the design commonizes the
+  L/R magnitude and excess-phase corrections below it (full weight up to the
+  crossover, fading over the half octave above). Rationale: one shared
+  subwoofer reproduces both channels there, so a measured L/R split is noise
+  on the same path - and a phase split would thin mono bass where bass
+  management sums the channels, which per-channel verification sweeps can
+  never observe. Pinned by a dsp-core test that injects a left-only 45 Hz
+  mode and asserts the commonized filters collapse the sub-band split.
+- Verification skip (user opt-in, SECS only): the user may export a final
+  package without the closed loop. The package is then labeled
+  predicted-only everywhere - file name (`_secs_predicted_`), README,
+  `verification_state: predicted-only-verification-skipped-by-user`, and a
+  `null` verification record - and is never presented as a verified
+  correction. The Phase 4 export has no skip; measured verification is its
+  core promise.

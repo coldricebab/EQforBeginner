@@ -255,6 +255,67 @@ export type LiveDesignSummary = {
   warning: string;
 };
 
+export type LiveSecsResolution = "low" | "normal" | "high";
+export type LiveSecsLatencyMode = "normal" | "low" | "zero";
+/** App target curve the SECS correction steers toward; "flat" keeps the
+ * SECS-native adaptive flat target, the rest match the main target selector. */
+export type LiveSecsTargetCurve = "flat" | "bk" | "harman" | "custom";
+
+export type LiveSecsDesignSettings = {
+  maxBoostDb: number;
+  tiltDbPerOctave: number;
+  bassBoostDb: number;
+  bassFrequencyHz: number;
+  resolution: LiveSecsResolution;
+  curtainHz: number;
+  latencyMode: LiveSecsLatencyMode;
+  fixedDelayMs: number | null;
+  multiPosition: boolean;
+  targetCurve: LiveSecsTargetCurve;
+};
+
+/// SECS.py "Flat" preset — the backend rejects out-of-range values instead
+/// of clamping, so the UI constrains inputs to the same limits.
+export const SECS_DEFAULT_SETTINGS: LiveSecsDesignSettings = {
+  maxBoostDb: 6,
+  tiltDbPerOctave: 0,
+  bassBoostDb: 0,
+  bassFrequencyHz: 80,
+  resolution: "normal",
+  curtainHz: 300,
+  latencyMode: "normal",
+  fixedDelayMs: null,
+  multiPosition: true,
+  targetCurve: "flat",
+};
+
+export type LiveSecsDesignSummary = {
+  settings: LiveSecsDesignSettings;
+  algorithmVersion: string;
+  positionId: string;
+  positionCount: number;
+  multiPositionApplied: boolean;
+  /** 2.1: crossover below which the L/R correction is commonized; null on 2.0. */
+  sharedSubBandHz: number | null;
+  sampleRateHz: number;
+  taps: number;
+  autoDelayMs: number;
+  lowCutoffHz: number;
+  highCutoffHz: number;
+  preampDb: number;
+  channelBalanceTrimDb: number;
+  inputPhaseScore: number;
+  leftRawRmseDb: number;
+  leftPredictedRmseDb: number;
+  rightRawRmseDb: number;
+  rightPredictedRmseDb: number;
+  trialWavPath: string;
+  trialZipPath: string;
+  /** Predicted-only raw/target/predicted display curves (verified empty). */
+  frequencyResponse: LiveFrequencyResponsePlot;
+  warning: string;
+};
+
 export type LiveFrequencyResponsePlot = {
   algorithmVersion: string;
   displaySmoothingFwhmOctaves: number;
@@ -308,12 +369,15 @@ export type LiveExportSummary = {
   algorithmVersion: string;
   recommendedHeadroomDb: number;
   measuredTruePeakRatioDb: number;
+  /** Worst program-material peak growth through any rate member (SECS). */
+  programMaterialPeakGrowthDb: number;
   firWorstCasePeakBoundDb: number;
   final48kBindingMaximumMagnitudeDifferenceDb: number;
   final48kBindingMaximumRelativeGroupDelayDifferenceMs: number;
   nativeRateCount: number;
   crossRatePassed: boolean;
-  verification: LiveVerificationSummary;
+  /** null when the user explicitly skipped verification (predicted-only). */
+  verification: LiveVerificationSummary | null;
 };
 
 export type LiveZipArtifactKind = "trial" | "final";
@@ -333,6 +397,9 @@ export const LIVE_BASELINE_POSITIONS = [
   "P3",
   "P4",
   "P5",
+  "P6",
+  "P7",
+  "P8",
   "P0_END",
 ] as const;
 

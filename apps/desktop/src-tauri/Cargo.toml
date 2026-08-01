@@ -29,5 +29,8 @@ tauri = { version = "=2.11.5", features = [] }
 tempfile = "3.20"
 tauri-plugin-dialog = "=2.7.2"
 
+[dev-dependencies]
+zip = { version = "=7.2.0", default-features = false }
+
 [lints]
 workspace = true
