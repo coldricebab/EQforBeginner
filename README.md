@@ -17,7 +17,7 @@ https://gall.dcinside.com/mgallery/board/view/?id=speakers&no=514096&s_type=sear
 
 ## Usage
 
-- [다운로드 링크 Windows](현재 준비 중)
+- [다운로드 링크 Windows](https://drive.google.com/file/d/1fHTNul-hNF_PIR7Mm5uJOAbF5CBKgZbU/view?usp=sharing)
 - [다운로드 링크 Mac](https://drive.google.com/file/d/1dv4g3yd9dgIV-FbkdvKMQgl3Hxso9W19/view?usp=sharing)
 
 - [L 스윕 다운로드 링크](https://drive.google.com/file/d/1oUExSKQPChtX7unysMLhCc10M9hqM8DW/view?usp=sharing)
