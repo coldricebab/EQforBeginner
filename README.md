@@ -25,8 +25,8 @@ https://gall.dcinside.com/mgallery/board/view/?id=speakers&no=514096&s_type=sear
 
 ### 0 - 측정 전 준비물
 
-준비물: 스피커(+서브우퍼), miniDSP UMIK-1 측정 마이크
-있으면 좋은것: 마이크 거치대, Roon
+준비물: 스피커(+서브우퍼), miniDSP UMIK-1 측정 마이크, Convolution 필터 적용 가능 프로그램
+있으면 좋은것: 마이크 거치대, Roon, 귀마개(스윕 소리가 상당히 시끄러움)
 
 ### 1 - 측정 준비
 
@@ -72,7 +72,7 @@ miniDSP에서 UMIK-1 마이크 **90도** 캘리브레이션 파일을 받아 올
 
 <img width="1433" height="802" alt="Image" src="https://github.com/user-attachments/assets/b3edf5fd-a6e2-46db-9482-d93a03cf245b" />
 
-### 5 - 검증 단계
+### 5 - 보정값 생성
 
 이제 보정이 의도한 대로 되었나 검증 단계입니다. zip 파일을 다운받고 Roon Convolution 필터를 적용해주세요.
 
@@ -80,9 +80,15 @@ miniDSP에서 UMIK-1 마이크 **90도** 캘리브레이션 파일을 받아 올
 
 <img width="1437" height="802" alt="Image" src="https://github.com/user-attachments/assets/ffb60ce5-1b16-4a90-a09d-caddee7cfeb6" />
 
-### 6 - 완료
+**고급 옵션** 버튼을 누르면 SECS 알고리즘 적용 가능합니다. UI가 잘 안보일 수 있으니 주의해주세요
 
-이제 보정이 완료되었습니다. 최종적으로 생성된 Roon Convolution 파일을 사용하시면 됩니다.
+### 6 - 검증 단계
+
+마지막으로 청취점 중앙에서 측정으로 보정이 올바르게 되었나 검증해주세요. (SECS 알고리즘 사용 시 검증 건너뛰기도 가능)
+
+### 7 - 완료
+
+이제 보정이 완료되었습니다. 최종적으로 생성된 Convolution 파일을 사용하시면 됩니다.
 검증 통과가 되지 않는다면 앱의 안내대로 다시 진행해주세요.
 
 ## 개발자를 위한 추가 설명
