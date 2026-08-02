@@ -70,15 +70,13 @@ miniDSP에서 UMIK-1 마이크 **90도** 캘리브레이션 파일을 받아 올
 
 (서브우퍼가 있다면 서브우퍼 전원을 켜고) 같은 스윕을 재생해서 앱 안내대로 측정 위치를 바꿔가며 L(+Sub), R(+Sub) 다지점 측정을 해줍니다.
 
-### 5 - 검증 단계
-
 <img width="1433" height="802" alt="Image" src="https://github.com/user-attachments/assets/b3edf5fd-a6e2-46db-9482-d93a03cf245b" />
+
+### 5 - 검증 단계
 
 이제 보정이 의도한 대로 되었나 검증 단계입니다. zip 파일을 다운받고 Roon Convolution 필터를 적용해주세요.
 
-Roon을 쓰지 않는다면 다운받을 파일을 ChatGPT 등에 올리고 PEQ로 최대한 근사시켜달라고 하면 됩니다. 그리고 보정값을 본인이 사용하는 EQ 시스템에 입력해주세요.
-
-아래는 예시입니다.
+.wav(또는 .zip)형식 convolution 파일을 쓰지 않는다면 다운받을 파일을 ChatGPT 등에 올리고 PEQ로 최대한 근사시켜달라고 하면 됩니다. 그리고 보정값을 본인이 사용하는 EQ 시스템에 입력해주세요. (SECS 알고리즘 사용 시 PEQ만으로는 부족합니다. 이때는 Convolution 파일을 적용해주세요)
 
 <img width="1437" height="802" alt="Image" src="https://github.com/user-attachments/assets/ffb60ce5-1b16-4a90-a09d-caddee7cfeb6" />
 
