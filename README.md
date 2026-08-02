@@ -80,8 +80,7 @@ Roon을 쓰지 않는다면 다운받을 파일을 ChatGPT 등에 올리고 PEQ�
 
 아래는 예시입니다.
 
-<img width="1433" height="802" alt="Image" src="https://github.com/user-attachments/assets/b3edf5fd-a6e2-46db-9482-d93a03cf245b" />
-
+<img width="1437" height="802" alt="Image" src="https://github.com/user-attachments/assets/ffb60ce5-1b16-4a90-a09d-caddee7cfeb6" />
 
 ### 6 - 완료
 
