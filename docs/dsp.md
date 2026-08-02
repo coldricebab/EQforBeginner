@@ -39,6 +39,9 @@ Implemented algorithm identifiers:
 - `umik-sweep-level-assessment-v2`: preferred and hard main-sweep digital peak/RMS
   boundaries plus an optional,
   explicitly assumed Sens-Factor SPL estimate.
+- `secs-port-v1`: port of 한플 (Hanpeul)'s SECS full-band single-point mixed-phase
+  correction (MIT-licensed by the author); in 2.1 it corrects both channels in common
+  below the confirmed crossover.
 - `live-closed-loop-validation-v4`: post-trial P0 magnitude-response and
   predicted-versus-verified admission gate.
 - `verified-trial-native48-response-binding-v1`: final native 48 kHz response binding
@@ -724,3 +727,191 @@ offline Phase 6 command does not calculate playback true peak, recommended headr
 or `export_eligible`. Only the separate live adapter may add its already-passed
 closed-loop evidence and signal/FIR-bound headroom before calling the same native-rate
 engine and exporter.
+
+## SECS full-band correction (advanced option)
+
+Original work by **한플 (Hanpeul)** — SECS, published on the DCInside speaker gallery
+(<https://gall.dcinside.com/mgallery/board/view/?id=speakers&no=514096&s_type=search_name&s_keyword=%ED%95%9C%ED%94%8C&page=1>),
+ported under the MIT License granted by the author.
+
+This section describes **what happens to the signal, in order**, rather than the code,
+and marks where the original design ends and this project's additions begin.
+
+### Input
+
+One left/right impulse-response pair from the central seat (P0), 48 kHz, 32,768 samples
+(0.68 s). Where the Phase 4 path uses only the **magnitude** of several seats, SECS uses
+the full **complex response (magnitude and phase)** of one seat. That is what lets it
+correct the time domain, and it is also why it can overfit that one seat.
+
+### Stage 1 — split the response into magnitude and time (original)
+
+A room transfer function factors uniquely into a minimum-phase part times an all-pass part.
+
+- **Minimum-phase part** — determined by the magnitude curve. EQ can fix this.
+- **All-pass (excess-phase) part** — unity magnitude, but arrival time varies with
+  frequency. EQ cannot touch it in principle; only an all-pass filter cancels it.
+
+SECS performs the split cepstrally (inverse transform of the log magnitude). Aligning the
+measured impulse on its peak and dividing by the minimum-phase reconstruction leaves the
+pure excess phase.
+
+This split is the decisive difference from ordinary room EQ. A PEQ or a minimum-phase FIR
+fixes magnitude only, so it can produce the same magnitude curve while leaving the
+low-frequency arrival-time scatter untouched.
+
+### Stage 2 — the magnitude side (original)
+
+**(a) Five-band fractional-octave smoothing.** The response is split into five LR4 bands,
+each smoothed at a different resolution, then recombined. The default (Normal) is
+1/24 → 1/12 → 1/6 → 1/3 → 1/1 octave: fine at the bottom, coarse at the top. The reason is
+physical. Low-frequency modes are real and repeatable; the dense ripple up high is an
+interference pattern that changes when the microphone moves a few centimetres, so it is
+not something to chase.
+
+**(b) Adaptive target.** No fixed curve.
+
+- The natural low and high cutoffs the speakers and room actually produce are located, and
+  outside them the target follows the natural rolloff instead of forcing level.
+- The reference level is anchored at the **35th percentile** of the 100 Hz–10 kHz
+  magnitude. Anchoring low rather than at the mean is the conservative choice behind the
+  whole algorithm: cut peaks to reach the target rather than boost dips to reach it. The
+  price is that roughly 65 % of the response sits above target and becomes a cut, so the
+  overall level drops after correction.
+- The bass shelf and tilt multiply this.
+
+**(c) Magnitude inversion.** The smoothed magnitude is divided into the target. **Cuts are
+unbounded in depth; only boost is capped** (default +6 dB) — the same philosophy again.
+
+**(d) Macro EQ.** The result of applying that filter is simulated, smoothed at one octave,
+compared to the target, and the remaining broadband error is corrected again within ±6 dB.
+This sets the large-scale tonal balance.
+
+**(e) Peak crush — below 500 Hz only.** Whatever still stands above the target is pressed
+down once more, at strength 0.3 / 0.6 / 1.0 by resolution setting. Full weight to 300 Hz,
+fading to zero by 500 Hz. This is where "a peak rings, so it is worse than a dip" is
+written into the algorithm.
+
+**(f) Curtain — default 300 Hz.** Above the curtain the narrow-band correction fades out
+and only the one-octave-scale tonal correction remains, fading linearly from the curtain to
+twice the curtain.
+
+### Stage 3 — the time side (original)
+
+Conjugating the excess-phase part gives an all-pass that cancels the room's phase
+distortion. The catch is that such an all-pass **sounds before its cause** (pre-ringing),
+so the budget differs by band.
+
+| Band | Pre-ringing allowed |
+| --- | --- |
+| Low | up to the target delay (10 ms by default) |
+| Mid | half of it (≤5 ms) |
+| High | a quarter of it (≤2.5 ms) |
+
+Long wavelengths hide pre-ringing well and phase error costs the most there; at high
+frequencies it is the other way round. Each band is windowed separately, recombined with
+the LR4 weights, and renormalised to unity magnitude so the result stays all-pass.
+
+**Phase-confidence guard.** Where the response falls into a deep null, the measured phase
+itself cannot be trusted. SECS fades the phase correction back toward unity there; the
+threshold is roughly 15 dB below the band average of that channel's own magnitude.
+
+**Automatic target-delay search.** How far the whole filter is pushed back is searched from
+2 to 10 ms in 1 ms steps, choosing the value that minimises a low-frequency-weighted error
+on the L+R sum. That delay *is* the pre-ringing budget for the phase correction: longer
+buys more low-frequency phase repair and costs latency.
+
+### Stage 4 — stereo combine (original)
+
+1. Level-match the channels on the RMS within ±5 ms of each peak.
+2. Align both impulse peaks to the same sample.
+3. Trim the right channel by the median L−R difference of the smoothed 20 Hz–1 kHz
+   responses (±6 dB limit).
+4. Apply a squared fade over the last 5 ms to end the tail.
+5. Normalise so the peak spectral magnitude across both channels is 0 dB. The attenuation
+   this costs is the built-in preamp, which is why no extra convolution preamp is needed.
+
+### Stage 5 — where 2.0 and 2.1 diverge (this project's addition)
+
+**In 2.0** everything above is fully independent per channel. The two speakers are
+physically different sources reaching the seat by different paths, so answering each
+measurement on its own is correct.
+
+**In 2.1**, below the bass-management crossover **one subwoofer reproduces both channels**.
+A difference between the L and R measurement there is not a channel difference; it is the
+same path measured twice. Left as the original algorithm has it, SECS believes that
+difference and cuts the two channels differently, without depth limit.
+
+Measured on this development system (90 Hz crossover), from its first 2.1 filter:
+
+| 20–90 Hz | Without commonization | With commonization |
+| --- | ---: | ---: |
+| L/R magnitude split (max) | 11.1 dB | 0.8 dB |
+| L/R phase split (max) | 178.7° | 13.2° |
+| L/R phase split (RMS) | 40.2° | 5.1° |
+
+At 37 Hz the two channels were being corrected 11.8 dB apart, and the phase was very nearly
+**inverted**.
+
+The phase half matters more than the magnitude half. Bass management **sums** L and R into
+the subwoofer, so when the two filters disagree in phase, the mono content that carries most
+musical bass partially cancels at the subwoofer input. A verification sweep plays one channel
+at a time and therefore **cannot observe that cancellation in principle** — the measurement
+looks fine while music loses bass.
+
+So in 2.1, below the confirmed crossover, the magnitude and excess-phase corrections are made
+**common to both channels**:
+
+- **Magnitude** — the energy mean of the two magnitudes becomes the common input.
+- **Phase** — the two excess-phase correctors are blended toward their normalised complex
+  mean, which keeps them all-pass.
+- **Weighting** — full weight to the crossover, fading to zero over the half octave above it,
+  where an LR4 subwoofer is already some 12 dB down and the mains dominate.
+- **The phase-confidence guard still watches each channel's own magnitude.** The averaged
+  magnitude has that channel's nulls erased, so guarding with it would disarm the guard.
+
+Above the crossover (127 Hz here) the channel difference is left alone: there the mains each
+produce their own sound and the difference is real. Measured, the 110–180 Hz L/R difference
+went 8.0 → 8.3 dB, i.e. unchanged.
+
+On a 2.0 project, or when no subwoofer setup has been confirmed on hardware, this stage is
+inactive and the design follows the original path exactly.
+
+### What this project added (not the original design)
+
+| Addition | What it does |
+| --- | --- |
+| Multi-position magnitude average | Replaces the magnitude input with a seat-weighted energy average of every measured seat; phase stays on P0 |
+| Target-curve overlay | Multiplies the adaptive target by the house curve chosen in the app, re-anchored to 0 dB at 500 Hz |
+| 2.1 shared-sub-band commonization | Stage 5 above |
+| Closed-loop verification | Plays the filter, remeasures, and compares against the prediction (judged 20–650 Hz) |
+| Per-rate redesign | Resamples and redesigns for each of the six Roon native rates; the 48 kHz member is byte-identical to the verified trial |
+| Headroom calculation | Measures program-material time-domain peak growth to produce the recommendation |
+
+Defects in these belong to this project, not to the original author.
+
+### What each setting actually changes
+
+| Setting | Effect |
+| --- | --- |
+| Boost ceiling (default +6 dB) | How far dips may be filled; raising it fills more but loads the amplifier and drivers |
+| Tilt | Adds a per-octave slope to the target |
+| Bass shelf / corner | Raises the low-frequency target; start here if the corrected bass feels thin |
+| Resolution (Low/Normal/High) | Changes the smoothing resolution and the peak-crush strength together |
+| Curtain (default 300 Hz) | Upper limit of narrow-band correction |
+| Latency mode | Normal = mixed phase; low/zero latency = minimum phase only, giving up phase correction |
+| Target delay | The pre-ringing budget available to the phase correction |
+
+### Known characteristics
+
+- Because cuts are unbounded and the sub-500 Hz peak crush stacks on top of them, **a few dB
+  of deficit is left beside the largest modal peaks.** Measured: after removing a 15 dB mode
+  at 41 Hz, −5.6 dB remained at 37–38 Hz and an average −1.7 dB across 150–250 Hz. The
+  correction is broader than the room's own structure there, so the valleys beside a peak get
+  cut with it.
+- The 35th-percentile anchor and the 0 dB peak normalization together mean **the overall
+  level drops after correction.** That is a digital level shift, recovered with volume — but
+  the volume must be held fixed for verification measurements.
+- A mixed-phase filter **grows broadband program peaks by several dB even at a 0 dB response
+  peak** (+2.8 to +6.4 dB measured), which is why the recommended headroom is far larger than
+  a sweep-based estimate suggests.
