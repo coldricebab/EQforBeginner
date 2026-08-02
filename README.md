@@ -33,7 +33,7 @@ https://gall.dcinside.com/mgallery/board/view/?id=speakers&no=514096&s_type=sear
 
 ### 2 - 캘리브레이션 파일 불러오기
 
-(이미지 a)
+<img width="1438" height="806" alt="Image" src="https://github.com/user-attachments/assets/2f1b7102-715e-44f5-93db-ff0a234e6ced" />
 
 마이크와 캘리브레이션 파일을 불러옵니다.
 
@@ -47,7 +47,7 @@ miniDSP에서 UMIK-1 마이크 **90도** 캘리브레이션 파일을 받아 올
 
 **서브우퍼를 안쓰시는 분은 4로 넘어가면 됩니다.**
 
-(이미지 b)
+<img width="1428" height="789" alt="Image" src="https://github.com/user-attachments/assets/746e2057-f37f-4163-a197-c58217670afd" />
 
 앱 안내대로 서브우퍼를 끄고 70, 80, 90hz 크로스오버 설정 후 L main only, R main only, Sub only 각각 측정해줍니다.
 
@@ -57,7 +57,7 @@ miniDSP에서 UMIK-1 마이크 **90도** 캘리브레이션 파일을 받아 올
 
 **진공관 앰프 사용 시 L 스피커 분리 후 L 스윕 자체가 위험할 수 있으니 L 스피커를 소프트웨어적으로 뮤트해주세요**
 
-(이미지 c)
+<img width="1438" height="800" alt="Image" src="https://github.com/user-attachments/assets/15044f4a-f518-446e-884c-27f93d5867c9" />
 
 측정을 완료하고 올리면 이렇게 결과가 나옵니다.
 
@@ -65,13 +65,13 @@ miniDSP에서 UMIK-1 마이크 **90도** 캘리브레이션 파일을 받아 올
 
 ### 4 - 다지점 측정
 
-(이미지 d)
+<img width="1433" height="797" alt="Image" src="https://github.com/user-attachments/assets/633e3357-60b0-4b72-b010-b63ff5ba98c7" />
 
 (서브우퍼가 있다면 서브우퍼 전원을 켜고) 같은 스윕을 재생해서 앱 안내대로 측정 위치를 바꿔가며 L(+Sub), R(+Sub) 다지점 측정을 해줍니다.
 
 ### 5 - 검증 단계
 
-(이미지 e)
+<img width="1433" height="802" alt="Image" src="https://github.com/user-attachments/assets/b3edf5fd-a6e2-46db-9482-d93a03cf245b" />
 
 이제 보정이 의도한 대로 되었나 검증 단계입니다. zip 파일을 다운받고 Roon Convolution 필터를 적용해주세요.
 
@@ -79,11 +79,10 @@ Roon을 쓰지 않는다면 다운받을 파일을 ChatGPT 등에 올리고 PEQ�
 
 아래는 예시입니다.
 
-(이미지 f)
+<img width="1433" height="802" alt="Image" src="https://github.com/user-attachments/assets/b3edf5fd-a6e2-46db-9482-d93a03cf245b" />
+
 
 ### 6 - 완료
-
-(이미지 g)
 
 이제 보정이 완료되었습니다. 최종적으로 생성된 Roon Convolution 파일을 사용하시면 됩니다.
 검증 통과가 되지 않는다면 앱의 안내대로 다시 진행해주세요.
