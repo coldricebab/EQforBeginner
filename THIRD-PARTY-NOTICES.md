@@ -11,18 +11,43 @@ program.
 - **Source link:**
   <https://gall.dcinside.com/mgallery/board/view/?id=speakers&no=514096&s_type=search_name&s_keyword=%ED%95%9C%ED%94%8C&page=1>
 
-### Permission and scope
+### License
 
-The original author gave this project permission to freely modify and improve
-the work, and asked that the original be credited with a link. That credit
+The original author licensed the work under the **MIT License** for use in
+this project, and asked that the original be credited with a link. That credit
 appears in this file, in the app's SECS advanced option, in the README, and in
 the header of every ported source file.
 
-This is a **permission granted to this project**, not a statement that the
-upstream program carries an open-source license. The upstream distribution
-carries no license text of its own. Anyone who wants to reuse the ported code
-(`crates/dsp-core/src/secs.rs` and its fixtures) beyond what this project's
-MIT license can convey should contact the original author directly.
+Because the upstream grant is MIT, the ported code in this repository carries
+no restriction beyond MIT: anyone may reuse `crates/dsp-core/src/secs.rs` and
+its fixtures under the same terms, keeping the copyright and permission notice
+below. The upstream program's own distribution ships no license file, so this
+notice is the record of the grant.
+
+```
+MIT License
+
+Copyright (c) 한플 (Hanpeul)          — original SECS algorithm and implementation
+Copyright (c) 2026 coldricebab        — Rust port and the additions listed below
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
 
 ### What was ported, and what is not the original author's work
 
@@ -49,5 +74,6 @@ Added by this project, and therefore **not** the original author's design:
 - the Rust implementation itself and its numerical parity harness.
 
 Defects in any of the above belong to this project, not to the original
-author. `crates/dsp-core/tests/secs_parity.rs` pins the ported DSP against the
+author; the MIT grant covers the code, not an endorsement of what this project
+built on top of it. `crates/dsp-core/tests/secs_parity.rs` pins the ported DSP against the
 original program's own output so the two can be compared numerically.

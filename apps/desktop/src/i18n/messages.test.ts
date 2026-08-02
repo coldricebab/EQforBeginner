@@ -89,7 +89,7 @@ describe("localized wizard copy", () => {
       // The original author asked for a credit with a link; both locales must
       // name them and must not present this app's additions as their design.
       expect(copy.secsCredit).toContain("한플");
-      expect(copy.secsCredit).toMatch(/허락|permission/i);
+      expect(copy.secsCredit).toMatch(/MIT/);
       expect(copy.secsCreditLink.trim()).not.toBe("");
       // The verification-skip strings must carry the predicted-only state.
       expect(copy.secsSkipVerificationNote).toMatch(/예측 전용|predicted-only/i);

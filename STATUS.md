@@ -22,7 +22,7 @@ intentionally absent rather than hidden behind a mock.
 An experimental **SECS advanced option** (`secs-port-v1`) - a port of SECS by
 한플 (Hanpeul), published on the DCInside speaker gallery
 ([original](https://gall.dcinside.com/mgallery/board/view/?id=speakers&no=514096&s_type=search_name&s_keyword=%ED%95%9C%ED%94%8C&page=1)),
-used with the original author's permission and credited per
+used under the MIT License granted by the original author and credited per
 `THIRD-PARTY-NOTICES.md` - can design a
 full-band mixed-phase trial from the accepted central P0 pair, deliberately
 bypassing the multi-seat safety design. The SECS.py control set (boost

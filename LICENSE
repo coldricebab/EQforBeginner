@@ -2,6 +2,10 @@ MIT License
 
 Copyright (c) 2026 coldricebab
 
+The SECS-derived files (crates/dsp-core/src/secs.rs and its fixtures) are also
+copyright 한플 (Hanpeul), MIT-licensed by that author; see
+THIRD-PARTY-NOTICES.md for the full notice and attribution.
+
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
 in the Software without restriction, including without limitation the rights

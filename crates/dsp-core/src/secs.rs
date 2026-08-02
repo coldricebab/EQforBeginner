@@ -4,9 +4,9 @@
 //! DCInside speaker gallery:
 //! <https://gall.dcinside.com/mgallery/board/view/?id=speakers&no=514096&s_type=search_name&s_keyword=%ED%95%9C%ED%94%8C&page=1>
 //!
-//! The original author gave this project permission to modify and improve the
-//! work, asking that the original be credited with a link. See
-//! `THIRD-PARTY-NOTICES.md` for the scope of that permission and for which
+//! Copyright (c) 한플 (Hanpeul) for the original algorithm, licensed by the
+//! author under the MIT License, with a request that the original be credited
+//! with a link. See `THIRD-PARTY-NOTICES.md` for the full notice and for which
 //! parts of this file are the original design versus this project's additions
 //! (multi-position averaging, the house-curve overlay, and the 2.1
 //! shared-sub-band commonization are ours, not the original author's).

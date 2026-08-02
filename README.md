@@ -87,11 +87,12 @@ Roon을 쓰지 않는다면 다운받을 파일을 ChatGPT 등에 올리고 PEQ�
 ## 크레딧 / 출처
 
 이 앱의 **SECS 고급 옵션**은 **한플**님이 만드신 SECS 룸 보정 프로그램을 이식한 것입니다.
-원작자께서 자유롭게 수정·개선해도 좋다고 허락해 주셨습니다. 감사합니다.
+원작자께서 **MIT 라이선스**로 사용을 허가해 주셨습니다. 감사합니다.
 
 - 원작자: 한플
 - 원본: [디시인사이드 스피커 갤러리 SECS 원본 글](https://gall.dcinside.com/mgallery/board/view/?id=speakers&no=514096&s_type=search_name&s_keyword=%ED%95%9C%ED%94%8C&page=1)
 
 다지점 평균, 타겟 커브 추종, 2.1 공유 서브 대역 공통화, 폐루프 검증과 내보내기는
 이 프로젝트에서 추가한 것이라 원작자의 설계가 아닙니다. 해당 부분의 결함은 이
-프로젝트 책임입니다. 자세한 범위는 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)에 있습니다.
+프로젝트 책임입니다. 라이선스 전문과 이식 범위는
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)에 있습니다.

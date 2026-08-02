@@ -3,9 +3,9 @@
 The reference program is SECS by 한플 (Hanpeul), published on the DCInside
 speaker gallery:
 https://gall.dcinside.com/mgallery/board/view/?id=speakers&no=514096&s_type=search_name&s_keyword=%ED%95%9C%ED%94%8C&page=1
-Used with the original author's permission; see THIRD-PARTY-NOTICES.md. This
-script only reads a developer-local copy of that program - no upstream source
-is redistributed in this repository.
+Used under the MIT License granted by the original author; see
+THIRD-PARTY-NOTICES.md. This script only reads a developer-local copy of that
+program - no upstream source is redistributed in this repository.
 
 Developer-local prerequisites (matches the other tools/ extractors):
 - `debugfiles/SECS.py` must exist (the upstream SECS snapshot; gitignored).
