@@ -6,13 +6,21 @@
 
 **알고리즘 및 방법론은 최상위 디렉토리의 md 파일과 docs 디렉토리의 md파일에 있습니다. 피드백 적극 환영합니다!**
 
+**SECS 알고리즘을 구현해주신 한플님 감사합니다."**
+https://gall.dcinside.com/mgallery/board/view/?id=speakers&no=514096&s_type=search_name&s_keyword=%ED%95%9C%ED%94%8C&page=1
+
+현재 버전 (v0.1.1)
+
+- SECS 알고리즘 추가
+- 2.1채널 선택 시 그에 맞게 SECS 알고리즘 개량
+
 ## Usage
 
-[다운로드 링크 Windows]
-[다운로드 링크 Mac]
+- [다운로드 링크 Windows](현재 준비 중)
+- [다운로드 링크 Mac](https://drive.google.com/file/d/1dv4g3yd9dgIV-FbkdvKMQgl3Hxso9W19/view?usp=sharing)
 
-[L 스윕 다운로드 링크](https://drive.google.com/file/d/1oUExSKQPChtX7unysMLhCc10M9hqM8DW/view?usp=sharing)
-[R 스윕 다운로드 링크](https://drive.google.com/file/d/1FIxWwctuwBQ99odKo2pj-PBXEp3CO1Ce/view?usp=sharing)
+- [L 스윕 다운로드 링크](https://drive.google.com/file/d/1oUExSKQPChtX7unysMLhCc10M9hqM8DW/view?usp=sharing)
+- [R 스윕 다운로드 링크](https://drive.google.com/file/d/1FIxWwctuwBQ99odKo2pj-PBXEp3CO1Ce/view?usp=sharing)
 
 ### 0 - 측정 전 준비물
 
