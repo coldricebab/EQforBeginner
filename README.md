@@ -11,8 +11,9 @@ https://gall.dcinside.com/mgallery/board/view/?id=speakers&no=514096&s_type=sear
 
 현재 버전 (v0.1.1)
 
-- SECS 알고리즘 추가
+- **SECS 알고리즘 추가**
 - 2.1채널 선택 시 그에 맞게 SECS 알고리즘 개량
+- 기존 6지점 측정에서 9지점 측정으로 변경
 
 ## Usage
 
@@ -59,7 +60,7 @@ miniDSP에서 UMIK-1 마이크 **90도** 캘리브레이션 파일을 받아 올
 
 <img width="1438" height="800" alt="Image" src="https://github.com/user-attachments/assets/15044f4a-f518-446e-884c-27f93d5867c9" />
 
-측정을 완료하고 올리면 이렇게 결과가 나옵니다.
+**측정 대기** 버튼을 누르고 스윕을 재생해주세요. 자동으로 스윕 시작/종료 신호를 인식합니다.
 
 이렇게 최적 서브우퍼 위상, 크로스오버, 지연을 찾았습니다.
 
