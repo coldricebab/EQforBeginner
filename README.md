@@ -29,7 +29,7 @@ https://gall.dcinside.com/mgallery/board/view/?id=speakers&no=514096&s_type=sear
 
 ## Usage
 
-- [다운로드 링크 Windows](https://drive.google.com/file/d/1fHTNul-hNF_PIR7Mm5uJOAbF5CBKgZbU/view?usp=sharing)
+- [다운로드 링크 Windows](https://drive.google.com/file/d/1Zs7bjpKbQbzAX1rT5_GdKL2CbDrJgRPD/view?usp=sharing)
 - [다운로드 링크 Mac](https://drive.google.com/file/d/1FDX1ztoL5BwTNrM_v8vBD-Fnb7vpFHU0/view?usp=sharing)
 
 - [L 스윕 다운로드 링크](https://drive.google.com/file/d/1oUExSKQPChtX7unysMLhCc10M9hqM8DW/view?usp=sharing)
