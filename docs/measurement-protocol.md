@@ -216,6 +216,12 @@ is still not qualified by this test.
 
 ## Opening the measurements in REW
 
+Session directories are named for the local time the session started
+(`live-2026-07-30_19-35-22-000`; the trailing counter only advances when two sessions
+begin in the same second). The names sort chronologically, so the directory listing is
+the measurement history, and the cache restore uses that same order when it decides
+which session is newest.
+
 Every accepted capture is also written to `live-projects/<session-id>/rew/` as a mono
 48 kHz IEEE-float WAV of its calibrated impulse response, named after what was measured
 and when:

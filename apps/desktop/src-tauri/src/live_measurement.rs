@@ -1480,10 +1480,17 @@ impl LiveMeasurementState {
                 base_directory.display()
             )
         })?;
-        let timestamp = unix_milliseconds()?;
+        // Local wall-clock time, so the directory list reads as the session
+        // list a person actually remembers making. The format is fixed width
+        // and big-endian, so sorting these names lexicographically still
+        // orders them by time - which the cache scan below depends on when it
+        // picks the newest session that carries a measurement. Sessions made
+        // inside the same second are separated by the suffix, which only
+        // increases, so that ordering holds there too.
+        let stamp = Local::now().format("%Y-%m-%d_%H-%M-%S").to_string();
         let mut selected = None;
         for suffix in 0..1_000_u16 {
-            let id = format!("live-{timestamp}-{suffix:03}");
+            let id = format!("live-{stamp}-{suffix:03}");
             let root = base_directory.join(&id);
             match fs::create_dir(&root) {
                 Ok(()) => {
@@ -10167,6 +10174,12 @@ impl LiveMeasurementState {
                         .is_some_and(|name| name.starts_with("live-"))
             })
             .collect::<Vec<_>>();
+        // Newest first. Session directory names are timestamps written big-end
+        // first (`live-YYYY-MM-DD_HH-MM-SS-NNN`), so a reverse name sort is a
+        // reverse time sort. Directories left over from the earlier
+        // `live-<unix-millis>-NNN` naming still sort before every dated name,
+        // which is also their true order, so a half-migrated cache stays
+        // correctly ordered.
         project_roots.sort_by(|left, right| right.file_name().cmp(&left.file_name()));
 
         let mut scanned_snapshot_count = 0_usize;
