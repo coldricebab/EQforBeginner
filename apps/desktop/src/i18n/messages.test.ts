@@ -53,6 +53,24 @@ describe("localized wizard copy", () => {
     ).toContain("prediction");
   });
 
+  it("keeps the wide-band crossover synthesis honest in both locales", () => {
+    for (const locale of [messages.en, messages.ko]) {
+      const search = locale.liveMeasurement.subwooferSearch;
+      expect(search.wideSafetyChecklist).toHaveLength(3);
+      // The wide mode is a model-based simulation, and the copy must say so:
+      // the recommendation can be wrong when the declared slopes differ from
+      // the hardware, and the real combined measurement stays the judge.
+      expect(search.modeWideBandHint).toMatch(/시뮬레이션|simulat/i);
+      expect(search.wideModelNote).toMatch(/모델|model/i);
+      expect(search.wideModelNote).toMatch(/틀릴 수|can be wrong/i);
+      expect(search.wideModelNote).toMatch(/최종 판정|remains the judge/i);
+      // The measured mode must remain described as model-free.
+      expect(search.modeMeasuredStatesHint).toMatch(
+        /가정하지 않|no filter model is assumed/i,
+      );
+    }
+  });
+
   it("keeps the redesign-and-reverify loop honest in both locales", () => {
     for (const locale of [messages.en, messages.ko]) {
       const copy = locale.liveMeasurement;

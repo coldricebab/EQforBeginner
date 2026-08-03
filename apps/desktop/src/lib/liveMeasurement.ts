@@ -40,6 +40,19 @@ export type LiveSubwooferSetupSummary = LiveSubwooferSetupRequest & {
   settingsPath: string;
 };
 
+/**
+ * `wide_band` measures the sub once with the bass-management low-pass at its
+ * maximum and both mains once full range (sub output off), then synthesizes
+ * every candidate crossover from the declared slope models. `measured_states`
+ * physically measures every candidate (model-free).
+ */
+export type LiveSubwooferSearchMode = "measured_states" | "wide_band";
+export type LiveCrossoverSlopeModel = "lr4" | "lr2" | "bw2";
+
+/** Wide-band mode's fixed capture roles (position ids). */
+export const WIDE_BAND_MAIN_POSITION_ID = "FULL";
+export const WIDE_BAND_SUB_POSITION_ID = "WIDE";
+
 export type LiveSubwooferSearchRequest = {
   crossoverHz: number[];
   measuredMainDelayMs: number;
@@ -48,6 +61,10 @@ export type LiveSubwooferSearchRequest = {
   delayMinimumMs: number;
   delayMaximumMs: number;
   delayStepMs: number;
+  mode: LiveSubwooferSearchMode;
+  subMeasuredLowPassHz: number | null;
+  mainHighPassSlope: LiveCrossoverSlopeModel | null;
+  subLowPassSlope: LiveCrossoverSlopeModel | null;
 };
 
 export type LiveSubwooferCrossoverCandidate = {
@@ -57,6 +74,7 @@ export type LiveSubwooferCrossoverCandidate = {
 
 export type LiveSubwooferSearchSummary = {
   algorithmVersion: string;
+  mode: LiveSubwooferSearchMode;
   candidates: LiveSubwooferCrossoverCandidate[];
   measuredMainDelayMs: number;
   measuredPolarityDegrees: 0 | 180;
@@ -64,6 +82,9 @@ export type LiveSubwooferSearchSummary = {
   delayMinimumMs: number;
   delayMaximumMs: number;
   delayStepMs: number;
+  subMeasuredLowPassHz: number | null;
+  mainHighPassSlope: LiveCrossoverSlopeModel | null;
+  subLowPassSlope: LiveCrossoverSlopeModel | null;
   fixedTimingReferenceChannel: LiveReferenceChannel;
   subSweepChannel: LiveChannel;
   planPath: string;
@@ -72,8 +93,12 @@ export type LiveSubwooferSearchSummary = {
 export type LiveSubwooferRankedSetting = {
   rank: number;
   crossoverHz: number;
+  /** Negative means the delay belongs on the subwoofer output instead. */
   mainDelayMs: number;
   polarityDegrees: 0 | 180;
+  /** Deployment sub-level change (dB re the measured level) this candidate
+   * was scored with — part of the recommendation. */
+  subTrimDb: number;
   totalScore: number;
   deficitRmsDb: number;
   deficitP95Db: number;
@@ -82,6 +107,10 @@ export type LiveSubwooferRankedSetting = {
 
 export type LiveSubwooferOptimizationSummary = {
   algorithmVersion: string;
+  mode: LiveSubwooferSearchMode;
+  subMeasuredLowPassHz: number | null;
+  mainHighPassSlope: LiveCrossoverSlopeModel | null;
+  subLowPassSlope: LiveCrossoverSlopeModel | null;
   synthesizedCandidateCount: number;
   best: LiveSubwooferRankedSetting;
   rankings: LiveSubwooferRankedSetting[];
@@ -532,6 +561,20 @@ export function acceptedSubTripletCount(
   search: LiveSubwooferSearchSummary | null,
 ): number {
   if (!search) return 0;
+  if (search.mode === "wide_band") {
+    // One shared triplet: both full-range mains plus the wide sub capture.
+    return captures[
+      captureKey("sub_main_only", WIDE_BAND_MAIN_POSITION_ID, "left")
+    ]?.accepted === true &&
+      captures[
+        captureKey("sub_main_only", WIDE_BAND_MAIN_POSITION_ID, "right")
+      ]?.accepted === true &&
+      captures[
+        captureKey("sub_only", WIDE_BAND_SUB_POSITION_ID, search.subSweepChannel)
+      ]?.accepted === true
+      ? 1
+      : 0;
+  }
   return search.candidates.filter(
     (candidate) =>
       captures[
@@ -544,6 +587,14 @@ export function acceptedSubTripletCount(
         captureKey("sub_only", candidate.id, search.subSweepChannel)
       ]?.accepted === true,
   ).length;
+}
+
+/** Total triplets the current plan expects (wide-band mode has exactly one). */
+export function expectedSubTripletCount(
+  search: LiveSubwooferSearchSummary | null,
+): number {
+  if (!search) return 0;
+  return search.mode === "wide_band" ? 1 : search.candidates.length;
 }
 
 export function formatMetric(

@@ -37,8 +37,11 @@ use eqforbeginner_dsp_core::smoothing::gaussian_log_frequency_smooth_at_db;
 use eqforbeginner_dsp_core::spatial::weighted_energy_average_db;
 use eqforbeginner_dsp_core::stereo::StereoBlendSettings;
 use eqforbeginner_dsp_core::sub_integration::{
-    optimize_separated_paths, CombinedResponse, Polarity, RankingConfig, SeparatedCrossoverPaths,
-    SeparatedPathOptimizationConfig, SEPARATED_PATH_OPTIMIZATION_VERSION,
+    optimize_separated_paths, synthesize_wide_band_crossover_states, CombinedResponse,
+    CrossoverAlignment, Polarity, RankingConfig, SeparatedCrossoverPaths,
+    SeparatedPathOptimizationConfig, WideBandIsolatedPaths, WideBandSynthesisConfig,
+    SEPARATED_PATH_CROSSOVER_REGULARIZATION_DB_PER_OCTAVE, SEPARATED_PATH_OPTIMIZATION_VERSION,
+    WIDE_BAND_CROSSOVER_SYNTHESIS_VERSION,
 };
 use eqforbeginner_dsp_core::target::{
     interpolate_log_frequency_grid, parse_target_txt, TargetCurve, TargetPreset,
@@ -97,7 +100,17 @@ pub const LIVE_CAPTURE_ENDPOINT_VERSION: &str = "known-marker-capture-endpoint-v
 pub const LIVE_LEVEL_ASSESSMENT_VERSION: &str = "umik-sweep-level-assessment-v2";
 pub const SWEEP_MARKER_CHANNEL_ANALYSIS_VERSION: &str = "uploaded-wav-marker-channel-analysis-v1";
 pub const LIVE_SUBWOOFER_SETUP_VERSION: &str = "manual-single-sub-settings-v1";
-pub const LIVE_SUBWOOFER_SEARCH_PLAN_VERSION: &str = "live-separated-path-search-plan-v1";
+/// v2 (2026-08-03): the plan carries a search mode. `wide_band` measures the
+/// sub once with the bass-management low-pass dialed to its maximum and the
+/// mains once full-range (sub output off), then synthesizes every candidate
+/// crossover state from a declared filter-slope model instead of asking the
+/// user to reconfigure and re-measure the hardware per crossover.
+pub const LIVE_SUBWOOFER_SEARCH_PLAN_VERSION: &str = "live-separated-path-search-plan-v2";
+/// Wide-band mode's fixed capture roles: both mains full-range at `FULL`, one
+/// sub capture at `WIDE`. These are position ids in the same key space the
+/// measured mode uses for its `XO##` candidates.
+pub const WIDE_BAND_MAIN_POSITION_ID: &str = "FULL";
+pub const WIDE_BAND_SUB_POSITION_ID: &str = "WIDE";
 pub const LIVE_ACCEPTED_MEASUREMENT_CACHE_VERSION: &str = "accepted-measurement-snapshot-cache-v3";
 /// Session subdirectory holding a REW-importable copy of every accepted capture.
 ///
@@ -285,6 +298,44 @@ pub struct LiveSubwooferCrossoverCandidate {
     pub crossover_hz: f64,
 }
 
+/// How the per-crossover isolated states are obtained.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveSubwooferSearchMode {
+    /// Every candidate crossover is physically configured and measured
+    /// (model-free; three captures per candidate).
+    #[default]
+    MeasuredStates,
+    /// One wide-band sub capture (bass-management low-pass at its maximum)
+    /// plus full-range main captures (sub output off); every candidate state
+    /// is synthesized from a declared filter-slope model. Three captures
+    /// total, at the cost of trusting that model.
+    WideBand,
+}
+
+/// The bass-management filter slope model the wide-band synthesis assumes.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveCrossoverSlopeModel {
+    /// 24 dB/oct Linkwitz-Riley - the consumer bass-management default
+    /// (confirmed on the WiiM Amp Ultra speaker/sub-out pair).
+    Lr4,
+    /// 12 dB/oct Linkwitz-Riley (antiphase branches at the crossover).
+    Lr2,
+    /// 12 dB/oct Butterworth (THX-style satellite high-pass).
+    Bw2,
+}
+
+impl LiveCrossoverSlopeModel {
+    fn alignment(self) -> CrossoverAlignment {
+        match self {
+            Self::Lr4 => CrossoverAlignment::LinkwitzRiley4,
+            Self::Lr2 => CrossoverAlignment::LinkwitzRiley2,
+            Self::Bw2 => CrossoverAlignment::Butterworth2,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LiveSubwooferSearchRequest {
@@ -295,12 +346,25 @@ pub struct LiveSubwooferSearchRequest {
     pub delay_minimum_ms: f64,
     pub delay_maximum_ms: f64,
     pub delay_step_ms: f64,
+    #[serde(default)]
+    pub mode: LiveSubwooferSearchMode,
+    /// Wide-band mode only: the bass-management low-pass corner active while
+    /// the sub is captured (the dial at its maximum). `None` declares a
+    /// genuine hardware bypass.
+    #[serde(default)]
+    pub sub_measured_low_pass_hz: Option<f64>,
+    /// Wide-band mode only; required there, rejected as absent elsewhere.
+    #[serde(default)]
+    pub main_high_pass_slope: Option<LiveCrossoverSlopeModel>,
+    #[serde(default)]
+    pub sub_low_pass_slope: Option<LiveCrossoverSlopeModel>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LiveSubwooferSearchSummary {
     pub algorithm_version: &'static str,
+    pub mode: LiveSubwooferSearchMode,
     pub candidates: Vec<LiveSubwooferCrossoverCandidate>,
     pub measured_main_delay_ms: f64,
     pub measured_polarity_degrees: u16,
@@ -308,6 +372,9 @@ pub struct LiveSubwooferSearchSummary {
     pub delay_minimum_ms: f64,
     pub delay_maximum_ms: f64,
     pub delay_step_ms: f64,
+    pub sub_measured_low_pass_hz: Option<f64>,
+    pub main_high_pass_slope: Option<LiveCrossoverSlopeModel>,
+    pub sub_low_pass_slope: Option<LiveCrossoverSlopeModel>,
     pub fixed_timing_reference_channel: ReferenceChannel,
     pub sub_sweep_channel: LiveChannel,
     pub plan_path: String,
@@ -318,8 +385,15 @@ pub struct LiveSubwooferSearchSummary {
 pub struct LiveSubwooferRankedSetting {
     pub rank: usize,
     pub crossover_hz: f64,
+    /// Negative means the delay belongs on the subwoofer output (main at
+    /// 0 ms, sub delayed by the absolute value) - a speaker output cannot be
+    /// advanced. The UI translates it into that instruction.
     pub main_delay_ms: f64,
     pub polarity_degrees: u16,
+    /// Deployment sub-level change (dB re the level measured at, i.e. re
+    /// `fixed_sub_level_db`) this candidate was scored with. Part of the
+    /// recommendation: apply it together with crossover/delay/polarity.
+    pub sub_trim_db: f64,
     pub total_score: f64,
     pub deficit_rms_db: f64,
     pub deficit_p95_db: f64,
@@ -330,6 +404,12 @@ pub struct LiveSubwooferRankedSetting {
 #[serde(rename_all = "camelCase")]
 pub struct LiveSubwooferOptimizationSummary {
     pub algorithm_version: &'static str,
+    pub mode: LiveSubwooferSearchMode,
+    /// Echo of the wide-band model inputs (`None` in measured-states mode),
+    /// so the report is self-describing about its model dependence.
+    pub sub_measured_low_pass_hz: Option<f64>,
+    pub main_high_pass_slope: Option<LiveCrossoverSlopeModel>,
+    pub sub_low_pass_slope: Option<LiveCrossoverSlopeModel>,
     pub synthesized_candidate_count: usize,
     pub best: LiveSubwooferRankedSetting,
     pub rankings: Vec<LiveSubwooferRankedSetting>,
@@ -342,8 +422,10 @@ pub struct LiveSubwooferOptimizationSummary {
     /// (delay the main by this much); negative means the delay belongs on the
     /// sub side. The search windows one crossover half-period around it.
     pub arrival_estimates: Vec<LiveSubwooferArrivalEstimate>,
-    /// Advisory only: predicted crossover-dip change if the sub level moved,
-    /// with the winning crossover/delay/polarity held fixed.
+    /// The deployment sub-level change the winner was scored at (its
+    /// `sub_trim_db`), plus the deficit the same candidate keeps at the
+    /// captured sub level for contrast. Since search v4 the trim is part of
+    /// the recommendation, not a free gain scan.
     pub sub_level_advisory: Option<LiveSubwooferSubLevelAdvisory>,
     pub warnings: Vec<String>,
     pub report_path: String,
@@ -1106,6 +1188,14 @@ fn validate_position_id(position_id: &str, kind: LiveCaptureKind) -> Result<Stri
         {
             return Ok(trimmed.to_string());
         }
+        // Wide-band search roles: full-range mains and one wide sub capture.
+        // Which of the two vocabularies a session accepts is enforced against
+        // the saved plan in `begin_capture`.
+        if (kind == LiveCaptureKind::SubMainOnly && trimmed == WIDE_BAND_MAIN_POSITION_ID)
+            || (kind == LiveCaptureKind::SubOnly && trimmed == WIDE_BAND_SUB_POSITION_ID)
+        {
+            return Ok(trimmed.to_string());
+        }
         return Err(format!(
             "unsupported {} crossover candidate `{trimmed}`",
             kind.as_str()
@@ -1608,6 +1698,46 @@ impl LiveMeasurementState {
                     .to_string(),
             );
         }
+        match request.mode {
+            LiveSubwooferSearchMode::MeasuredStates => {
+                if request.sub_measured_low_pass_hz.is_some()
+                    || request.main_high_pass_slope.is_some()
+                    || request.sub_low_pass_slope.is_some()
+                {
+                    return Err(
+                        "filter-model settings only apply to the wide-band search mode".to_string(),
+                    );
+                }
+            }
+            LiveSubwooferSearchMode::WideBand => {
+                if request.main_high_pass_slope.is_none() || request.sub_low_pass_slope.is_none() {
+                    return Err(
+                        "the wide-band search needs the speaker high-pass and sub low-pass slope \
+                         models your bass management applies"
+                            .to_string(),
+                    );
+                }
+                if let Some(low_pass_hz) = request.sub_measured_low_pass_hz {
+                    if !low_pass_hz.is_finite() || !(120.0..=500.0).contains(&low_pass_hz) {
+                        return Err(
+                            "the low-pass active during the wide sub capture must be a finite \
+                             value from 120 to 500 Hz (dial the crossover to its maximum)"
+                                .to_string(),
+                        );
+                    }
+                    if request
+                        .crossover_hz
+                        .iter()
+                        .any(|candidate| *candidate > low_pass_hz)
+                    {
+                        return Err(format!(
+                            "every candidate crossover must stay at or below the {low_pass_hz:.0} Hz \
+                             low-pass active during the wide sub capture"
+                        ));
+                    }
+                }
+            }
+        }
         for (label, value) in [
             ("minimum delay", request.delay_minimum_ms),
             ("maximum delay", request.delay_maximum_ms),
@@ -1628,28 +1758,12 @@ impl LiveMeasurementState {
         if !(0.01..=5.0).contains(&request.delay_step_ms) {
             return Err("the delay step must be from 0.01 to 5 ms".to_string());
         }
-        // The configured range is the hardware's outer capability; the search
-        // itself windows a crossover half-period around the measured sub
-        // arrival and snaps candidates to absolute step multiples, so the
-        // range no longer has to be an exact multiple of the step. The size
-        // bound below is the worst case (full range at this step).
-        let delay_steps =
-            (request.delay_maximum_ms - request.delay_minimum_ms) / request.delay_step_ms;
-        if delay_steps.ceil() as usize + 1 > 1_001 {
-            return Err("the delay search is limited to 1001 values".to_string());
-        }
-        let synthesized_candidate_count = request
-            .crossover_hz
-            .len()
-            .checked_mul(delay_steps.ceil() as usize + 1)
-            .and_then(|count| count.checked_mul(2))
-            .ok_or_else(|| "the separated-path search size overflowed".to_string())?;
-        if synthesized_candidate_count > 10_000 {
-            return Err(
-                "the crossover, delay, and polarity search is limited to 10000 candidates"
-                    .to_string(),
-            );
-        }
+        // No plan-time grid-size check: since search v3 the core derives an
+        // admissible grid for every in-range step on its own - it coarsens
+        // the arrival-window scan to the finest step multiple that fits the
+        // per-window/total candidate caps and then refines around each
+        // crossover's best at the full requested resolution. The caps live
+        // in `optimize_separated_paths` as structural backstops.
 
         let active = self
             .active_capture
@@ -1727,13 +1841,17 @@ impl LiveMeasurementState {
             })
             .collect::<Vec<_>>();
         if let Some(existing) = session.subwoofer_search.as_ref() {
-            if existing.candidates == candidates
+            if existing.mode == request.mode
+                && existing.candidates == candidates
                 && existing.measured_main_delay_ms == request.measured_main_delay_ms
                 && existing.measured_polarity_degrees == request.measured_polarity_degrees
                 && existing.fixed_sub_level_db == request.fixed_sub_level_db
                 && existing.delay_minimum_ms == request.delay_minimum_ms
                 && existing.delay_maximum_ms == request.delay_maximum_ms
                 && existing.delay_step_ms == request.delay_step_ms
+                && existing.sub_measured_low_pass_hz == request.sub_measured_low_pass_hz
+                && existing.main_high_pass_slope == request.main_high_pass_slope
+                && existing.sub_low_pass_slope == request.sub_low_pass_slope
                 && existing.fixed_timing_reference_channel == fixed_timing_reference_channel
                 && existing.sub_sweep_channel == sub_sweep_channel
             {
@@ -1751,6 +1869,7 @@ impl LiveMeasurementState {
             .join(format!("{artifact_index:06}-single-sub-search-plan.json"));
         let summary = LiveSubwooferSearchSummary {
             algorithm_version: LIVE_SUBWOOFER_SEARCH_PLAN_VERSION,
+            mode: request.mode,
             candidates,
             measured_main_delay_ms: request.measured_main_delay_ms,
             measured_polarity_degrees: request.measured_polarity_degrees,
@@ -1758,6 +1877,9 @@ impl LiveMeasurementState {
             delay_minimum_ms: request.delay_minimum_ms,
             delay_maximum_ms: request.delay_maximum_ms,
             delay_step_ms: request.delay_step_ms,
+            sub_measured_low_pass_hz: request.sub_measured_low_pass_hz,
+            main_high_pass_slope: request.main_high_pass_slope,
+            sub_low_pass_slope: request.sub_low_pass_slope,
             fixed_timing_reference_channel,
             sub_sweep_channel,
             plan_path: path.display().to_string(),
@@ -1826,17 +1948,23 @@ impl LiveMeasurementState {
                     .to_string()
             })?;
             let best = &optimization.best;
+            // The recommended sub level is the measured level plus the
+            // deployment trim the winner was scored at (search v4). Level
+            // dials are coarser than delay dials, so a +/-0.5 dB entry
+            // tolerance covers hardware granularity; the recorded value is
+            // what the user actually applied and feeds the confirmation.
+            let recommended_sub_level_db = search.fixed_sub_level_db + best.sub_trim_db;
             let matches_recommendation = (request.crossover_hz - best.crossover_hz).abs() < 1.0e-9
                 && (request.main_delay_ms - best.main_delay_ms).abs() < 1.0e-9
                 && request.polarity_degrees == best.polarity_degrees
-                && (request.sub_level_db - search.fixed_sub_level_db).abs() < 1.0e-9;
+                && (request.sub_level_db - recommended_sub_level_db).abs() <= 0.5 + 1.0e-9;
             if !matches_recommendation {
                 return Err(format!(
-                    "apply the measured-path recommendation exactly: {:.1} Hz, {:.3} ms, {} degrees, {:.1} dB",
+                    "apply the measured-path recommendation exactly: {:.1} Hz, {:.3} ms, {} degrees, {:.1} dB (sub level within 0.5 dB)",
                     best.crossover_hz,
                     best.main_delay_ms,
                     best.polarity_degrees,
-                    search.fixed_sub_level_db,
+                    recommended_sub_level_db,
                 ));
             }
         }
@@ -1913,64 +2041,151 @@ impl LiveMeasurementState {
                 .subwoofer_search
                 .clone()
                 .ok_or_else(|| "save a separated-path crossover search plan first".to_string())?;
-            let mut paths = Vec::with_capacity(search.candidates.len());
-            let mut marker_levels: Vec<(String, Option<f64>)> = Vec::new();
-            for candidate in &search.candidates {
-                let left_key = (
-                    LiveCaptureKind::SubMainOnly,
-                    candidate.id.clone(),
-                    LiveChannel::Left,
-                );
-                let right_key = (
-                    LiveCaptureKind::SubMainOnly,
-                    candidate.id.clone(),
-                    LiveChannel::Right,
-                );
-                let sub_key = (
-                    LiveCaptureKind::SubOnly,
-                    candidate.id.clone(),
-                    search.sub_sweep_channel,
-                );
-                let left = session.measurements.get(&left_key).ok_or_else(|| {
-                    format!(
-                        "capture the {} Hz left main-only path before optimization",
-                        candidate.crossover_hz
-                    )
-                })?;
-                let right = session.measurements.get(&right_key).ok_or_else(|| {
-                    format!(
-                        "capture the {} Hz right main-only path before optimization",
-                        candidate.crossover_hz
-                    )
-                })?;
-                let sub = session.measurements.get(&sub_key).ok_or_else(|| {
-                    format!(
-                        "capture the {} Hz sub-only path before optimization",
-                        candidate.crossover_hz
-                    )
-                })?;
-                for measurement in [left, right, sub] {
-                    validate_stored_evidence(session, measurement)?;
-                }
-                for (role, measurement) in [
-                    ("left main-only", left),
-                    ("right main-only", right),
-                    ("sub-only", sub),
-                ] {
-                    marker_levels.push((
-                        format!("the {} Hz {role} capture", candidate.crossover_hz),
-                        measurement.summary.start_marker_rms_dbfs,
-                    ));
-                }
-                paths.push(SeparatedCrossoverPaths {
-                    id: candidate.id.clone(),
-                    crossover_hz: candidate.crossover_hz,
-                    left_main: isolated_measurement_response(left, "left main-only capture")?,
-                    right_main: isolated_measurement_response(right, "right main-only capture")?,
-                    sub: isolated_measurement_response(sub, "sub-only capture")?,
-                });
-            }
-            validate_isolated_marker_levels(&marker_levels)?;
+            let paths =
+                match search.mode {
+                    LiveSubwooferSearchMode::MeasuredStates => {
+                        let mut paths = Vec::with_capacity(search.candidates.len());
+                        let mut marker_levels: Vec<(String, Option<f64>)> = Vec::new();
+                        for candidate in &search.candidates {
+                            let left_key = (
+                                LiveCaptureKind::SubMainOnly,
+                                candidate.id.clone(),
+                                LiveChannel::Left,
+                            );
+                            let right_key = (
+                                LiveCaptureKind::SubMainOnly,
+                                candidate.id.clone(),
+                                LiveChannel::Right,
+                            );
+                            let sub_key = (
+                                LiveCaptureKind::SubOnly,
+                                candidate.id.clone(),
+                                search.sub_sweep_channel,
+                            );
+                            let left = session.measurements.get(&left_key).ok_or_else(|| {
+                                format!(
+                                    "capture the {} Hz left main-only path before optimization",
+                                    candidate.crossover_hz
+                                )
+                            })?;
+                            let right = session.measurements.get(&right_key).ok_or_else(|| {
+                                format!(
+                                    "capture the {} Hz right main-only path before optimization",
+                                    candidate.crossover_hz
+                                )
+                            })?;
+                            let sub = session.measurements.get(&sub_key).ok_or_else(|| {
+                                format!(
+                                    "capture the {} Hz sub-only path before optimization",
+                                    candidate.crossover_hz
+                                )
+                            })?;
+                            for measurement in [left, right, sub] {
+                                validate_stored_evidence(session, measurement)?;
+                            }
+                            for (role, measurement) in [
+                                ("left main-only", left),
+                                ("right main-only", right),
+                                ("sub-only", sub),
+                            ] {
+                                marker_levels.push((
+                                    format!("the {} Hz {role} capture", candidate.crossover_hz),
+                                    measurement.summary.start_marker_rms_dbfs,
+                                ));
+                            }
+                            paths.push(SeparatedCrossoverPaths {
+                                id: candidate.id.clone(),
+                                crossover_hz: candidate.crossover_hz,
+                                left_main: isolated_measurement_response(
+                                    left,
+                                    "left main-only capture",
+                                )?,
+                                right_main: isolated_measurement_response(
+                                    right,
+                                    "right main-only capture",
+                                )?,
+                                sub: isolated_measurement_response(sub, "sub-only capture")?,
+                            });
+                        }
+                        validate_isolated_marker_levels(&marker_levels)?;
+                        paths
+                    }
+                    LiveSubwooferSearchMode::WideBand => {
+                        let left_key = (
+                            LiveCaptureKind::SubMainOnly,
+                            WIDE_BAND_MAIN_POSITION_ID.to_string(),
+                            LiveChannel::Left,
+                        );
+                        let right_key = (
+                            LiveCaptureKind::SubMainOnly,
+                            WIDE_BAND_MAIN_POSITION_ID.to_string(),
+                            LiveChannel::Right,
+                        );
+                        let sub_key = (
+                            LiveCaptureKind::SubOnly,
+                            WIDE_BAND_SUB_POSITION_ID.to_string(),
+                            search.sub_sweep_channel,
+                        );
+                        let left = session.measurements.get(&left_key).ok_or_else(|| {
+                            "capture the left full-range main path before optimization".to_string()
+                        })?;
+                        let right = session.measurements.get(&right_key).ok_or_else(|| {
+                            "capture the right full-range main path before optimization".to_string()
+                        })?;
+                        let sub = session.measurements.get(&sub_key).ok_or_else(|| {
+                            "capture the wide-band sub path before optimization".to_string()
+                        })?;
+                        for measurement in [left, right, sub] {
+                            validate_stored_evidence(session, measurement)?;
+                        }
+                        let marker_levels: Vec<(String, Option<f64>)> = [
+                            ("the left full-range main capture", left),
+                            ("the right full-range main capture", right),
+                            ("the wide-band sub capture", sub),
+                        ]
+                        .into_iter()
+                        .map(|(role, measurement)| {
+                            (role.to_string(), measurement.summary.start_marker_rms_dbfs)
+                        })
+                        .collect();
+                        validate_isolated_marker_levels_within(
+                            &marker_levels,
+                            MAXIMUM_WIDE_BAND_MARKER_LEVEL_DEVIATION_DB,
+                        )?;
+                        let (main_slope, sub_slope) =
+                            match (search.main_high_pass_slope, search.sub_low_pass_slope) {
+                                (Some(main_slope), Some(sub_slope)) => (main_slope, sub_slope),
+                                _ => return Err(
+                                    "the wide-band search plan is missing its filter-slope models"
+                                        .to_string(),
+                                ),
+                            };
+                        synthesize_wide_band_crossover_states(
+                            &WideBandIsolatedPaths {
+                                left_main: isolated_measurement_response(
+                                    left,
+                                    "left full-range main capture",
+                                )?,
+                                right_main: isolated_measurement_response(
+                                    right,
+                                    "right full-range main capture",
+                                )?,
+                                sub: isolated_measurement_response(sub, "wide-band sub capture")?,
+                            },
+                            &WideBandSynthesisConfig {
+                                candidate_crossovers_hz: search
+                                    .candidates
+                                    .iter()
+                                    .map(|candidate| candidate.crossover_hz)
+                                    .collect(),
+                                sub_measured_low_pass_hz: search.sub_measured_low_pass_hz,
+                                main_high_pass: main_slope.alignment(),
+                                sub_low_pass: sub_slope.alignment(),
+                            },
+                        )
+                        .map_err(|error| format!("wide-band crossover synthesis failed: {error}"))?
+                    }
+                };
             (
                 session.id.clone(),
                 session.evidence_generation,
@@ -1987,6 +2202,28 @@ impl LiveMeasurementState {
                 )
             }
         };
+        let synthesized_crossover_model = match search.mode {
+            LiveSubwooferSearchMode::MeasuredStates => None,
+            LiveSubwooferSearchMode::WideBand => Some(match (
+                search.main_high_pass_slope,
+                search.sub_low_pass_slope,
+                search.sub_measured_low_pass_hz,
+            ) {
+                (Some(main_slope), Some(sub_slope), Some(low_pass_hz)) => format!(
+                    "{} high-pass on the mains, {} low-pass on the sub, replacing the {low_pass_hz:.0} Hz \
+                     low-pass active during the wide sub capture",
+                    main_slope.alignment().as_str(),
+                    sub_slope.alignment().as_str(),
+                ),
+                (Some(main_slope), Some(sub_slope), None) => format!(
+                    "{} high-pass on the mains, {} low-pass on the sub, applied to a bypassed \
+                     (unfiltered) sub capture",
+                    main_slope.alignment().as_str(),
+                    sub_slope.alignment().as_str(),
+                ),
+                _ => "undeclared slope models".to_string(),
+            }),
+        };
         let report = optimize_separated_paths(
             &paths,
             &SeparatedPathOptimizationConfig {
@@ -1995,6 +2232,9 @@ impl LiveMeasurementState {
                 delay_minimum_ms: search.delay_minimum_ms,
                 delay_maximum_ms: search.delay_maximum_ms,
                 delay_step_ms: search.delay_step_ms,
+                synthesized_crossover_model,
+                crossover_regularization_db_per_octave:
+                    SEPARATED_PATH_CROSSOVER_REGULARIZATION_DB_PER_OCTAVE,
                 ranking: RankingConfig::default(),
             },
         )
@@ -2018,11 +2258,18 @@ impl LiveMeasurementState {
                         ))
                     }
                 };
+                let sub_trim_db = candidate.settings.sub_level_db.ok_or_else(|| {
+                    format!(
+                        "ranked candidate `{}` omitted its deployment sub trim",
+                        candidate.id
+                    )
+                })?;
                 Ok(LiveSubwooferRankedSetting {
                     rank: candidate.rank,
                     crossover_hz: candidate.settings.crossover_hz,
                     main_delay_ms,
                     polarity_degrees,
+                    sub_trim_db,
                     total_score: candidate.metrics.total_score,
                     deficit_rms_db: candidate.metrics.deficit_rms_db,
                     deficit_p95_db: candidate.metrics.deficit_p95_db,
@@ -2061,7 +2308,14 @@ impl LiveMeasurementState {
             .join("inputs")
             .join(format!("{artifact_index:06}-single-sub-optimization.json"));
         let summary = LiveSubwooferOptimizationSummary {
-            algorithm_version: SEPARATED_PATH_OPTIMIZATION_VERSION,
+            algorithm_version: match search.mode {
+                LiveSubwooferSearchMode::MeasuredStates => SEPARATED_PATH_OPTIMIZATION_VERSION,
+                LiveSubwooferSearchMode::WideBand => WIDE_BAND_CROSSOVER_SYNTHESIS_VERSION,
+            },
+            mode: search.mode,
+            sub_measured_low_pass_hz: search.sub_measured_low_pass_hz,
+            main_high_pass_slope: search.main_high_pass_slope,
+            sub_low_pass_slope: search.sub_low_pass_slope,
             synthesized_candidate_count: report.synthesized_candidate_count,
             best,
             rankings,
@@ -2460,6 +2714,7 @@ mod tests {
     fn isolated_leakage_gate_rejects_unmuted_paths_and_passes_clean_ones() {
         let search = LiveSubwooferSearchSummary {
             algorithm_version: LIVE_SUBWOOFER_SEARCH_PLAN_VERSION,
+            mode: LiveSubwooferSearchMode::MeasuredStates,
             candidates: vec![LiveSubwooferCrossoverCandidate {
                 id: "XO01".into(),
                 crossover_hz: 80.0,
@@ -2470,6 +2725,9 @@ mod tests {
             delay_minimum_ms: 0.0,
             delay_maximum_ms: 4.0,
             delay_step_ms: 0.5,
+            sub_measured_low_pass_hz: None,
+            main_high_pass_slope: None,
+            sub_low_pass_slope: None,
             fixed_timing_reference_channel: ReferenceChannel::Right,
             sub_sweep_channel: LiveChannel::Left,
             plan_path: String::new(),
@@ -2508,6 +2766,9 @@ mod tests {
             Some(IsolatedLeakageFinding::Leakage(code)) => code,
             Some(IsolatedLeakageFinding::NoiseLimited(code)) => {
                 panic!("expected a hard rejection, got NoiseLimited({code})")
+            }
+            Some(IsolatedLeakageFinding::Diagnostic(code)) => {
+                panic!("expected a hard rejection, got Diagnostic({code})")
             }
             None => panic!("expected a hard rejection, got None"),
         };
@@ -2605,11 +2866,271 @@ mod tests {
                 assert!(code.contains("main_only_sub_band_noise_limited"), "{code}");
                 assert!(code.contains("band_snr:"), "{code}");
             }
-            Some(IsolatedLeakageFinding::Leakage(code)) => {
-                panic!("a noise-dominated band must downgrade to a diagnostic, got Leakage({code})")
+            Some(
+                IsolatedLeakageFinding::Leakage(code) | IsolatedLeakageFinding::Diagnostic(code),
+            ) => {
+                panic!("a noise-dominated band must downgrade to NoiseLimited, got {code}")
             }
             None => panic!("a noise-dominated band must downgrade to a diagnostic, got None"),
         }
+    }
+
+    #[test]
+    fn wide_band_leakage_gate_admits_full_range_bass_and_flags_a_high_passed_main() {
+        let search = LiveSubwooferSearchSummary {
+            algorithm_version: LIVE_SUBWOOFER_SEARCH_PLAN_VERSION,
+            mode: LiveSubwooferSearchMode::WideBand,
+            candidates: vec![
+                LiveSubwooferCrossoverCandidate {
+                    id: "XO01".into(),
+                    crossover_hz: 60.0,
+                },
+                LiveSubwooferCrossoverCandidate {
+                    id: "XO02".into(),
+                    crossover_hz: 90.0,
+                },
+            ],
+            measured_main_delay_ms: 0.0,
+            measured_polarity_degrees: 0,
+            fixed_sub_level_db: 0.0,
+            delay_minimum_ms: -10.0,
+            delay_maximum_ms: 25.0,
+            delay_step_ms: 0.1,
+            sub_measured_low_pass_hz: Some(200.0),
+            main_high_pass_slope: Some(LiveCrossoverSlopeModel::Lr4),
+            sub_low_pass_slope: Some(LiveCrossoverSlopeModel::Lr4),
+            fixed_timing_reference_channel: ReferenceChannel::Right,
+            sub_sweep_channel: LiveChannel::Left,
+            plan_path: String::new(),
+        };
+        let response =
+            |shape: &dyn Fn(f64) -> f64| eqforbeginner_dsp_core::analysis::FrequencyResponse {
+                sample_rate_hz: PROJECT_SAMPLE_RATE_HZ,
+                fft_size: 96_000,
+                frequencies_hz: (20..=500).map(f64::from).collect(),
+                magnitude_db: (20..=500).map(|f| shape(f64::from(f))).collect(),
+                phase_rad: vec![0.0; 481],
+            };
+        // The 470 Hz tone sits inside the 440-500 Hz band the wide sub check
+        // examines (2.2 x the 200 Hz dial); a silent pre-sweep keeps the
+        // band-SNR path from demoting the finding.
+        let quiet_capture: Vec<f64> = (0..120_000)
+            .map(|index| {
+                let time = index as f64 / 48_000.0;
+                let in_sweep = index >= 24_000;
+                if in_sweep {
+                    0.05 * (std::f64::consts::TAU * 470.0 * time).sin()
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        // A genuinely full-range main produces deep bass; the measured-mode
+        // sub-band leakage reading of that same shape would have rejected it.
+        let full_range_main = response(&|_| 0.0);
+        assert!(isolated_path_leakage_issue(
+            LiveCaptureKind::SubMainOnly,
+            WIDE_BAND_MAIN_POSITION_ID,
+            Some(&search),
+            &full_range_main,
+            &quiet_capture,
+            24_000.0,
+            120_000.0,
+        )
+        .is_none());
+        // A main that reached the microphone through a forgotten LR4 bass
+        // management high-pass has essentially no 40-100 Hz energy. That is a
+        // diagnostic, not a rejection: small speakers roll off early too.
+        let high_passed_main = response(&|f| -48.0 * (250.0_f64 / f).log2().max(0.0));
+        match isolated_path_leakage_issue(
+            LiveCaptureKind::SubMainOnly,
+            WIDE_BAND_MAIN_POSITION_ID,
+            Some(&search),
+            &high_passed_main,
+            &quiet_capture,
+            24_000.0,
+            120_000.0,
+        ) {
+            Some(IsolatedLeakageFinding::Diagnostic(code)) => {
+                assert!(code.contains("main_full_range_low_band_missing"), "{code}");
+            }
+            other => panic!("expected a diagnostic, got {other:?}"),
+        }
+        // The wide sub capture is judged against the 200 Hz dial: content well
+        // above it that clears the room noise is still a leaking (unmuted)
+        // main speaker.
+        let leaking_wide_sub = response(&|_| 0.0);
+        match isolated_path_leakage_issue(
+            LiveCaptureKind::SubOnly,
+            WIDE_BAND_SUB_POSITION_ID,
+            Some(&search),
+            &leaking_wide_sub,
+            &quiet_capture,
+            24_000.0,
+            120_000.0,
+        ) {
+            Some(IsolatedLeakageFinding::Leakage(code)) => {
+                assert!(code.contains("sub_only_high_band_leakage"), "{code}");
+            }
+            other => panic!("expected a leakage rejection, got {other:?}"),
+        }
+        // A clean wide sub rolls off above the dial and passes.
+        let clean_wide_sub = response(&|f| -24.0 * (f / 200.0_f64).log2().max(0.0));
+        assert!(isolated_path_leakage_issue(
+            LiveCaptureKind::SubOnly,
+            WIDE_BAND_SUB_POSITION_ID,
+            Some(&search),
+            &clean_wide_sub,
+            &quiet_capture,
+            24_000.0,
+            120_000.0,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn isolated_cache_reuse_ignores_search_parameters_but_keeps_physical_state() {
+        let cached = CachedSubwooferSearch {
+            mode: LiveSubwooferSearchMode::WideBand,
+            candidates: vec![
+                CachedSubwooferCandidate {
+                    id: "XO01".into(),
+                    crossover_hz: 40.0,
+                },
+                CachedSubwooferCandidate {
+                    id: "XO02".into(),
+                    crossover_hz: 80.0,
+                },
+            ],
+            measured_main_delay_ms: 0.0,
+            measured_polarity_degrees: 0,
+            fixed_sub_level_db: 0.0,
+            sub_measured_low_pass_hz: Some(250.0),
+            fixed_timing_reference_channel: ReferenceChannel::Right,
+            sub_sweep_channel: LiveChannel::Left,
+        };
+        let mut current = LiveSubwooferSearchSummary {
+            algorithm_version: LIVE_SUBWOOFER_SEARCH_PLAN_VERSION,
+            mode: LiveSubwooferSearchMode::WideBand,
+            candidates: vec![
+                LiveSubwooferCrossoverCandidate {
+                    id: "XO01".into(),
+                    crossover_hz: 60.0,
+                },
+                LiveSubwooferCrossoverCandidate {
+                    id: "XO02".into(),
+                    crossover_hz: 90.0,
+                },
+                LiveSubwooferCrossoverCandidate {
+                    id: "XO03".into(),
+                    crossover_hz: 110.0,
+                },
+            ],
+            measured_main_delay_ms: 0.0,
+            measured_polarity_degrees: 0,
+            fixed_sub_level_db: 0.0,
+            delay_minimum_ms: -10.0,
+            delay_maximum_ms: 25.0,
+            delay_step_ms: 0.01,
+            sub_measured_low_pass_hz: Some(250.0),
+            main_high_pass_slope: Some(LiveCrossoverSlopeModel::Lr2),
+            sub_low_pass_slope: Some(LiveCrossoverSlopeModel::Lr4),
+            fixed_timing_reference_channel: ReferenceChannel::Right,
+            sub_sweep_channel: LiveChannel::Left,
+            plan_path: String::new(),
+        };
+        // Wide mode: the candidate list, delay search parameters, and slope
+        // models are synthesis inputs, not capture state - every capture
+        // stays reusable when only they change.
+        assert!(cached_subwoofer_search_matches(
+            Some(&cached),
+            Some(&current),
+            LiveCaptureKind::SubMainOnly,
+            WIDE_BAND_MAIN_POSITION_ID,
+        ));
+        assert!(cached_subwoofer_search_matches(
+            Some(&cached),
+            Some(&current),
+            LiveCaptureKind::SubOnly,
+            WIDE_BAND_SUB_POSITION_ID,
+        ));
+        // The dial physically shaped the wide sub capture only.
+        current.sub_measured_low_pass_hz = Some(200.0);
+        assert!(cached_subwoofer_search_matches(
+            Some(&cached),
+            Some(&current),
+            LiveCaptureKind::SubMainOnly,
+            WIDE_BAND_MAIN_POSITION_ID,
+        ));
+        assert!(!cached_subwoofer_search_matches(
+            Some(&cached),
+            Some(&current),
+            LiveCaptureKind::SubOnly,
+            WIDE_BAND_SUB_POSITION_ID,
+        ));
+        current.sub_measured_low_pass_hz = Some(250.0);
+        // The hardware state held during the captures always gates.
+        current.fixed_sub_level_db = -3.0;
+        assert!(!cached_subwoofer_search_matches(
+            Some(&cached),
+            Some(&current),
+            LiveCaptureKind::SubMainOnly,
+            WIDE_BAND_MAIN_POSITION_ID,
+        ));
+        current.fixed_sub_level_db = 0.0;
+
+        // Measured mode: a capture follows its own candidate's physical
+        // crossover, not the whole list.
+        let cached_measured = CachedSubwooferSearch {
+            mode: LiveSubwooferSearchMode::MeasuredStates,
+            candidates: vec![
+                CachedSubwooferCandidate {
+                    id: "XO01".into(),
+                    crossover_hz: 70.0,
+                },
+                CachedSubwooferCandidate {
+                    id: "XO02".into(),
+                    crossover_hz: 90.0,
+                },
+            ],
+            sub_measured_low_pass_hz: None,
+            ..cached
+        };
+        let current_measured = LiveSubwooferSearchSummary {
+            mode: LiveSubwooferSearchMode::MeasuredStates,
+            candidates: vec![
+                LiveSubwooferCrossoverCandidate {
+                    id: "XO01".into(),
+                    crossover_hz: 70.0,
+                },
+                LiveSubwooferCrossoverCandidate {
+                    id: "XO02".into(),
+                    crossover_hz: 100.0,
+                },
+            ],
+            sub_measured_low_pass_hz: None,
+            main_high_pass_slope: None,
+            sub_low_pass_slope: None,
+            ..current
+        };
+        assert!(cached_subwoofer_search_matches(
+            Some(&cached_measured),
+            Some(&current_measured),
+            LiveCaptureKind::SubMainOnly,
+            "XO01",
+        ));
+        assert!(!cached_subwoofer_search_matches(
+            Some(&cached_measured),
+            Some(&current_measured),
+            LiveCaptureKind::SubOnly,
+            "XO02",
+        ));
+        assert!(!cached_subwoofer_search_matches(
+            Some(&cached_measured),
+            Some(&current_measured),
+            LiveCaptureKind::SubOnly,
+            "XO03",
+        ));
     }
 
     #[test]
@@ -3747,6 +4268,10 @@ mod tests {
             delay_minimum_ms: 0.0,
             delay_maximum_ms: 5.0,
             delay_step_ms: 0.05,
+            mode: LiveSubwooferSearchMode::MeasuredStates,
+            sub_measured_low_pass_hz: None,
+            main_high_pass_slope: None,
+            sub_low_pass_slope: None,
         };
         let plan = state.configure_subwoofer_search(request).unwrap();
         assert_eq!(plan.candidates.len(), 3);
@@ -3794,6 +4319,36 @@ mod tests {
             })
             .unwrap_err();
         assert!(setup_before_optimization.contains("finish the separated main/sub optimization"));
+
+        // Since search v3 no in-range step is refused at plan time: fine
+        // steps whose arrival windows exceed the candidate caps run as a
+        // coarsened scan plus a full-resolution refinement in the core, so
+        // even 0.01 ms across a 40 Hz candidate's 25 ms window saves a plan.
+        let fine_step = |crossover_hz: Vec<f64>, delay_step_ms: f64| LiveSubwooferSearchRequest {
+            crossover_hz,
+            measured_main_delay_ms: 0.0,
+            measured_polarity_degrees: 0,
+            fixed_sub_level_db: 0.0,
+            delay_minimum_ms: -10.0,
+            delay_maximum_ms: 25.0,
+            delay_step_ms,
+            mode: LiveSubwooferSearchMode::MeasuredStates,
+            sub_measured_low_pass_hz: None,
+            main_high_pass_slope: None,
+            sub_low_pass_slope: None,
+        };
+        state
+            .configure_subwoofer_search(fine_step(vec![40.0, 80.0], 0.03))
+            .unwrap();
+        state
+            .configure_subwoofer_search(fine_step(vec![110.0, 120.0], 0.01))
+            .unwrap();
+        state
+            .configure_subwoofer_search(fine_step(
+                vec![40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 100.0, 110.0, 120.0],
+                0.01,
+            ))
+            .unwrap();
     }
 
     #[test]
@@ -3828,6 +4383,10 @@ mod tests {
                 delay_minimum_ms: 0.0,
                 delay_maximum_ms: 4.0,
                 delay_step_ms: 1.0,
+                mode: LiveSubwooferSearchMode::MeasuredStates,
+                sub_measured_low_pass_hz: None,
+                main_high_pass_slope: None,
+                sub_low_pass_slope: None,
             })
             .unwrap();
         let (_, _, sweep, calibration, evidence, _) = state
@@ -3927,16 +4486,372 @@ mod tests {
         }
 
         let result = state.optimize_subwoofer_paths().unwrap();
-        // Adaptive arrival-centered windows: (5 + 4) * 2 = 18 candidates.
-        assert_eq!(result.synthesized_candidate_count, 18);
+        // One anchor arrival (~2 ms from the lowest path) centres both
+        // windows; each clips to [0, 4] -> five 1 ms steps: (5 + 5) * 2 = 20.
+        assert_eq!(result.synthesized_candidate_count, 20);
+        assert_eq!(result.mode, LiveSubwooferSearchMode::MeasuredStates);
+        assert_eq!(
+            result.algorithm_version,
+            SEPARATED_PATH_OPTIMIZATION_VERSION
+        );
         assert_eq!(result.best.crossover_hz, 80.0);
         assert_eq!(result.best.main_delay_ms, 2.0);
         assert_eq!(result.best.polarity_degrees, 180);
         assert!(result.needs_combined_confirmation);
         assert_eq!(result.arrival_estimates.len(), 2);
         assert!((result.arrival_estimates[0].center_ms - 2.0).abs() <= 0.1);
+        assert!(
+            (result.arrival_estimates[1].center_ms - result.arrival_estimates[0].center_ms).abs()
+                < 1.0e-9
+        );
         assert!(result.arrival_estimates[1].range_limited);
         assert!(Path::new(&result.report_path).is_file());
+    }
+
+    #[test]
+    fn live_wide_band_adapter_synthesizes_states_and_gates_the_recommendation() {
+        let temporary = tempdir().unwrap();
+        let state = LiveMeasurementState::default();
+        state
+            .start_session_with_mode(temporary.path(), LiveSystemMode::SingleSub21)
+            .unwrap();
+        state
+            .import_calibration("umik.txt", "10 0\n24000 0\n")
+            .unwrap();
+        let fixture_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../assets/sweeps");
+        state
+            .import_sweep(
+                LiveChannel::Left,
+                &fs::read(fixture_root.join("Sweep_L_20-20k_refR.wav")).unwrap(),
+            )
+            .unwrap();
+        state
+            .import_sweep(
+                LiveChannel::Right,
+                &fs::read(fixture_root.join("Sweep_R_20-20k_refR.wav")).unwrap(),
+            )
+            .unwrap();
+        // The wide-band mode needs its slope models declared up front.
+        let missing_slopes = state
+            .configure_subwoofer_search(LiveSubwooferSearchRequest {
+                crossover_hz: vec![60.0, 90.0],
+                measured_main_delay_ms: 0.0,
+                measured_polarity_degrees: 0,
+                fixed_sub_level_db: 0.0,
+                delay_minimum_ms: -10.0,
+                delay_maximum_ms: 25.0,
+                delay_step_ms: 0.5,
+                mode: LiveSubwooferSearchMode::WideBand,
+                sub_measured_low_pass_hz: Some(250.0),
+                main_high_pass_slope: None,
+                sub_low_pass_slope: None,
+            })
+            .unwrap_err();
+        assert!(missing_slopes.contains("slope"), "{missing_slopes}");
+        let candidate_above_dial = state
+            .configure_subwoofer_search(LiveSubwooferSearchRequest {
+                crossover_hz: vec![60.0, 180.0],
+                measured_main_delay_ms: 0.0,
+                measured_polarity_degrees: 0,
+                fixed_sub_level_db: 0.0,
+                delay_minimum_ms: -10.0,
+                delay_maximum_ms: 25.0,
+                delay_step_ms: 0.5,
+                mode: LiveSubwooferSearchMode::WideBand,
+                sub_measured_low_pass_hz: Some(150.0),
+                main_high_pass_slope: Some(LiveCrossoverSlopeModel::Lr4),
+                sub_low_pass_slope: Some(LiveCrossoverSlopeModel::Lr4),
+            })
+            .unwrap_err();
+        assert!(
+            candidate_above_dial.contains("at or below"),
+            "{candidate_above_dial}"
+        );
+        let plan = state
+            .configure_subwoofer_search(LiveSubwooferSearchRequest {
+                crossover_hz: vec![60.0, 90.0],
+                measured_main_delay_ms: 0.0,
+                measured_polarity_degrees: 0,
+                fixed_sub_level_db: 0.0,
+                delay_minimum_ms: -10.0,
+                delay_maximum_ms: 25.0,
+                delay_step_ms: 0.5,
+                mode: LiveSubwooferSearchMode::WideBand,
+                sub_measured_low_pass_hz: Some(250.0),
+                main_high_pass_slope: Some(LiveCrossoverSlopeModel::Lr4),
+                sub_low_pass_slope: Some(LiveCrossoverSlopeModel::Lr4),
+            })
+            .unwrap();
+        assert_eq!(plan.mode, LiveSubwooferSearchMode::WideBand);
+        assert_eq!(plan.candidates.len(), 2);
+        assert_eq!(plan.sub_sweep_channel, LiveChannel::Left);
+
+        // Wide mode rejects the measured-mode candidate vocabulary and the
+        // wrong role ids; the two fixed roles are the only valid targets.
+        let wrong_id = state
+            .begin_capture(
+                LiveCaptureKind::SubMainOnly,
+                LiveChannel::Left,
+                "XO01",
+                "synthetic::input",
+                0,
+            )
+            .unwrap_err();
+        assert!(
+            wrong_id.contains("wide-band search captures `FULL`"),
+            "{wrong_id}"
+        );
+        let wrong_sub_id = state
+            .begin_capture(
+                LiveCaptureKind::SubOnly,
+                LiveChannel::Left,
+                "XO01",
+                "synthetic::input",
+                0,
+            )
+            .unwrap_err();
+        assert!(
+            wrong_sub_id.contains("wide-band search captures `WIDE`"),
+            "{wrong_sub_id}"
+        );
+        // The role ids cannot cross kinds either: `FULL` is not a sub-only
+        // vocabulary entry at all.
+        let crossed_role = state
+            .begin_capture(
+                LiveCaptureKind::SubOnly,
+                LiveChannel::Left,
+                WIDE_BAND_MAIN_POSITION_ID,
+                "synthetic::input",
+                0,
+            )
+            .unwrap_err();
+        assert!(
+            crossed_role.contains("unsupported sub_only"),
+            "{crossed_role}"
+        );
+
+        let (_, _, sweep, calibration, evidence, _) = state
+            .begin_capture(
+                LiveCaptureKind::SubMainOnly,
+                LiveChannel::Left,
+                WIDE_BAND_MAIN_POSITION_ID,
+                "synthetic::input",
+                0,
+            )
+            .unwrap();
+        let samples: Vec<f32> =
+            sparse_room_response(&marker_wrapped_capture_samples(&sweep, 48_000, 0.5));
+        let capture = capture_from_samples(samples, true);
+        analyze_and_store_capture(
+            &state,
+            LiveCaptureKind::SubMainOnly,
+            LiveChannel::Left,
+            WIDE_BAND_MAIN_POSITION_ID.to_string(),
+            &sweep,
+            &calibration,
+            &evidence,
+            &capture,
+        )
+        .unwrap();
+        state.finish_capture();
+
+        // LR4 low-pass at `corner_hz`, evaluated analytically: the wide sub
+        // capture reaches the analyzer through the 250 Hz dial, and the
+        // planted truth below must survive its replacement by each candidate
+        // filter.
+        let lr4_low_pass = |corner_hz: f64, frequency_hz: f64| -> (f64, f64) {
+            let wn = frequency_hz / corner_hz;
+            let denominator = (1.0 - wn * wn, std::f64::consts::SQRT_2 * wn);
+            let magnitude_squared = denominator.0 * denominator.0 + denominator.1 * denominator.1;
+            let section = (
+                denominator.0 / magnitude_squared,
+                -denominator.1 / magnitude_squared,
+            );
+            (
+                section.0 * section.0 - section.1 * section.1,
+                2.0 * section.0 * section.1,
+            )
+        };
+        // Planted truth: mains roll off naturally below 70 Hz (so the 60 Hz
+        // candidate leaves a hole and 90 Hz must win), the sub is flat to
+        // 150 Hz, 4 ms late, and wired inverted.
+        let full_range_main = || {
+            let frequencies_hz = (20..=500).map(f64::from).collect::<Vec<_>>();
+            eqforbeginner_dsp_core::analysis::FrequencyResponse {
+                sample_rate_hz: PROJECT_SAMPLE_RATE_HZ,
+                fft_size: 96_000,
+                magnitude_db: frequencies_hz
+                    .iter()
+                    .map(|f| -24.0 * (70.0 / f).log2().max(0.0))
+                    .collect(),
+                phase_rad: vec![0.0; frequencies_hz.len()],
+                frequencies_hz,
+            }
+        };
+        let wide_sub = || {
+            let frequencies_hz = (20..=500).map(f64::from).collect::<Vec<_>>();
+            let magnitude_db = frequencies_hz
+                .iter()
+                .map(|f| {
+                    let (real, imaginary) = lr4_low_pass(250.0, *f);
+                    -24.0 * (f / 150.0).log2().max(0.0)
+                        + 20.0 * real.hypot(imaginary).max(1.0e-15).log10()
+                })
+                .collect::<Vec<_>>();
+            let phase_rad = frequencies_hz
+                .iter()
+                .map(|f| {
+                    let (real, imaginary) = lr4_low_pass(250.0, *f);
+                    -TAU * f * 4.0 / 1_000.0 + TAU / 2.0 + imaginary.atan2(real)
+                })
+                .collect::<Vec<_>>();
+            eqforbeginner_dsp_core::analysis::FrequencyResponse {
+                sample_rate_hz: PROJECT_SAMPLE_RATE_HZ,
+                fft_size: 96_000,
+                magnitude_db,
+                phase_rad,
+                frequencies_hz,
+            }
+        };
+        {
+            let mut guard = state.session.lock().unwrap();
+            let session = guard.as_mut().unwrap();
+            let base = session
+                .measurements
+                .get(&(
+                    LiveCaptureKind::SubMainOnly,
+                    WIDE_BAND_MAIN_POSITION_ID.to_string(),
+                    LiveChannel::Left,
+                ))
+                .unwrap()
+                .clone();
+            for (kind, position_id, channel, response) in [
+                (
+                    LiveCaptureKind::SubMainOnly,
+                    WIDE_BAND_MAIN_POSITION_ID,
+                    LiveChannel::Left,
+                    full_range_main(),
+                ),
+                (
+                    LiveCaptureKind::SubMainOnly,
+                    WIDE_BAND_MAIN_POSITION_ID,
+                    LiveChannel::Right,
+                    full_range_main(),
+                ),
+                (
+                    LiveCaptureKind::SubOnly,
+                    WIDE_BAND_SUB_POSITION_ID,
+                    plan.sub_sweep_channel,
+                    wide_sub(),
+                ),
+            ] {
+                let mut stored = base.clone();
+                stored.summary.kind = kind;
+                stored.summary.channel = channel;
+                stored.summary.position_id = position_id.to_string();
+                stored.summary.frequency_bin_count = response.frequencies_hz.len();
+                stored.frequencies_hz = response.frequencies_hz.clone();
+                stored.magnitude_db = response.magnitude_db.clone();
+                stored.calibrated_frequency_response = response;
+                stored.evidence.generation = session.evidence_generation;
+                stored.evidence.subwoofer_search = Some(plan.clone());
+                stored.evidence.sweep_sha256 = session.sweeps[&channel].summary.sha256.clone();
+                session
+                    .measurements
+                    .insert((kind, position_id.to_string(), channel), stored);
+            }
+        }
+
+        let result = state.optimize_subwoofer_paths().unwrap();
+        assert_eq!(result.mode, LiveSubwooferSearchMode::WideBand);
+        assert_eq!(
+            result.algorithm_version,
+            WIDE_BAND_CROSSOVER_SYNTHESIS_VERSION
+        );
+        assert_eq!(result.sub_measured_low_pass_hz, Some(250.0));
+        assert_eq!(
+            result.main_high_pass_slope,
+            Some(LiveCrossoverSlopeModel::Lr4)
+        );
+        assert_eq!(result.best.crossover_hz, 90.0);
+        assert!(
+            (result.best.main_delay_ms - 4.0).abs() <= 0.5,
+            "{}",
+            result.best.main_delay_ms
+        );
+        assert_eq!(result.best.polarity_degrees, 180);
+        // The deployment trim ships with every ranked entry; the planted sub
+        // and mains sit at the same level, so it stays within the ~+2 dB the
+        // [fc/2, fc] matching band picks up from the candidate low-pass's own
+        // edge (a crossover-independent convention offset, identical for
+        // every candidate). The advisory echoes the winner's value.
+        assert!(
+            result.best.sub_trim_db.abs() < 3.5,
+            "{}",
+            result.best.sub_trim_db
+        );
+        assert_eq!(
+            result.sub_level_advisory.as_ref().unwrap().best_gain_db,
+            result.best.sub_trim_db
+        );
+        assert!(result
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("level-matched into the mains'")));
+        assert!(result.needs_combined_confirmation);
+        assert!(result
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("synthesized from a filter model")));
+        assert!(!result
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("no crossover transfer function")));
+        assert!(Path::new(&result.report_path).is_file());
+
+        // The hardware confirmation still demands the exact recommendation.
+        let wrong_setup = state
+            .record_subwoofer_setup(LiveSubwooferSetupRequest {
+                crossover_hz: result.best.crossover_hz,
+                main_delay_ms: result.best.main_delay_ms + 1.0,
+                polarity_degrees: result.best.polarity_degrees,
+                sub_level_db: 0.0,
+                confirmed_on_hardware: true,
+            })
+            .unwrap_err();
+        assert!(
+            wrong_setup.contains("apply the measured-path recommendation exactly"),
+            "{wrong_setup}"
+        );
+        // A stale sub level (the measured one, without the recommended trim)
+        // is not "the recommendation": the gate must demand the trimmed
+        // level, allowing dial granularity only.
+        let stale_level = state
+            .record_subwoofer_setup(LiveSubwooferSetupRequest {
+                crossover_hz: result.best.crossover_hz,
+                main_delay_ms: result.best.main_delay_ms,
+                polarity_degrees: result.best.polarity_degrees,
+                sub_level_db: result.fixed_sub_level_db,
+                confirmed_on_hardware: true,
+            })
+            .unwrap_err();
+        assert!(
+            stale_level.contains("apply the measured-path recommendation exactly"),
+            "{stale_level}"
+        );
+        // The UI prefills measured level + trim rounded to 0.1 dB; the gate's
+        // 0.5 dB entry tolerance accepts it (and a real dial's granularity).
+        let entered_level_db =
+            ((result.fixed_sub_level_db + result.best.sub_trim_db) * 10.0).round() / 10.0;
+        state
+            .record_subwoofer_setup(LiveSubwooferSetupRequest {
+                crossover_hz: result.best.crossover_hz,
+                main_delay_ms: result.best.main_delay_ms,
+                polarity_degrees: result.best.polarity_degrees,
+                sub_level_db: entered_level_db,
+                confirmed_on_hardware: true,
+            })
+            .unwrap();
     }
 
     #[test]
@@ -8393,14 +9308,32 @@ impl LiveMeasurementState {
             let search = session.subwoofer_search.as_ref().ok_or_else(|| {
                 "save a separated-path crossover search plan before capturing".to_string()
             })?;
-            if !search
-                .candidates
-                .iter()
-                .any(|candidate| candidate.id == position_id)
-            {
-                return Err(format!(
-                    "crossover candidate `{position_id}` is not in the current search plan"
-                ));
+            match search.mode {
+                LiveSubwooferSearchMode::MeasuredStates => {
+                    if !search
+                        .candidates
+                        .iter()
+                        .any(|candidate| candidate.id == position_id)
+                    {
+                        return Err(format!(
+                            "crossover candidate `{position_id}` is not in the current search plan"
+                        ));
+                    }
+                }
+                LiveSubwooferSearchMode::WideBand => {
+                    let expected = match kind {
+                        LiveCaptureKind::SubMainOnly => WIDE_BAND_MAIN_POSITION_ID,
+                        LiveCaptureKind::SubOnly => WIDE_BAND_SUB_POSITION_ID,
+                        _ => unreachable!("separated-path capture kinds checked above"),
+                    };
+                    if position_id != expected {
+                        return Err(format!(
+                            "the wide-band search captures `{expected}` for {} sweeps, not \
+                             `{position_id}`",
+                            kind.as_str()
+                        ));
+                    }
+                }
             }
             if kind == LiveCaptureKind::SubOnly && channel != search.sub_sweep_channel {
                 return Err(format!(
@@ -9441,6 +10374,7 @@ const LEAKAGE_BAND_MINIMUM_SNR_DB: f64 = 20.0;
 
 /// One rejection-worthy finding from an isolated capture, split by whether the
 /// evidence is measurable above the room's noise.
+#[derive(Debug)]
 enum IsolatedLeakageFinding {
     /// The flagged band is well above the ambient noise floor: the other path
     /// was live. Hard rejection.
@@ -9449,7 +10383,19 @@ enum IsolatedLeakageFinding {
     /// leakage cannot be judged either way. Recorded as a diagnostic on an
     /// otherwise accepted capture.
     NoiseLimited(String),
+    /// A non-rejecting plausibility observation (wide-band mode): recorded as
+    /// a diagnostic on an accepted capture, never a rejection, because the
+    /// spectral shape it flags also has innocent physical explanations.
+    Diagnostic(String),
 }
+
+/// Wide-band mode: a full-range main whose 40-100 Hz mean sits this far below
+/// its own 200-500 Hz anchor probably reached the microphone through a
+/// bass-management high-pass the user forgot to turn off (LR4 at 250 Hz
+/// leaves that band 35 dB down or more). Small speakers roll off early for
+/// innocent physical reasons - a compact ported satellite can approach this
+/// figure - so the finding is a diagnostic, not a rejection.
+const FULL_RANGE_MAIN_MISSING_LOW_BAND_DB: f64 = 30.0;
 
 /// Sweep-span band power against pre-sweep band power for one arbitrary band,
 /// mirroring `octave_band_snr_db`'s span conventions.
@@ -9507,11 +10453,50 @@ fn isolated_path_leakage_issue(
     ) {
         return None;
     }
-    let crossover_hz = search?
-        .candidates
-        .iter()
-        .find(|candidate| candidate.id == position_id)?
-        .crossover_hz;
+    let search = search?;
+    let crossover_hz = match search.mode {
+        LiveSubwooferSearchMode::MeasuredStates => {
+            search
+                .candidates
+                .iter()
+                .find(|candidate| candidate.id == position_id)?
+                .crossover_hz
+        }
+        LiveSubwooferSearchMode::WideBand => match kind {
+            // The wide sub capture is judged against the dial setting it was
+            // made at. With the dial at 250 Hz the checked band (2.2x =
+            // 550 Hz) exceeds the 500 Hz analysis cap and the check honestly
+            // skips via the band mean below - the protocol's mains muting is
+            // the remaining guard - and a declared hardware bypass has no
+            // corner to judge against at all.
+            LiveCaptureKind::SubOnly => {
+                if position_id != WIDE_BAND_SUB_POSITION_ID {
+                    return None;
+                }
+                search.sub_measured_low_pass_hz?
+            }
+            // A full-range main legitimately produces deep bass, so the
+            // sub-band leakage test cannot apply (and the sub output being
+            // off means no signal reaches the sub to leak). Detect the
+            // opposite mistake instead - bass management left on, so the
+            // mains reached the microphone already high-passed.
+            LiveCaptureKind::SubMainOnly => {
+                if position_id != WIDE_BAND_MAIN_POSITION_ID {
+                    return None;
+                }
+                let anchor_db = band_mean_level_db(response, 200.0, 500.0)?;
+                let low_band_db = band_mean_level_db(response, 40.0, 100.0)?;
+                let deficit_db = anchor_db - low_band_db;
+                if deficit_db > FULL_RANGE_MAIN_MISSING_LOW_BAND_DB {
+                    return Some(IsolatedLeakageFinding::Diagnostic(format!(
+                        "main_full_range_low_band_missing:{deficit_db:.1}dB"
+                    )));
+                }
+                return None;
+            }
+            _ => return None,
+        },
+    };
     let (excess_db, checked_low_hz, checked_high_hz, label) = match kind {
         LiveCaptureKind::SubOnly => {
             let passband = band_mean_level_db(response, 0.5 * crossover_hz, 0.9 * crossover_hz)?;
@@ -9639,8 +10624,23 @@ fn marker_capture_rms_dbfs(
 /// that. A missing value means the capture predates marker-level recording
 /// and must be retaken (2026-07-29 expert review, finding 1).
 const MAXIMUM_ISOLATED_MARKER_LEVEL_DEVIATION_DB: f64 = 0.3;
+/// Wide-band mode compares captures across a bass-management toggle: the wide
+/// sub capture plays its markers through the reference speaker with the
+/// high-pass at the wide dial engaged, which attenuates the >=650 Hz marker
+/// band by up to ~0.2 dB (LR4 at 250 Hz), while the full-range main captures
+/// play them unfiltered. The allowance grows by that bounded filter effect so
+/// an honest one-volume session is not rejected; a real volume change still
+/// trips it.
+const MAXIMUM_WIDE_BAND_MARKER_LEVEL_DEVIATION_DB: f64 = 0.5;
 
 fn validate_isolated_marker_levels(levels: &[(String, Option<f64>)]) -> Result<(), String> {
+    validate_isolated_marker_levels_within(levels, MAXIMUM_ISOLATED_MARKER_LEVEL_DEVIATION_DB)
+}
+
+fn validate_isolated_marker_levels_within(
+    levels: &[(String, Option<f64>)],
+    allowed_deviation_db: f64,
+) -> Result<(), String> {
     let mut values = Vec::with_capacity(levels.len());
     for (label, level) in levels {
         match level {
@@ -9659,10 +10659,10 @@ fn validate_isolated_marker_levels(levels: &[(String, Option<f64>)]) -> Result<(
     let median = sorted[sorted.len() / 2];
     for ((label, _), value) in levels.iter().zip(&values) {
         let deviation = (value - median).abs();
-        if deviation > MAXIMUM_ISOLATED_MARKER_LEVEL_DEVIATION_DB {
+        if deviation > allowed_deviation_db {
             return Err(format!(
                 "{label} was captured {deviation:.2} dB away from the session's median \
-                 marker level (allowed {MAXIMUM_ISOLATED_MARKER_LEVEL_DEVIATION_DB:.1} dB); \
+                 marker level (allowed {allowed_deviation_db:.1} dB); \
                  the playback or capture volume changed between isolated captures, which \
                  breaks the crossover comparison. Fix the volume and recapture the \
                  isolated paths"
@@ -9794,16 +10794,24 @@ struct CachedSubwooferCandidate {
     crossover_hz: f64,
 }
 
+/// The capture-relevant subset of a snapshot's search plan. The delay search
+/// range/step and the wide-band slope models are deliberately absent: they
+/// are pure search/synthesis parameters that cannot have influenced a
+/// capture, so compatibility never reads them (unknown JSON fields are
+/// simply ignored on deserialize).
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CachedSubwooferSearch {
+    /// Snapshots from before the wide-band mode existed carry no mode field;
+    /// the default marks them as the measured-states plans they were.
+    #[serde(default)]
+    mode: LiveSubwooferSearchMode,
     candidates: Vec<CachedSubwooferCandidate>,
     measured_main_delay_ms: f64,
     measured_polarity_degrees: u16,
     fixed_sub_level_db: f64,
-    delay_minimum_ms: f64,
-    delay_maximum_ms: f64,
-    delay_step_ms: f64,
+    #[serde(default)]
+    sub_measured_low_pass_hz: Option<f64>,
     fixed_timing_reference_channel: ReferenceChannel,
     sub_sweep_channel: LiveChannel,
 }
@@ -9908,29 +10916,59 @@ fn cached_subwoofer_setup_matches(
     }
 }
 
+/// An isolated capture is reusable when everything that could physically
+/// have influenced it matches. Pure search/synthesis parameters - the
+/// candidate list in wide-band mode, the delay search range/step, and the
+/// wide-band slope models - are deliberately ignored: re-running the
+/// optimizer with different parameters over the same physical captures is
+/// exactly what the cache exists for.
 fn cached_subwoofer_search_matches(
     cached: Option<&CachedSubwooferSearch>,
     current: Option<&LiveSubwooferSearchSummary>,
+    capture_kind: LiveCaptureKind,
+    position_id: &str,
 ) -> bool {
     match (cached, current) {
         (None, None) => true,
         (Some(cached), Some(current)) => {
-            cached.candidates.len() == current.candidates.len()
-                && cached
-                    .candidates
-                    .iter()
-                    .zip(&current.candidates)
-                    .all(|(cached, current)| {
-                        cached.id == current.id && cached.crossover_hz == current.crossover_hz
-                    })
-                && cached.measured_main_delay_ms == current.measured_main_delay_ms
-                && cached.measured_polarity_degrees == current.measured_polarity_degrees
-                && cached.fixed_sub_level_db == current.fixed_sub_level_db
-                && cached.delay_minimum_ms == current.delay_minimum_ms
-                && cached.delay_maximum_ms == current.delay_maximum_ms
-                && cached.delay_step_ms == current.delay_step_ms
-                && cached.fixed_timing_reference_channel == current.fixed_timing_reference_channel
-                && cached.sub_sweep_channel == current.sub_sweep_channel
+            // The hardware state held during every isolated capture, and the
+            // marker/sweep routing, always gate.
+            if cached.mode != current.mode
+                || cached.measured_main_delay_ms != current.measured_main_delay_ms
+                || cached.measured_polarity_degrees != current.measured_polarity_degrees
+                || cached.fixed_sub_level_db != current.fixed_sub_level_db
+                || cached.fixed_timing_reference_channel != current.fixed_timing_reference_channel
+                || cached.sub_sweep_channel != current.sub_sweep_channel
+            {
+                return false;
+            }
+            match cached.mode {
+                // Only the wide sub capture passed through the dialed
+                // bass-management low-pass; the full-range mains were made
+                // with the sub output off, so the dial cannot have shaped
+                // them.
+                LiveSubwooferSearchMode::WideBand => {
+                    capture_kind != LiveCaptureKind::SubOnly
+                        || cached.sub_measured_low_pass_hz == current.sub_measured_low_pass_hz
+                }
+                // A measured-mode capture was made at one physically
+                // configured crossover; it stays valid exactly when the
+                // current plan's same-id candidate declares that same
+                // frequency.
+                LiveSubwooferSearchMode::MeasuredStates => {
+                    let cached_crossover = cached
+                        .candidates
+                        .iter()
+                        .find(|candidate| candidate.id == position_id)
+                        .map(|candidate| candidate.crossover_hz);
+                    let current_crossover = current
+                        .candidates
+                        .iter()
+                        .find(|candidate| candidate.id == position_id)
+                        .map(|candidate| candidate.crossover_hz);
+                    cached_crossover.is_some() && cached_crossover == current_crossover
+                }
+            }
         }
         (None, Some(_)) | (Some(_), None) => false,
     }
@@ -9963,17 +11001,25 @@ fn cached_snapshot_matches_session(
     };
     if cached.calibration_sha256 != calibration.summary.sha256
         || cached.sweep_sha256 != sweep.summary.sha256
-        || !cached_subwoofer_search_matches(
-            cached.subwoofer_search.as_ref(),
-            session.subwoofer_search.as_ref(),
-        )
     {
         return false;
     }
     match cached.capture_kind {
         LiveCaptureKind::SubMainOnly | LiveCaptureKind::SubOnly => {
-            session.system_mode == LiveSystemMode::SingleSub21 && session.subwoofer_search.is_some()
+            session.system_mode == LiveSystemMode::SingleSub21
+                && session.subwoofer_search.is_some()
+                && cached_subwoofer_search_matches(
+                    cached.subwoofer_search.as_ref(),
+                    session.subwoofer_search.as_ref(),
+                    cached.capture_kind,
+                    &cached.position_id,
+                )
         }
+        // A baseline's physical state is the confirmed hardware setup plus
+        // the calibration/sweeps/microphone checked above; the search plan's
+        // candidate list and search parameters cannot influence it, so a
+        // plan edited after the baselines were captured does not invalidate
+        // them - the setup comparison is the physical gate.
         LiveCaptureKind::Baseline => cached_subwoofer_setup_matches(
             cached.subwoofer_setup.as_ref(),
             session.subwoofer_setup.as_ref(),
@@ -10582,7 +11628,9 @@ pub fn analyze_and_store_capture(
         deconvolution_detection.estimated_sweep_end_sample_exclusive,
     ) {
         Some(IsolatedLeakageFinding::Leakage(code)) => issue_codes.push(code),
-        Some(IsolatedLeakageFinding::NoiseLimited(code)) => extra_diagnostic_codes.push(code),
+        Some(
+            IsolatedLeakageFinding::NoiseLimited(code) | IsolatedLeakageFinding::Diagnostic(code),
+        ) => extra_diagnostic_codes.push(code),
         None => {}
     }
     if !level_assessment.acceptable_for_measurement {

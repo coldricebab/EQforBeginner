@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  bandMedianDb,
   buildPath,
   geometricFrequencies,
   linearY,
@@ -38,6 +39,21 @@ describe("chart geometry", () => {
     );
     expect(path).toMatch(/^M50\.00,/);
     expect(path.match(/[ML]/g)).toHaveLength(2);
+  });
+
+  it("takes the band median only from finite in-band samples", () => {
+    const frequencies = [20, 100, 200, 300, 400, 500, 1_000];
+    const levels = [99, 99, 4, 2, 6, 8, -99];
+    // In-band values are 4, 2, 6, 8 -> median 5.
+    expect(bandMedianDb(frequencies, levels, 200, 500)).toBe(5);
+    // Odd count picks the middle sample.
+    expect(bandMedianDb(frequencies, levels, 200, 400)).toBe(4);
+    // A non-finite sample is skipped rather than poisoning the median.
+    expect(
+      bandMedianDb([200, 300, 400], [2, Number.NaN, 6], 200, 500),
+    ).toBe(4);
+    // An empty band reports no reference instead of guessing one.
+    expect(bandMedianDb(frequencies, levels, 600, 900)).toBeNull();
   });
 
   it("keeps deterministic synthetic traces finite", () => {

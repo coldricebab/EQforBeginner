@@ -55,6 +55,58 @@ describe("MeasuredFrequencyResponseChart", () => {
     expect(html).not.toContain("합성 예시");
   });
 
+  it("keeps the zoomed view at 500 Hz when the algorithm corrects the full band", () => {
+    // SECS reports 20 kHz as its correction range, which used to make the
+    // zoomed view identical to the full-band one. The 500 Hz gridline must
+    // land on the plot's right edge (x = 906) in the default zoomed view.
+    const secsPlot: LiveFrequencyResponsePlot = {
+      ...measuredPlotFixture,
+      correctionHighHz: 20_000,
+      taperEndHz: 20_000,
+    };
+    const html = renderToStaticMarkup(
+      <MeasuredFrequencyResponseChart copy={messages.ko.chart} data={secsPlot} />,
+    );
+
+    expect(html).toContain('class="grid-line" x1="906" x2="906"');
+    expect(html).not.toContain(">20k<");
+  });
+
+  it("aligns the displayed curve levels and reports the applied offsets", () => {
+    // A mixed-phase filter attenuates broadly: predicted and verified sit
+    // 6 dB below raw here. The traces are lifted onto the raw level for
+    // shape comparison and the offset is stated under the chart.
+    const attenuated: LiveFrequencyResponsePlot = {
+      ...measuredPlotFixture,
+      predictedLeftDb: shifted(3.5 - 6),
+      predictedRightDb: shifted(3.5 - 6),
+      predictedAverageDb: shifted(3.5 - 6),
+      verifiedLeftDb: shifted(3.5 - 6),
+      verifiedRightDb: shifted(3.5 - 6),
+      verifiedAverageDb: shifted(3.5 - 6),
+    };
+    const html = renderToStaticMarkup(
+      <MeasuredFrequencyResponseChart
+        copy={messages.ko.chart}
+        data={attenuated}
+      />,
+    );
+
+    expect(html).toContain("표시 레벨 정렬(200–500 Hz 중앙값 기준");
+    expect(html).toContain("Predicted +6.0 dB");
+    expect(html).toContain("Verified +6.0 dB");
+    // Raw is the reference, so it is never moved and never listed.
+    expect(html).not.toContain("Raw +");
+    // The aligned predicted trace now coincides with raw: same path data.
+    const paths = [
+      ...html.matchAll(
+        /class="response-line trace--(raw|predicted) channel--spatial" d="([^"]+)"/g,
+      ),
+    ];
+    expect(paths).toHaveLength(2);
+    expect(paths[0][2]).toBe(paths[1][2]);
+  });
+
   it("hides the verified toggle and trace on a predicted-only plot", () => {
     const predictedOnly: LiveFrequencyResponsePlot = {
       ...measuredPlotFixture,

@@ -6,9 +6,14 @@ Implemented algorithm identifiers:
   spatially gated boost capped at +3 dB.
 - `phase3-single-sub-ranking-v2`: deterministic ranking of measured manual
   single-subwoofer settings.
-- `phase3-separated-path-delay-polarity-search-v2`: bounded complex synthesis of
+- `phase3-separated-path-delay-polarity-search-v4`: bounded complex synthesis of
   main-delay and 0/180-degree polarity alternatives across physically measured
-  crossover states.
+  crossover states, scored with each candidate's sub level-matched to the mains
+  (the reported deployment trim).
+- `phase3-wide-band-crossover-synthesis-v1`: virtual crossover states synthesized
+  from one wide-band sub capture and full-range main captures using declared
+  LR4/LR2/BW2 slope models, with the measurement-state low-pass replaced rather
+  than stacked; feeds the same delay/polarity optimizer.
 - `phase4-response-replay-v2`: deterministic 48 kHz minimum-phase design and
   predicted-only validation from a measured combined-response baseline.
 - `phase6-native-six-rate-v2`: independent native-grid synthesis at all six target
@@ -433,7 +438,8 @@ This anchor check never changes response values or the ranking inputs.
 
 ### Live separated-path delay and polarity search
 
-`phase3-separated-path-delay-polarity-search-v2` reuses the ranking objective above.
+`phase3-separated-path-delay-polarity-search-v4` scores with its own level-neutral
+splice objective (below), not the measured-candidate envelope objective above.
 Its input is not one generic main/sub measurement plus an assumed crossover model.
 For every declared crossover `x`, the user physically configures the hardware and
 measures complex P0 responses `M_x,L(f)`, `M_x,R(f)`, and mono `U_x(f)`. Therefore the
@@ -450,13 +456,83 @@ U'_x(f; p)     = U_x(f) exp(j pi I[p != p_0])
 C_x,c(f)       = M'_x,c(f; tau) + U'_x(f; p)
 ```
 
-The bounded delay grid must lie within -20 to 50 ms, use a 0.01–5 ms step, contain at
-most 1,001 values, and divide its range exactly. Total
-`crossover_count * delay_count * 2` candidates are capped at 10,000. Synthesis retains
-positive bins from `max(20 Hz, 0.4 min(x))` through 500 Hz; the reused Phase 3 scorer
-then selects its common `[0.5 min(x), 2 max(x)]` comparison band.
+The bounded delay range must lie within -20 to 50 ms with a 0.01–5 ms step. The grid
+is not the full range: each crossover searches one half-period window centred on its
+measured sub arrival, clipped to the range and snapped to absolute step multiples.
+Each window holds at most 1,001 values and the complete search at most 10,000
+candidates. When the requested step is too fine for those caps (a 0.01 ms step across
+a 40 Hz candidate's 25 ms window would need 2,501 values), the search runs in two stages
+instead of refusing: stage one scans every window at the smallest integer multiple of
+the step that fits the caps, and stage two re-ranks at the full requested resolution
+within one coarse step either side of each crossover's stage-one optimum. Both stages
+contain only hardware-step multiples, each fine window contains its own coarse
+winner, and the score's variation scale over delay (about one period of the highest
+scored frequency, >= ~2 ms) is hundreds of times any coarse step chosen here, so the
+coarse scan cannot skip the optimum's basin. A configuration the caps admit directly
+produces the identical single-stage v2 grid. Synthesis retains
+positive bins from `max(20 Hz, 0.4 min(x))` through 500 Hz and the scorer judges the
+common `[0.5 min(x), 2 max(x)]` band.
 
-Sub level is fixed and no candidate receives automatic level alignment. The one
+One arrival anchors every delay window, estimated by band-limited complex
+cross-correlation on the lowest-crossover path over 20 Hz to twice its crossover.
+The true sub-minus-main offset is a property of the drivers and placement, not the
+crossover dial, and only the lowest path's correlation is alias-free inside the
++/-20 ms scan: a band centred on `f` repeats every ~`1/f`, so a high-crossover
+path's own estimate can lock a full bass cycle away (observed as 12-15 ms
+recommendations on real data whose true offset was about -1 ms). A plan whose
+lowest candidate sits above 55 Hz carries a warning that the anchor itself is
+ambiguous.
+
+Before the window search, each path's sub is level-matched into the mains
+(new in v4): the smoothed weighted-median of `|U_x|` over the
+crossover-adjacent octave `[x/2, x]` is shifted onto the mains' own raw
+200-500 Hz anchor (mean of both channels), and this per-candidate trim `g_x` -
+the calibration a user performs after choosing that crossover - is applied to
+`U_x` before arrival estimation, synthesis, and scoring, clamped to +/-24 dB
+with a warning. The trim is part of the recommendation (reported with every
+ranked entry and echoed by the sub-level advisory), never a free search
+dimension, and it is what makes the objective below level-neutral end to end:
+a pure gain change on the captured sub cancels out of `g_x` exactly, so the
+ranking is invariant to the captured sub level. Scoring at capture level
+instead let a sub captured ~10 dB hotter than the mains clear the anchor
+everywhere it played - its own dips hidden behind the surplus while the mains'
+room holes between the crossover and the midband were charged in full - so the
+anchor term silently rewarded handing the widest band to the loudest branch
+and the recommendation tracked the top of whatever candidate list was offered
+(110 of 40-120, 100 of 40-100, 90 of 40-90 on the same real session). A path
+that cannot be matched (no 200-500 Hz mains coverage, or too few bins in
+`[x/2, x]`) keeps its captured level with a warning, matching the scorer's own
+anchor fallback.
+
+Because every candidate derives from the same captures, the measured-candidate
+envelope objective is replaced by a per-candidate splice objective on
+gate-smoothed curves:
+
+```text
+deficit_x,c(f) = max(0, max(smooth(max(|M'_x,c|, |U'_x|))(f), A_x,c) - smooth(|C_x,c|)(f))
+```
+
+The first reference term is the pointwise-louder branch, smoothed after the max: an
+aligned sum is never below the louder branch bin by bin, so this term charges
+destructive interference exactly where the branches overlap and cannot be masked by
+turning either branch up (the v2 cross-candidate envelope let a sub running hotter
+than the mains hand the win to whichever candidate gave it the widest band - the
+highest crossover in every list, confirmed on real data). The second term `A` is the
+candidate's own raw 200-500 Hz median: a splice whose sum falls below the midband is
+a hole the cut-only EQ cannot legally fill. The anchor comparison is meaningful
+because the sub enters it at deployment level (the `g_x` trim above). Excess above
+the anchor is deliberately uncharged (cuts remove it and headroom is charged at
+export). Group-delay smoothness is computed and reported but not
+scored: an LR crossover's own group-delay bump scales as `1/fc`, so a
+millisecond-unit smoothness term structurally favors high crossovers and can even
+prefer an accidentally-smoother misaligned delay. The score is the weighted deficit
+RMS + 0.20 p95 + 0.05 worst, plus `0.02 dB/ms * |tau - tau_arrival|` (regularizing
+toward the measured arrival, which is the physically privileged delay - never toward
+zero) and `0.1 dB/octave * log2(x / 40 Hz)` (a documented localization tie-break far
+below any real splice defect, so it only decides between equivalent splices).
+
+Beyond the reported deployment trim `g_x`, no candidate receives any level
+alignment, and the trim itself is never varied to improve a score. The one
 sub-only response is reused for both L and R, so symmetric bass-management routing is
 an explicit limitation. All captures must use the same uploaded sweep hashes,
 calibration, microphone device/channel, gain state, P0 position, and fixed acoustic
@@ -468,6 +544,48 @@ The report always sets `needs_confirmation=true`. Its first-ranked setting is a
 complex-sum prediction, not measured L+sub/R+sub evidence. The user must apply it to
 the hardware and take the next combined P0 captures before the correction workflow
 continues.
+
+### Wide-band single-capture crossover synthesis
+
+`phase3-wide-band-crossover-synthesis-v1` feeds the same optimizer from three captures
+instead of three per crossover. The sub is measured once through the bass-management
+low-pass dialed to its maximum `f_meas` (or genuinely bypassed), and both mains are
+measured once with the sub output off, which removes the speaker high-pass. For each
+candidate crossover `x` a virtual `SeparatedCrossoverPaths` state is synthesized:
+
+```text
+M'_x,c(f) = M_c(f) * HP_model(x, f)
+U'_x(f)   = U_meas(f) * LP_model(x, f) / LP_model(f_meas, f)    (dial at f_meas)
+U'_x(f)   = U_meas(f) * LP_model(x, f)                          (declared bypass)
+```
+
+The division *replaces* the measurement-state filter instead of stacking a second
+one: an LR4 low-pass at 250 Hz carries about 1.8 ms of low-frequency group delay that
+is absent at deployment, and leaving it in would bias the delay recommendation by
+about that much (52 degrees at an 80 Hz crossover). With the same alignment and
+`x <= f_meas` the replacement ratio `|LP(x)/LP(f_meas)| <= 1` at every frequency, so
+measurement noise is never amplified; candidates above the measured dial are rejected.
+The available alignment models are LR4 (squared 2nd-order Butterworth, branches in
+phase at the crossover), LR2 (two cascaded first-order sections, branches antiphase at
+the crossover), and 2nd-order Butterworth, selectable per branch because THX-style
+bass management pairs a 12 dB/oct satellite high-pass with a 24 dB/oct sub low-pass.
+
+This mode explicitly trades the measured-states mode's model-freedom for a
+three-sweep session and a dialable candidate list of any size up to twelve. The room,
+drivers, and placement remain measured complex data on the shared marker timeline;
+only the bass-management filters are modeled. The model dependence is honest and
+consequential: if the hardware's true slopes differ from the declared ones -
+especially 12 versus 24 dB/oct, which flips the relative branch phase at the
+crossover - the delay and polarity recommendation can be wrong, and the report
+carries that warning instead of the measured-mode "no crossover transfer function was
+synthesized" line. Marker-timeline algebra keeps cross-state combination exact: each
+capture's markers absorb that state's processing latency, so the sub-minus-main
+arrival assembled from the two hardware states equals the deployed one. The
+cross-capture marker-level gate widens from 0.3 to 0.5 dB because the wide dial's
+high-pass attenuates the reference speaker's >=650 Hz marker band by a bounded
+~0.2 dB on the sub capture only. The recommendation stays predicted-only; the
+mandatory combined L+sub/R+sub captures that follow are the first measurement of the
+hardware's real filters at the chosen crossover.
 
 ### Separated main/sub consistency diagnostic
 

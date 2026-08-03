@@ -16,10 +16,13 @@ import {
   acceptedPairCount,
   captureKey,
   classifyLiveCaptureIssues,
+  expectedSubTripletCount,
   formatMetric,
   hasAcceptedP0,
   liveWizardStages,
   parseCrossoverCandidates,
+  WIDE_BAND_MAIN_POSITION_ID,
+  WIDE_BAND_SUB_POSITION_ID,
   type CalibrationImportSummary,
   type LiveCaptureProgress,
   type LiveCaptureKind,
@@ -36,6 +39,8 @@ import {
   type LiveMeasurementCacheRestoreSummary,
   type LiveReferenceChannel,
   type LiveSessionSummary,
+  type LiveCrossoverSlopeModel,
+  type LiveSubwooferSearchMode,
   type LiveSubwooferSetupRequest,
   type LiveSubwooferSetupSummary,
   type LiveSubwooferSearchRequest,
@@ -113,6 +118,18 @@ export const SUBWOOFER_DELAY_DEFAULTS = {
   stepMs: "0.1",
 } as const;
 
+/**
+ * Defaults for the wide-band search mode. The candidate list spans the
+ * practical bass-management range in the 10 Hz steps consumer amplifiers
+ * offer (every value must remain dialable); the 250 Hz dial matches the
+ * WiiM-class maximum; LR4 is the dominant consumer bass-management slope.
+ */
+export const WIDE_BAND_SEARCH_DEFAULTS = {
+  crossoverCandidates: "40, 50, 60, 70, 80, 90, 100, 110, 120",
+  subMeasuredLowPassHz: "250",
+  slope: "lr4",
+} as const;
+
 export function LiveMeasurementPanel({
   copy,
   chartCopy,
@@ -140,8 +157,21 @@ export function LiveMeasurementPanel({
     useState<LiveSubwooferSearchSummary | null>(null);
   const [subwooferOptimization, setSubwooferOptimization] =
     useState<LiveSubwooferOptimizationSummary | null>(null);
+  const [searchMode, setSearchMode] =
+    useState<LiveSubwooferSearchMode>("wide_band");
   const [crossoverCandidates, setCrossoverCandidates] =
     useState("70, 80, 90");
+  const [wideCrossoverCandidates, setWideCrossoverCandidates] = useState<string>(
+    WIDE_BAND_SEARCH_DEFAULTS.crossoverCandidates,
+  );
+  const [subMeasuredLowPassHz, setSubMeasuredLowPassHz] = useState<string>(
+    WIDE_BAND_SEARCH_DEFAULTS.subMeasuredLowPassHz,
+  );
+  const [subLowPassBypassed, setSubLowPassBypassed] = useState(false);
+  const [mainHighPassSlope, setMainHighPassSlope] =
+    useState<LiveCrossoverSlopeModel>(WIDE_BAND_SEARCH_DEFAULTS.slope);
+  const [subLowPassSlope, setSubLowPassSlope] =
+    useState<LiveCrossoverSlopeModel>(WIDE_BAND_SEARCH_DEFAULTS.slope);
   const [measuredMainDelayMs, setMeasuredMainDelayMs] = useState("0");
   const [measuredPolarityDegrees, setMeasuredPolarityDegrees] =
     useState<"0" | "180">("0");
@@ -180,9 +210,10 @@ export function LiveMeasurementPanel({
   // On: the SECS design overlays the target curve chosen in the main target
   // selector. Off: the SECS-native flat adaptive target.
   const [secsFollowTarget, setSecsFollowTarget] = useState(true);
-  // Explicit opt-in to export a SECS package without the closed loop; the
-  // result is labeled predicted-only everywhere.
-  const [secsSkipVerification, setSecsSkipVerification] = useState(false);
+  // Default-on for the SECS path, whose closed loop is impractical for most
+  // sessions; the export stays labeled predicted-only everywhere (file name,
+  // README, project record) and running the verification is one click away.
+  const [secsSkipVerification, setSecsSkipVerification] = useState(true);
   const [secsDesign, setSecsDesign] = useState<LiveSecsDesignSummary | null>(
     null,
   );
@@ -205,9 +236,24 @@ export function LiveMeasurementPanel({
   const baselineP0Ready = hasAcceptedP0(captures, "baseline");
   const verificationP0Ready = hasAcceptedP0(captures, "verification");
   const filesReady = calibration !== null && Boolean(sweeps.left && sweeps.right);
-  const parsedCrossovers = parseCrossoverCandidates(crossoverCandidates);
+  const parsedCrossovers = parseCrossoverCandidates(
+    searchMode === "wide_band" ? wideCrossoverCandidates : crossoverCandidates,
+  );
+  const wideFieldsValid =
+    searchMode !== "wide_band" ||
+    (subLowPassBypassed
+      ? true
+      : subMeasuredLowPassHz.trim() !== "" &&
+        Number.isFinite(Number(subMeasuredLowPassHz)) &&
+        Number(subMeasuredLowPassHz) >= 120 &&
+        Number(subMeasuredLowPassHz) <= 500 &&
+        (parsedCrossovers === null ||
+          parsedCrossovers.every(
+            (crossover) => crossover <= Number(subMeasuredLowPassHz),
+          )));
   const subwooferSearchFieldsValid =
     parsedCrossovers !== null &&
+    wideFieldsValid &&
     [
       measuredMainDelayMs,
       fixedSubLevelDb,
@@ -228,6 +274,7 @@ export function LiveMeasurementPanel({
     captures,
     subwooferSearch,
   );
+  const expectedSubTriplets = expectedSubTripletCount(subwooferSearch);
   const subwooferFieldsValid =
     crossoverHz.trim() !== "" &&
     mainDelayMs.trim() !== "" &&
@@ -345,7 +392,13 @@ export function LiveMeasurementPanel({
       setSubwooferSetup(null);
       setSubwooferSearch(null);
       setSubwooferOptimization(null);
+      setSearchMode("wide_band");
       setCrossoverCandidates("70, 80, 90");
+      setWideCrossoverCandidates(WIDE_BAND_SEARCH_DEFAULTS.crossoverCandidates);
+      setSubMeasuredLowPassHz(WIDE_BAND_SEARCH_DEFAULTS.subMeasuredLowPassHz);
+      setSubLowPassBypassed(false);
+      setMainHighPassSlope(WIDE_BAND_SEARCH_DEFAULTS.slope);
+      setSubLowPassSlope(WIDE_BAND_SEARCH_DEFAULTS.slope);
       setMeasuredMainDelayMs("0");
       setMeasuredPolarityDegrees("0");
       setFixedSubLevelDb("0");
@@ -427,6 +480,13 @@ export function LiveMeasurementPanel({
       delayMinimumMs: Number(delayMinimumMs),
       delayMaximumMs: Number(delayMaximumMs),
       delayStepMs: Number(delayStepMs),
+      mode: searchMode,
+      subMeasuredLowPassHz:
+        searchMode === "wide_band" && !subLowPassBypassed
+          ? Number(subMeasuredLowPassHz)
+          : null,
+      mainHighPassSlope: searchMode === "wide_band" ? mainHighPassSlope : null,
+      subLowPassSlope: searchMode === "wide_band" ? subLowPassSlope : null,
     };
     setBusy("sub_search");
     setError("");
@@ -454,7 +514,7 @@ export function LiveMeasurementPanel({
   const optimizeSubwooferPaths = async () => {
     if (
       !subwooferSearch ||
-      completedSubTriplets !== subwooferSearch.candidates.length ||
+      completedSubTriplets !== expectedSubTriplets ||
       busy !== null
     ) return;
     setBusy("sub_optimize");
@@ -467,7 +527,9 @@ export function LiveMeasurementPanel({
       setCrossoverHz(result.best.crossoverHz.toString());
       setMainDelayMs(result.best.mainDelayMs.toString());
       setPolarityDegrees(result.best.polarityDegrees.toString() as "0" | "180");
-      setSubLevelDb(result.fixedSubLevelDb.toString());
+      // The recommendation includes the deployment sub trim the winner was
+      // scored at, so the setup form starts from measured level + trim.
+      setSubLevelDb((result.fixedSubLevelDb + result.best.subTrimDb).toFixed(1));
       setHardwareConfirmed(false);
       setSubwooferSetup(null);
       setDesign(null);
@@ -1159,20 +1221,128 @@ export function LiveMeasurementPanel({
             <p>{copy.subwooferSearch.body}</p>
           </div>
           <label className="live-sub-search-crossovers">
+            <span>{copy.subwooferSearch.modeLabel}</span>
+            <select
+              value={searchMode}
+              disabled={busy !== null}
+              onChange={(event) => {
+                setSearchMode(
+                  event.currentTarget.value as LiveSubwooferSearchMode,
+                );
+                invalidateSubwooferSearch();
+              }}
+            >
+              <option value="wide_band">
+                {copy.subwooferSearch.modeWideBand}
+              </option>
+              <option value="measured_states">
+                {copy.subwooferSearch.modeMeasuredStates}
+              </option>
+            </select>
+            <small>
+              {searchMode === "wide_band"
+                ? copy.subwooferSearch.modeWideBandHint
+                : copy.subwooferSearch.modeMeasuredStatesHint}
+            </small>
+          </label>
+          <label className="live-sub-search-crossovers">
             <span>{copy.subwooferSearch.crossoverCandidates}</span>
             <input
               type="text"
               inputMode="decimal"
-              value={crossoverCandidates}
+              value={
+                searchMode === "wide_band"
+                  ? wideCrossoverCandidates
+                  : crossoverCandidates
+              }
               disabled={busy !== null}
               aria-invalid={parsedCrossovers === null}
               onChange={(event) => {
-                setCrossoverCandidates(event.currentTarget.value);
+                if (searchMode === "wide_band") {
+                  setWideCrossoverCandidates(event.currentTarget.value);
+                } else {
+                  setCrossoverCandidates(event.currentTarget.value);
+                }
                 invalidateSubwooferSearch();
               }}
             />
             <small>{copy.subwooferSearch.crossoverCandidatesHint}</small>
           </label>
+          {searchMode === "wide_band" && (
+            <>
+              <div className="live-subwoofer-fields">
+                <label>
+                  <span>{copy.subwooferSearch.wideDial}</span>
+                  <input
+                    type="number"
+                    min="120"
+                    max="500"
+                    step="1"
+                    inputMode="decimal"
+                    value={subMeasuredLowPassHz}
+                    disabled={busy !== null || subLowPassBypassed}
+                    aria-invalid={!wideFieldsValid}
+                    onChange={(event) => {
+                      setSubMeasuredLowPassHz(event.currentTarget.value);
+                      invalidateSubwooferSearch();
+                    }}
+                  />
+                  <small>{copy.subwooferSearch.wideDialHint}</small>
+                </label>
+                <label>
+                  <span>{copy.subwooferSearch.mainHighPassSlopeLabel}</span>
+                  <select
+                    value={mainHighPassSlope}
+                    disabled={busy !== null}
+                    onChange={(event) => {
+                      setMainHighPassSlope(
+                        event.currentTarget.value as LiveCrossoverSlopeModel,
+                      );
+                      invalidateSubwooferSearch();
+                    }}
+                  >
+                    {(["lr4", "lr2", "bw2"] as const).map((slope) => (
+                      <option key={slope} value={slope}>
+                        {copy.subwooferSearch.slopeLabels[slope]}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  <span>{copy.subwooferSearch.subLowPassSlopeLabel}</span>
+                  <select
+                    value={subLowPassSlope}
+                    disabled={busy !== null}
+                    onChange={(event) => {
+                      setSubLowPassSlope(
+                        event.currentTarget.value as LiveCrossoverSlopeModel,
+                      );
+                      invalidateSubwooferSearch();
+                    }}
+                  >
+                    {(["lr4", "lr2", "bw2"] as const).map((slope) => (
+                      <option key={slope} value={slope}>
+                        {copy.subwooferSearch.slopeLabels[slope]}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+              <label className="live-declaration">
+                <input
+                  type="checkbox"
+                  checked={subLowPassBypassed}
+                  disabled={busy !== null}
+                  onChange={(event) => {
+                    setSubLowPassBypassed(event.currentTarget.checked);
+                    invalidateSubwooferSearch();
+                  }}
+                />
+                <span>{copy.subwooferSearch.wideDialBypassed}</span>
+              </label>
+              <p className="live-warning">{copy.subwooferSearch.wideModelNote}</p>
+            </>
+          )}
           <div className="live-sub-search-section__heading">
             <strong>{copy.subwooferSearch.measuredSettings}</strong>
             <p>{copy.subwooferSearch.measuredSettingsHint}</p>
@@ -1342,11 +1512,22 @@ export function LiveMeasurementPanel({
             />
             <div className="live-sub-search-section">
               <div className="live-sub-search-section__heading">
-                <strong>{copy.subwooferSearch.measurementsTitle}</strong>
-                <p>{copy.subwooferSearch.measurementsBody}</p>
+                <strong>
+                  {subwooferSearch.mode === "wide_band"
+                    ? copy.subwooferSearch.wideMeasurementsTitle
+                    : copy.subwooferSearch.measurementsTitle}
+                </strong>
+                <p>
+                  {subwooferSearch.mode === "wide_band"
+                    ? copy.subwooferSearch.wideMeasurementsBody
+                    : copy.subwooferSearch.measurementsBody}
+                </p>
               </div>
               <ul className="live-sub-safety">
-                {copy.subwooferSearch.safetyChecklist.map((item) => (
+                {(subwooferSearch.mode === "wide_band"
+                  ? copy.subwooferSearch.wideSafetyChecklist
+                  : copy.subwooferSearch.safetyChecklist
+                ).map((item) => (
                   <li key={item}>{item}</li>
                 ))}
               </ul>
@@ -1364,7 +1545,67 @@ export function LiveMeasurementPanel({
                   )}
               </p>
               <div className="live-sub-candidate-list">
-                {subwooferSearch.candidates.map((candidate) => (
+                {subwooferSearch.mode === "wide_band" ? (
+                  <article className="live-sub-candidate">
+                    <header>
+                      <strong>
+                        {copy.subwooferSearch.wideCaptureTitle.replace(
+                          "{dial}",
+                          subwooferSearch.subMeasuredLowPassHz === null
+                            ? copy.subwooferSearch.wideDialBypassedShort
+                            : `${subwooferSearch.subMeasuredLowPassHz.toFixed(0)} Hz`,
+                        )}
+                      </strong>
+                      <span>
+                        {WIDE_BAND_MAIN_POSITION_ID}·{WIDE_BAND_SUB_POSITION_ID}
+                      </span>
+                    </header>
+                    <div className="live-sub-candidate__captures">
+                      {[
+                        {
+                          kind: "sub_main_only" as const,
+                          positionId: WIDE_BAND_MAIN_POSITION_ID,
+                          channel: "left" as const,
+                          label: copy.subwooferSearch.wideMainLeft,
+                        },
+                        {
+                          kind: "sub_main_only" as const,
+                          positionId: WIDE_BAND_MAIN_POSITION_ID,
+                          channel: "right" as const,
+                          label: copy.subwooferSearch.wideMainRight,
+                        },
+                        {
+                          kind: "sub_only" as const,
+                          positionId: WIDE_BAND_SUB_POSITION_ID,
+                          channel: subwooferSearch.subSweepChannel,
+                          label: copy.subwooferSearch.wideSub,
+                        },
+                      ].map(({ kind, positionId, channel, label }) => {
+                        const key = captureKey(kind, positionId, channel);
+                        return (
+                          <CaptureCell
+                            key={key}
+                            copy={copy}
+                            label={label}
+                            summary={captures[key]}
+                            busy={busy === `capture:${key}`}
+                            disabled={
+                              !filesReady ||
+                              !inputDeviceId ||
+                              inputChannelIndex === null ||
+                              (busy !== null && busy !== `capture:${key}`)
+                            }
+                            onCapture={() =>
+                              void capture(kind, positionId, channel)
+                            }
+                            onCancel={() => void cancelCapture()}
+                          />
+                        );
+                      })}
+                    </div>
+                  </article>
+                ) : (
+                  subwooferSearch.candidates.map((candidate) => (
                   <article className="live-sub-candidate" key={candidate.id}>
                     <header>
                       <strong>
@@ -1416,21 +1657,19 @@ export function LiveMeasurementPanel({
                       })}
                     </div>
                   </article>
-                ))}
+                  ))
+                )}
               </div>
               <p className="live-stage__footnote">
                 {copy.subwooferSearch.tripletProgress
                   .replace("{complete}", completedSubTriplets.toString())
-                  .replace(
-                    "{total}",
-                    subwooferSearch.candidates.length.toString(),
-                  )}
+                  .replace("{total}", expectedSubTriplets.toString())}
               </p>
               <button
                 className="button button--primary"
                 type="button"
                 disabled={
-                  completedSubTriplets !== subwooferSearch.candidates.length ||
+                  completedSubTriplets !== expectedSubTriplets ||
                   busy !== null
                 }
                 onClick={() => void optimizeSubwooferPaths()}
@@ -1453,7 +1692,17 @@ export function LiveMeasurementPanel({
               <div><dt>{copy.crossoverHz}</dt><dd>{subwooferOptimization.best.crossoverHz.toFixed(1)} Hz</dd></div>
               <div><dt>{copy.mainDelayMs}</dt><dd>{subwooferOptimization.best.mainDelayMs.toFixed(3)} ms</dd></div>
               <div><dt>{copy.polarityDegrees}</dt><dd>{subwooferOptimization.best.polarityDegrees}°</dd></div>
-              <div><dt>{copy.subLevelDb}</dt><dd>{subwooferOptimization.fixedSubLevelDb.toFixed(1)} dB</dd></div>
+              <div>
+                <dt>{copy.subwooferSearch.subTrim}</dt>
+                <dd>
+                  {subwooferOptimization.fixedSubLevelDb.toFixed(1)} dB
+                  {" → "}
+                  {(subwooferOptimization.fixedSubLevelDb + subwooferOptimization.best.subTrimDb).toFixed(1)} dB
+                  {" ("}
+                  {subwooferOptimization.best.subTrimDb >= 0 ? "+" : ""}
+                  {subwooferOptimization.best.subTrimDb.toFixed(1)} dB)
+                </dd>
+              </div>
               <div>
                 <dt>{copy.subwooferSearch.scoringBand}</dt>
                 <dd>{subwooferOptimization.scoringLowerHz.toFixed(1)}–{subwooferOptimization.scoringUpperHz.toFixed(1)} Hz</dd>
@@ -1462,7 +1711,44 @@ export function LiveMeasurementPanel({
                 <dt>{copy.subwooferSearch.candidateCount}</dt>
                 <dd>{subwooferOptimization.synthesizedCandidateCount}</dd>
               </div>
+              {subwooferOptimization.mode === "wide_band" && (
+                <div>
+                  <dt>{copy.subwooferSearch.modelUsed}</dt>
+                  <dd>
+                    {copy.subwooferSearch.wideModelSummary
+                      .replace(
+                        "{main}",
+                        copy.subwooferSearch.slopeLabels[
+                          subwooferOptimization.mainHighPassSlope ?? "lr4"
+                        ],
+                      )
+                      .replace(
+                        "{sub}",
+                        copy.subwooferSearch.slopeLabels[
+                          subwooferOptimization.subLowPassSlope ?? "lr4"
+                        ],
+                      )
+                      .replace(
+                        "{dial}",
+                        subwooferOptimization.subMeasuredLowPassHz === null
+                          ? copy.subwooferSearch.wideDialBypassedShort
+                          : `${subwooferOptimization.subMeasuredLowPassHz.toFixed(0)} Hz`,
+                      )}
+                  </dd>
+                </div>
+              )}
             </dl>
+            {subwooferOptimization.best.mainDelayMs < 0 && (
+              <p className="live-warning">
+                {copy.subwooferSearch.negativeDelayNote.replace(
+                  "{delay}",
+                  Math.abs(subwooferOptimization.best.mainDelayMs).toFixed(2),
+                )}
+              </p>
+            )}
+            {subwooferOptimization.mode === "wide_band" && (
+              <p className="live-warning">{copy.subwooferSearch.wideModelNote}</p>
+            )}
             {subwooferOptimization.subLevelAdvisory && (
               <p>
                 {copy.subwooferSearch.subLevelAdvisory
@@ -1486,6 +1772,7 @@ export function LiveMeasurementPanel({
                     <th>{copy.crossoverHz}</th>
                     <th>{copy.mainDelayMs}</th>
                     <th>{copy.polarityDegrees}</th>
+                    <th>{copy.subwooferSearch.subTrim}</th>
                     <th>{copy.subwooferSearch.score}</th>
                     <th>{copy.subwooferSearch.rmsDeficit}</th>
                     <th>{copy.subwooferSearch.p95Deficit}</th>
@@ -1499,6 +1786,7 @@ export function LiveMeasurementPanel({
                       <td>{ranking.crossoverHz.toFixed(1)} Hz</td>
                       <td>{ranking.mainDelayMs.toFixed(3)} ms</td>
                       <td>{ranking.polarityDegrees}°</td>
+                      <td>{ranking.subTrimDb >= 0 ? "+" : ""}{ranking.subTrimDb.toFixed(1)} dB</td>
                       <td>{ranking.totalScore.toFixed(3)}</td>
                       <td>{ranking.deficitRmsDb.toFixed(2)} dB</td>
                       <td>{ranking.deficitP95Db.toFixed(2)} dB</td>

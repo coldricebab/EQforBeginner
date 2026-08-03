@@ -182,6 +182,7 @@ export type Messages = {
     accessibleDescription: string;
     displaySmoothing: string;
     scopeNote: string;
+    levelAlignment: string;
   };
   wirelessSweep: {
     eyebrow: string;
@@ -306,8 +307,30 @@ export type Messages = {
     subwooferSearch: {
       title: string;
       body: string;
+      modeLabel: string;
+      modeWideBand: string;
+      modeMeasuredStates: string;
+      modeWideBandHint: string;
+      modeMeasuredStatesHint: string;
       crossoverCandidates: string;
       crossoverCandidatesHint: string;
+      wideDial: string;
+      wideDialHint: string;
+      wideDialBypassed: string;
+      wideDialBypassedShort: string;
+      mainHighPassSlopeLabel: string;
+      subLowPassSlopeLabel: string;
+      slopeLabels: { lr4: string; lr2: string; bw2: string };
+      wideModelNote: string;
+      wideMeasurementsTitle: string;
+      wideMeasurementsBody: string;
+      wideSafetyChecklist: string[];
+      wideCaptureTitle: string;
+      wideMainLeft: string;
+      wideMainRight: string;
+      wideSub: string;
+      modelUsed: string;
+      wideModelSummary: string;
       measuredSettings: string;
       measuredSettingsHint: string;
       delayMinimum: string;
@@ -340,6 +363,8 @@ export type Messages = {
       worstDeficit: string;
       scoringBand: string;
       candidateCount: string;
+      subTrim: string;
+      negativeDelayNote: string;
       subLevelAdvisory: string;
       reportPath: string;
       applyTitle: string;

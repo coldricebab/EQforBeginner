@@ -23,9 +23,67 @@ const GAUSSIAN_RADIUS_SIGMA: f64 = 3.0;
 /// Persisted with Phase 3 ranking reports so scoring changes remain auditable.
 pub const SUB_INTEGRATION_ALGORITHM_VERSION: &str = "phase3-single-sub-ranking-v2";
 /// Version for synthesizing delay/polarity candidates from measured isolated
-/// paths at each physically configured crossover.
+/// paths at each physically configured crossover. v4 adds one change on top
+/// of v3 (none of v3/v4 has shipped in a release):
+/// 4. Candidates are scored at deployment level, not capture level: each
+///    path's sub is first level-matched into the mains' own 200-500 Hz
+///    anchor over its crossover-adjacent octave [fc/2, fc] - the calibration
+///    a user performs after choosing that crossover - and the applied trim
+///    is part of the recommendation. Without this, the v3 anchor term was
+///    still level-sensitive: a sub captured ~10 dB hotter than the mains
+///    cleared the anchor everywhere it played (its own dips hidden by the
+///    surplus) while the mains' room holes were charged in full, so handing
+///    a wider band to the louder branch kept buying the ranking through the
+///    anchor door and the recommendation tracked the top of any candidate
+///    list (110 of 40-120, 100 of 40-100, 90 of 40-90 on real data). The
+///    trim makes the whole objective invariant to the captured sub level.
+///
+/// The v3 changes:
+/// 1. A step too fine for the per-window/total candidate caps - which v2
+///    rejected outright - runs in two stages (a coarsened scan of every
+///    window, then the full requested resolution around each crossover's
+///    best).
+/// 2. The objective is level-neutral. v2 charged each candidate its deficit
+///    below the loudest candidate at each frequency; because a higher
+///    crossover hands a wider band to the sub, any sub running hotter than
+///    the mains made the score a monotonic function of the crossover (the
+///    highest candidate always won, confirmed on real data). v3 scores each
+///    candidate only against its own physics - the smoothed pointwise-louder
+///    of its two branches (interference cannot be masked by turning either
+///    branch up) and its own midband anchor (a hole the cut-only EQ cannot
+///    legally fill). Excess level above the anchor is deliberately
+///    uncharged (cuts remove it, headroom is accounted at export, and the
+///    sub-level advisory reports the gain trim); group-delay smoothness is
+///    reported but not scored (an LR crossover's own group-delay bump
+///    scales as 1/fc and biased the comparison toward high crossovers); the
+///    delay regularizer references the measured arrival rather than zero;
+///    and a small documented per-octave regularizer prefers the lower
+///    crossover among equivalent splices (localization practice, far below
+///    any real splice defect).
+/// 3. One sub-minus-main arrival anchors every delay window, estimated from
+///    the lowest-crossover path over 20 Hz to twice its crossover. Only
+///    that path's correlation is alias-free inside the +/-20 ms scan
+///    (aliases space at ~1/band-centroid); a high-crossover path's own
+///    band estimate can lock a full bass cycle away, which centred the
+///    delay windows 12-15 ms off on real data. A plan whose lowest
+///    candidate sits above 55 Hz gets a warning that its anchor is
+///    ambiguous.
 pub const SEPARATED_PATH_OPTIMIZATION_VERSION: &str =
-    "phase3-separated-path-delay-polarity-search-v2";
+    "phase3-separated-path-delay-polarity-search-v4";
+/// Tie-breaking preference for lower crossovers, in score dB per octave above
+/// 40 Hz. This encodes textbook practice - a single subwoofer becomes
+/// localizable and collapses stereo bass as the handoff rises - not any
+/// measured room. It is far below a real splice defect (>= 0.5 dB), so it
+/// only decides between candidates whose measured integration is equivalent.
+pub const SEPARATED_PATH_CROSSOVER_REGULARIZATION_DB_PER_OCTAVE: f64 = 0.1;
+/// Hard bound on the per-candidate deployment sub trim. A capture needing
+/// more than this to level-match the sub into the mains' anchor indicates a
+/// gain-staging problem, not a calibration choice; the trim is clamped and
+/// the report says so instead of silently scoring an implausible deployment.
+pub const DEPLOYMENT_SUB_TRIM_LIMIT_DB: f64 = 24.0;
+/// Version for synthesizing per-crossover states from one wide-band sub
+/// capture and full-range main captures using a declared filter model.
+pub const WIDE_BAND_CROSSOVER_SYNTHESIS_VERSION: &str = "phase3-wide-band-crossover-synthesis-v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Polarity {
@@ -188,6 +246,65 @@ pub struct SeparatedCrossoverPaths {
     pub sub: CombinedResponse,
 }
 
+/// Analog-prototype crossover alignments a consumer bass-management stage
+/// commonly applies. These exist only for the wide-band synthesis path; the
+/// measured-states path never assumes any of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrossoverAlignment {
+    /// 24 dB/oct, squared 2nd-order Butterworth. High-pass and low-pass are
+    /// in phase at the crossover. The default in most consumer DSP bass
+    /// management (confirmed LR4 on the WiiM Amp Ultra sub-out/speaker pair).
+    LinkwitzRiley4,
+    /// 12 dB/oct, two cascaded first-order sections (Q=0.5). High-pass and
+    /// low-pass are 180 degrees apart at the crossover.
+    LinkwitzRiley2,
+    /// 12 dB/oct, 2nd-order Butterworth (Q=0.707), -3 dB at the corner.
+    /// Common as the satellite high-pass in THX-style bass management.
+    Butterworth2,
+}
+
+impl CrossoverAlignment {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LinkwitzRiley4 => "LR4 24 dB/oct",
+            Self::LinkwitzRiley2 => "LR2 12 dB/oct",
+            Self::Butterworth2 => "BW2 12 dB/oct",
+        }
+    }
+}
+
+/// The three wide-band isolated captures the synthesis mode starts from:
+/// both mains captured full range (bass management off, so no high-pass) and
+/// one sub captured with the bass-management low-pass dialed to its maximum
+/// (or bypassed where the hardware allows it).
+#[derive(Debug, Clone, PartialEq)]
+pub struct WideBandIsolatedPaths {
+    pub left_main: CombinedResponse,
+    pub right_main: CombinedResponse,
+    pub sub: CombinedResponse,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct WideBandSynthesisConfig {
+    /// Crossover candidates to synthesize, each a value the user can actually
+    /// dial into the hardware. Two to twelve strictly increasing values.
+    pub candidate_crossovers_hz: Vec<f64>,
+    /// The bass-management low-pass corner physically active while the sub
+    /// was captured (the dial at its maximum). `None` means the low-pass was
+    /// genuinely bypassed for the capture. When `Some`, the synthesis divides
+    /// this modeled filter out while multiplying the candidate filter in, so
+    /// the deployed state is modeled instead of a double-filtered one; with
+    /// the same alignment and a candidate at or below this corner the
+    /// replacement ratio never exceeds unity at any frequency, so measurement
+    /// noise is never amplified.
+    pub sub_measured_low_pass_hz: Option<f64>,
+    /// Model applied to the mains for each candidate (the speaker high-pass
+    /// bass management engages when a sub output is active).
+    pub main_high_pass: CrossoverAlignment,
+    /// Model applied to the sub for each candidate.
+    pub sub_low_pass: CrossoverAlignment,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SeparatedPathOptimizationConfig {
     /// Main delay and sub polarity physically active during every isolated
@@ -197,6 +314,16 @@ pub struct SeparatedPathOptimizationConfig {
     pub delay_minimum_ms: f64,
     pub delay_maximum_ms: f64,
     pub delay_step_ms: f64,
+    /// `None` when every `SeparatedCrossoverPaths` entry was physically
+    /// measured at its declared crossover (the model-free path). `Some`
+    /// carries a human-readable description of the filter model when the
+    /// entries were synthesized by `synthesize_wide_band_crossover_states`,
+    /// so the report warns about the model dependence instead of falsely
+    /// claiming no crossover transfer function was synthesized.
+    pub synthesized_crossover_model: Option<String>,
+    /// Score dB per octave above 40 Hz added to each candidate; see
+    /// `SEPARATED_PATH_CROSSOVER_REGULARIZATION_DB_PER_OCTAVE`.
+    pub crossover_regularization_db_per_octave: f64,
     pub ranking: RankingConfig,
 }
 
@@ -209,19 +336,25 @@ pub struct SeparatedPathOptimizationReport {
     /// Marker-timeline relative sub-minus-main arrival estimate per measured
     /// crossover, and the delay window the search actually used around it.
     pub arrival_estimates: Vec<CrossoverArrivalEstimate>,
-    /// Advisory only (2026-07-29 expert review, finding 11): with the winning
-    /// crossover/delay/polarity held fixed, how the deficit score would move
-    /// if the sub level changed by up to +/-6 dB. The main recommendation
-    /// never depends on it and the confirmation measurement still gates
-    /// everything.
+    /// The deployment sub-level change the winner was scored at, with the
+    /// deficit the same candidate would keep at the captured level for
+    /// contrast. Since v4 this is part of the recommendation (apply it with
+    /// the crossover/delay/polarity), not a free gain scan: the v3-era
+    /// +/-6 dB rescan rewarded raw level through the anchor door the trim
+    /// closes and pegged at its cap on hot-sub captures.
     pub sub_level_advisory: Option<SubLevelAdvisory>,
     pub ranking: SubIntegrationReport,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SubLevelAdvisory {
+    /// dB change to apply to the sub, relative to the level physically
+    /// active during the isolated captures (`fixed_sub_level_db` upstream).
     pub best_gain_db: f64,
+    /// The winner's scored deficit RMS (at the applied trim).
     pub deficit_rms_at_best_db: f64,
+    /// The same crossover/delay/polarity re-scored at the captured sub
+    /// level (trim 0).
     pub deficit_rms_at_zero_db: f64,
 }
 
@@ -549,6 +682,97 @@ pub fn rank_candidates(
     })
 }
 
+/// Deployment sub-level trim for every path, and the trimmed paths scoring
+/// runs on.
+///
+/// Each path's sub is shifted so that its smoothed weighted-median level over
+/// the crossover-adjacent octave [fc/2, fc] sits at the mains' own 200-500 Hz
+/// anchor (mean of both channels) - the level a user calibrates the sub to
+/// after choosing that crossover. Scoring at this level is what keeps the
+/// objective level-neutral end to end: at capture level, a sub running hotter
+/// than the mains clears the midband anchor everywhere it plays (its own dips
+/// hidden behind the surplus) while the mains' room holes are charged in
+/// full, so the anchor's hole-charging silently rewards handing the widest
+/// band to the loudest branch. The trim is a reported deployment setting, not
+/// a search dimension, and a pure gain change on the captured sub cancels out
+/// of it exactly, which makes the final ranking invariant to the captured sub
+/// level. When a path cannot be matched (mains without 200-500 Hz coverage,
+/// or a grid that cannot resolve [fc/2, fc]), its trim falls back to 0 dB
+/// with a warning, matching the scorer's own anchor fallback.
+fn deployment_trimmed_paths(
+    paths: &[SeparatedCrossoverPaths],
+    ranking: &RankingConfig,
+) -> DspResult<(Vec<SeparatedCrossoverPaths>, Vec<f64>, Vec<String>)> {
+    let mut trimmed = Vec::with_capacity(paths.len());
+    let mut trims_db = Vec::with_capacity(paths.len());
+    let mut warnings = Vec::new();
+    for path in paths {
+        let grid = &path.sub.frequencies_hz;
+        let anchors = [
+            response_anchor_db(&path.left_main.frequencies_hz, &path.left_main.magnitude_db)?,
+            response_anchor_db(
+                &path.right_main.frequencies_hz,
+                &path.right_main.magnitude_db,
+            )?,
+        ];
+        let band_indices: Vec<usize> = grid
+            .iter()
+            .enumerate()
+            .filter_map(|(index, frequency)| {
+                (*frequency >= 0.5 * path.crossover_hz && *frequency <= path.crossover_hz)
+                    .then_some(index)
+            })
+            .collect();
+        let trim_db = match (
+            anchors[0],
+            anchors[1],
+            band_indices.len() >= MIN_SCORING_BINS,
+        ) {
+            (Some(left_anchor), Some(right_anchor), true) => {
+                let band_frequencies: Vec<f64> =
+                    band_indices.iter().map(|&index| grid[index]).collect();
+                let weights = log_frequency_weights(&band_frequencies)?;
+                let smoothed = gaussian_log_smooth_at(
+                    grid,
+                    &path.sub.magnitude_db,
+                    &band_indices,
+                    ranking.magnitude_smoothing_octaves,
+                )?;
+                let sub_level_db = weighted_percentile(&smoothed, &weights, 0.5)?;
+                let raw_trim = 0.5 * (left_anchor + right_anchor) - sub_level_db;
+                if raw_trim.abs() > DEPLOYMENT_SUB_TRIM_LIMIT_DB {
+                    warnings.push(format!(
+                        "{}: level-matching the sub into the mains' anchor needs {raw_trim:+.1} dB; \
+                         the trim is clamped to {:+.1} dB - check the capture gain staging before \
+                         trusting these scores.",
+                        path.id,
+                        raw_trim.signum() * DEPLOYMENT_SUB_TRIM_LIMIT_DB,
+                    ));
+                }
+                raw_trim.clamp(-DEPLOYMENT_SUB_TRIM_LIMIT_DB, DEPLOYMENT_SUB_TRIM_LIMIT_DB)
+            }
+            _ => {
+                warnings.push(format!(
+                    "{}: the sub could not be level-matched (missing 200-500 Hz mains coverage or \
+                     too few bins in [{:.0}, {:.0}] Hz); its candidates are scored at the captured \
+                     sub level.",
+                    path.id,
+                    0.5 * path.crossover_hz,
+                    path.crossover_hz,
+                ));
+                0.0
+            }
+        };
+        let mut path = path.clone();
+        for value in &mut path.sub.magnitude_db {
+            *value += trim_db;
+        }
+        trims_db.push(trim_db);
+        trimmed.push(path);
+    }
+    Ok((trimmed, trims_db, warnings))
+}
+
 /// Search main-delay and 0/180-degree sub-polarity candidates across isolated
 /// paths measured at two or more real hardware crossover settings.
 ///
@@ -561,6 +785,14 @@ pub fn optimize_separated_paths(
     config: &SeparatedPathOptimizationConfig,
 ) -> DspResult<SeparatedPathOptimizationReport> {
     validate_separated_optimization(paths, config)?;
+    // Deployment level first: every downstream stage - arrival estimation,
+    // candidate synthesis, branch references, the anchor - sees the sub at
+    // the level the user will actually calibrate it to, and the applied trim
+    // ships with the recommendation.
+    let captured_paths = paths;
+    let (trimmed_paths, path_trims_db, trim_warnings) =
+        deployment_trimmed_paths(paths, &config.ranking)?;
+    let paths = &trimmed_paths[..];
 
     let minimum_crossover_hz = paths
         .iter()
@@ -587,99 +819,220 @@ pub fn optimize_separated_paths(
     // 0-5 ms grid cannot cover a DSP sub whose processing latency plus
     // placement offset exceeds it, and 5 ms is only 144 degrees at 80 Hz
     // (2026-07-29 expert review, finding 2).
+    // One arrival per channel for the whole search, taken from the
+    // lowest-crossover path. The true sub-minus-main offset is a property of
+    // the drivers and placement, not of the crossover dial, so every path
+    // shares it - but each path can only be measured over its own filtered
+    // overlap band, and a band centred on frequency f has correlation
+    // aliases spaced at roughly 1/f. For the lowest path that spacing
+    // (>= 20 ms at a 50 Hz candidate) falls outside the +/-20 ms scan, so
+    // its peak is the one unambiguous anchor; a high-crossover path's own
+    // estimate can lock a full bass cycle away (the real session recommended
+    // 12-15 ms - one period at its band centroid - while its 40 Hz path
+    // measured the true sub-early offset of about -1 ms). Precision beyond a
+    // couple of milliseconds is not required here: the center only places
+    // the half-period search window, and the splice scoring picks the exact
+    // delay inside it.
+    let anchor_path = paths
+        .iter()
+        .min_by(|left, right| left.crossover_hz.total_cmp(&right.crossover_hz))
+        .expect("validated: at least two paths");
+    let arrival_band_low_hz = 20.0;
+    let arrival_band_high_hz = (2.0 * anchor_path.crossover_hz).min(240.0);
+    let mut channel_arrivals_ms = [0.0_f64; 2];
+    for (channel_index, main) in [&anchor_path.left_main, &anchor_path.right_main]
+        .into_iter()
+        .enumerate()
+    {
+        let curve = arrival_correlation_curve(
+            common_grid,
+            main,
+            &anchor_path.sub,
+            arrival_band_low_hz,
+            arrival_band_high_hz,
+        )?;
+        let best_index = curve
+            .iter()
+            .enumerate()
+            .max_by(|left, right| left.1.total_cmp(right.1))
+            .map(|(index, _)| index)
+            .expect("scan grid is nonempty");
+        channel_arrivals_ms[channel_index] =
+            -ARRIVAL_SCAN_LIMIT_MS + best_index as f64 * ARRIVAL_SCAN_STEP_MS;
+    }
+    let center_ms = 0.5 * (channel_arrivals_ms[0] + channel_arrivals_ms[1]);
+    let left_right_spread_ms = (channel_arrivals_ms[0] - channel_arrivals_ms[1]).abs();
     let mut arrival_estimates = Vec::with_capacity(paths.len());
-    let mut path_grids = Vec::with_capacity(paths.len());
-    let mut candidate_count = 0_usize;
     for path in paths {
-        let left_arrival_ms = estimate_relative_arrival_ms(
-            common_grid,
-            &path.left_main,
-            &path.sub,
-            path.crossover_hz,
-        )?;
-        let right_arrival_ms = estimate_relative_arrival_ms(
-            common_grid,
-            &path.right_main,
-            &path.sub,
-            path.crossover_hz,
-        )?;
-        let center_ms = 0.5 * (left_arrival_ms + right_arrival_ms);
         let half_period_ms = 1_000.0 / (2.0 * path.crossover_hz);
         let window_low_ms = (center_ms - half_period_ms).max(config.delay_minimum_ms);
         let window_high_ms = (center_ms + half_period_ms).min(config.delay_maximum_ms);
         let range_limited = center_ms - half_period_ms < config.delay_minimum_ms - 1.0e-9
             || center_ms + half_period_ms > config.delay_maximum_ms + 1.0e-9;
-        let grid = snapped_delay_grid(window_low_ms, window_high_ms, config.delay_step_ms)?;
-        candidate_count = candidate_count
-            .checked_add(grid.len().checked_mul(2).ok_or_else(|| {
-                DspError::InvalidArgument("separated-path search size overflowed".into())
-            })?)
-            .ok_or_else(|| {
-                DspError::InvalidArgument("separated-path search size overflowed".into())
-            })?;
         arrival_estimates.push(CrossoverArrivalEstimate {
             id: path.id.clone(),
             crossover_hz: path.crossover_hz,
-            left_arrival_ms,
-            right_arrival_ms,
+            left_arrival_ms: channel_arrivals_ms[0],
+            right_arrival_ms: channel_arrivals_ms[1],
             center_ms,
-            left_right_spread_ms: (left_arrival_ms - right_arrival_ms).abs(),
+            left_right_spread_ms,
             window_low_ms,
             window_high_ms,
             range_limited,
         });
-        path_grids.push(grid);
-    }
-    if candidate_count > 10_000 {
-        return Err(DspError::InvalidArgument(
-            "separated-path search is limited to 10000 synthesized candidates".into(),
-        ));
     }
 
-    let mut candidates = Vec::with_capacity(candidate_count);
-    for (path, delays) in paths.iter().zip(&path_grids) {
-        for &delay_ms in delays {
-            for polarity in [Polarity::Normal, Polarity::Inverted] {
-                let left_combined = synthesize_isolated_sum(
-                    &path.left_main,
-                    &path.sub,
-                    &retained_indices,
-                    delay_ms - config.measured_main_delay_ms,
-                    polarity != config.measured_polarity,
-                )?;
-                let right_combined = synthesize_isolated_sum(
-                    &path.right_main,
-                    &path.sub,
-                    &retained_indices,
-                    delay_ms - config.measured_main_delay_ms,
-                    polarity != config.measured_polarity,
-                )?;
-                candidates.push(SubIntegrationCandidate {
-                    id: format!(
-                        "{}-delay-{delay_ms:+.3}-{}",
-                        path.id,
-                        match polarity {
-                            Polarity::Normal => "normal",
-                            Polarity::Inverted => "inverted",
-                        }
-                    ),
-                    settings: CandidateSettings {
-                        crossover_hz: path.crossover_hz,
-                        main_delay_ms: Some(delay_ms),
-                        sub_level_db: None,
-                        polarity: Some(polarity),
-                    },
-                    positions: vec![PositionObservation {
-                        id: "P0".into(),
-                        weight: 2.0,
-                        left_combined,
-                        right_combined,
-                    }],
-                });
+    // Stage-1 grid granularity: the smallest integer multiple of the hardware
+    // step whose windows respect both the 1,001-value per-window cap and the
+    // 10,000-candidate total. A multiplier of 1 reproduces the v2 grid
+    // exactly; a finer request (0.01 ms across a 25 ms window at a 40 Hz
+    // candidate needs 2,501 values) coarsens stage 1 and a refinement pass
+    // below restores the full requested resolution. Coarse multiples of the
+    // step remain values the user can dial. The score varies over delay on a
+    // scale of roughly one period of the highest scored frequency (>= ~2 ms
+    // at the 500 Hz band edge), hundreds of times any coarse step chosen
+    // here, so the coarse scan cannot skip past the optimum's basin.
+    let overflowed = || DspError::InvalidArgument("separated-path search size overflowed".into());
+    let maximum_span_ms = arrival_estimates
+        .iter()
+        .map(|estimate| estimate.window_high_ms - estimate.window_low_ms)
+        .fold(0.0_f64, f64::max);
+    let mut multiplier =
+        ((maximum_span_ms / (1_000.0 * config.delay_step_ms)).ceil() as usize).max(1);
+    let (path_grids, coarse_step_ms, mut candidate_count) = loop {
+        let coarse_step_ms = multiplier as f64 * config.delay_step_ms;
+        let mut grids = Vec::with_capacity(arrival_estimates.len());
+        let mut count = 0_usize;
+        let mut fits = true;
+        for estimate in &arrival_estimates {
+            // `snapped_delay_grid` fails above 1,001 values per window; that
+            // simply means this granularity is still too fine.
+            match snapped_delay_grid(
+                estimate.window_low_ms,
+                estimate.window_high_ms,
+                coarse_step_ms,
+            ) {
+                Ok(grid) => {
+                    count = count
+                        .checked_add(grid.len().checked_mul(2).ok_or_else(overflowed)?)
+                        .ok_or_else(overflowed)?;
+                    grids.push(grid);
+                }
+                Err(_) => {
+                    fits = false;
+                    break;
+                }
             }
         }
+        if fits && count <= 10_000 {
+            break (grids, coarse_step_ms, count);
+        }
+        multiplier = multiplier.checked_add(1).ok_or_else(overflowed)?;
+    };
+
+    let synthesize_grid_candidates =
+        |grids: &[Vec<f64>]| -> DspResult<Vec<SubIntegrationCandidate>> {
+            let mut candidates = Vec::new();
+            for ((path, delays), trim_db) in paths.iter().zip(grids).zip(&path_trims_db) {
+                for &delay_ms in delays {
+                    for polarity in [Polarity::Normal, Polarity::Inverted] {
+                        let left_combined = synthesize_isolated_sum(
+                            &path.left_main,
+                            &path.sub,
+                            &retained_indices,
+                            delay_ms - config.measured_main_delay_ms,
+                            polarity != config.measured_polarity,
+                        )?;
+                        let right_combined = synthesize_isolated_sum(
+                            &path.right_main,
+                            &path.sub,
+                            &retained_indices,
+                            delay_ms - config.measured_main_delay_ms,
+                            polarity != config.measured_polarity,
+                        )?;
+                        candidates.push(SubIntegrationCandidate {
+                            id: format!(
+                                "{}-delay-{delay_ms:+.3}-{}",
+                                path.id,
+                                match polarity {
+                                    Polarity::Normal => "normal",
+                                    Polarity::Inverted => "inverted",
+                                }
+                            ),
+                            settings: CandidateSettings {
+                                crossover_hz: path.crossover_hz,
+                                main_delay_ms: Some(delay_ms),
+                                // The deployment trim this candidate was
+                                // scored at - part of the recommendation.
+                                sub_level_db: Some(*trim_db),
+                                polarity: Some(polarity),
+                            },
+                            positions: vec![PositionObservation {
+                                id: "P0".into(),
+                                weight: 2.0,
+                                left_combined,
+                                right_combined,
+                            }],
+                        });
+                    }
+                }
+            }
+            Ok(candidates)
+        };
+    let mut ranking = rank_spliced_candidates(
+        paths,
+        common_grid,
+        &synthesize_grid_candidates(&path_grids)?,
+        center_ms,
+        config,
+    )?;
+
+    // Stage 2: when stage 1 had to coarsen, re-rank at the full requested
+    // resolution inside one coarse step either side of every crossover's
+    // stage-1 optimum (clipped to its arrival window). Each fine window
+    // contains its own coarse winner, so the final ranking can only match or
+    // improve on stage 1, and every candidate stays a hardware-step multiple.
+    if multiplier > 1 {
+        let mut fine_grids = Vec::with_capacity(paths.len());
+        for (path, estimate) in paths.iter().zip(&arrival_estimates) {
+            let best_delay_ms = ranking
+                .rankings
+                .iter()
+                .find(|candidate| candidate.settings.crossover_hz == path.crossover_hz)
+                .and_then(|candidate| candidate.settings.main_delay_ms)
+                .ok_or_else(|| {
+                    DspError::InvalidArgument("stage-one ranking lost a crossover candidate".into())
+                })?;
+            let refine_low_ms = (best_delay_ms - coarse_step_ms).max(estimate.window_low_ms);
+            let refine_high_ms = (best_delay_ms + coarse_step_ms).min(estimate.window_high_ms);
+            fine_grids.push(snapped_delay_grid(
+                refine_low_ms,
+                refine_high_ms,
+                config.delay_step_ms,
+            )?);
+        }
+        let fine_candidates = synthesize_grid_candidates(&fine_grids)?;
+        candidate_count = candidate_count
+            .checked_add(fine_candidates.len())
+            .ok_or_else(overflowed)?;
+        ranking = rank_spliced_candidates(paths, common_grid, &fine_candidates, center_ms, config)?;
+        ranking.warnings.push(format!(
+            "A {:.2} ms delay step over these arrival windows exceeds the candidate limits, so \
+             the search ran in two stages: a {coarse_step_ms:.2} ms scan of every window, then \
+             the full {:.2} ms resolution within +/-{coarse_step_ms:.2} ms of each crossover's \
+             best delay. Both stages contain only hardware-step multiples.",
+            config.delay_step_ms, config.delay_step_ms,
+        ));
     }
-    let mut ranking = rank_candidates(&candidates, &config.ranking)?;
+    if anchor_path.crossover_hz > 55.0 {
+        ranking.warnings.push(format!(
+            "The lowest crossover candidate ({:.0} Hz) anchors the delay window, and its \
+             correlation ambiguity spacing (~{:.0} ms) falls inside the scan range; include a \
+             candidate at or below 50 Hz so the arrival anchor cannot lock a bass cycle off.",
+            anchor_path.crossover_hz,
+            1_000.0 / anchor_path.crossover_hz,
+        ));
+    }
     for estimate in &arrival_estimates {
         if estimate.range_limited {
             ranking.warnings.push(format!(
@@ -721,10 +1074,18 @@ pub fn optimize_separated_paths(
             }
         }
     }
-    ranking.warnings.push(
-        "Crossover entries are separately measured hardware states; no crossover transfer function was synthesized."
-            .into(),
-    );
+    match &config.synthesized_crossover_model {
+        None => ranking.warnings.push(
+            "Crossover entries are separately measured hardware states; no crossover transfer function was synthesized."
+                .into(),
+        ),
+        Some(model) => ranking.warnings.push(format!(
+            "Crossover states were synthesized from a filter model ({model}), not measured per \
+             state; if the hardware's real slopes differ (especially 12 vs 24 dB/oct, which \
+             flips the relative phase at the crossover), the delay and polarity recommendation \
+             can be wrong. The measured combined confirmation remains the judge."
+        )),
+    }
     ranking.warnings.push(
         "The mono sub-only path is reused for L and R prediction; symmetric bass-management routing must be confirmed."
             .into(),
@@ -733,102 +1094,74 @@ pub fn optimize_separated_paths(
         "Every result is a complex-sum prediction and requires new measured L+sub/R+sub confirmation at the selected setting."
             .into(),
     );
-    // Sub-level advisory: purely free synthesis (a scalar on the measured
-    // complex sub path), scored on acoustic deficits only, never entering the
-    // recommendation itself.
-    let sub_level_advisory = ranking.rankings.first().and_then(|best| {
-        let path = paths
+    ranking.warnings.push(format!(
+        "Each candidate was scored with its sub level-matched into the mains' 200-500 Hz anchor \
+         (the calibration applied at deployment): {}. Apply the winning entry's sub-level change \
+         together with its crossover, delay, and polarity.",
+        paths
             .iter()
-            .find(|path| path.crossover_hz == best.settings.crossover_hz)?;
+            .zip(&path_trims_db)
+            .map(|(path, trim_db)| format!("{} {trim_db:+.1} dB", path.id))
+            .collect::<Vec<_>>()
+            .join(", "),
+    ));
+    ranking.warnings.extend(trim_warnings);
+    // Sub-level advisory: the deployment trim the winner was scored at, plus
+    // the deficit the same candidate keeps at the captured sub level, so the
+    // report shows what applying the level change is worth. Nothing rescans
+    // gain as a free dimension: the earlier +/-6 dB rescan rewarded raw
+    // level through the anchor door the trim closes, and pegged at its cap
+    // on hot-sub captures.
+    let sub_level_advisory = ranking.rankings.first().and_then(|best| {
+        let path_index = paths
+            .iter()
+            .position(|path| path.crossover_hz == best.settings.crossover_hz)?;
         let delay_ms = best.settings.main_delay_ms?;
         let polarity = best.settings.polarity?;
-        let mut variants = Vec::new();
-        for gain_step in -6_i32..=6 {
-            let gain_db = f64::from(gain_step);
-            let mut scaled_sub = path.sub.clone();
-            for value in &mut scaled_sub.magnitude_db {
-                *value += gain_db;
-            }
-            let left_combined = synthesize_isolated_sum(
-                &path.left_main,
-                &scaled_sub,
-                &retained_indices,
-                delay_ms - config.measured_main_delay_ms,
-                polarity != config.measured_polarity,
-            )
-            .ok()?;
-            let right_combined = synthesize_isolated_sum(
-                &path.right_main,
-                &scaled_sub,
-                &retained_indices,
-                delay_ms - config.measured_main_delay_ms,
-                polarity != config.measured_polarity,
-            )
-            .ok()?;
-            variants.push(SubIntegrationCandidate {
-                id: format!("sub-gain-{gain_step:+03}"),
-                settings: CandidateSettings {
-                    crossover_hz: path.crossover_hz,
-                    main_delay_ms: Some(delay_ms),
-                    sub_level_db: Some(gain_db),
-                    polarity: Some(polarity),
-                },
-                positions: vec![PositionObservation {
-                    id: "P0".into(),
-                    weight: 2.0,
-                    left_combined,
-                    right_combined,
-                }],
-            });
-        }
-        // Each gain variant is scored against its *own* one-octave envelope,
-        // not against the other variants: a cross-variant envelope would
-        // always reward the loudest sub. Self-referenced dip depth measures
-        // integration quality (the crossover suckout) and is invariant to the
-        // absolute gain itself.
-        let dip_rms_for = |candidate: &SubIntegrationCandidate| -> Option<f64> {
-            let mut deficits = Vec::new();
-            let mut weights = Vec::new();
-            for response in [
-                &candidate.positions[0].left_combined,
-                &candidate.positions[0].right_combined,
-            ] {
-                // Synthesized sums live on their own retained band grid.
-                let variant_grid = &response.frequencies_hz;
-                let all_indices: Vec<usize> = (0..variant_grid.len()).collect();
-                let variant_weights = log_frequency_weights(variant_grid).ok()?;
-                let fine = gaussian_log_smooth_at(
-                    variant_grid,
-                    &response.magnitude_db,
-                    &all_indices,
-                    config.ranking.magnitude_smoothing_octaves,
-                )
-                .ok()?;
-                let wide =
-                    gaussian_log_smooth_at(variant_grid, &response.magnitude_db, &all_indices, 1.0)
-                        .ok()?;
-                for ((fine_db, wide_db), weight) in fine.iter().zip(&wide).zip(&variant_weights) {
-                    deficits.push((wide_db - fine_db).max(0.0));
-                    weights.push(*weight);
-                }
-            }
-            weighted_rms(&deficits, &weights).ok()
+        let captured_path = &captured_paths[path_index];
+        let left_combined = synthesize_isolated_sum(
+            &captured_path.left_main,
+            &captured_path.sub,
+            &retained_indices,
+            delay_ms - config.measured_main_delay_ms,
+            polarity != config.measured_polarity,
+        )
+        .ok()?;
+        let right_combined = synthesize_isolated_sum(
+            &captured_path.right_main,
+            &captured_path.sub,
+            &retained_indices,
+            delay_ms - config.measured_main_delay_ms,
+            polarity != config.measured_polarity,
+        )
+        .ok()?;
+        let at_captured_level = SubIntegrationCandidate {
+            id: "winner-at-captured-sub-level".into(),
+            settings: CandidateSettings {
+                crossover_hz: best.settings.crossover_hz,
+                main_delay_ms: Some(delay_ms),
+                sub_level_db: Some(0.0),
+                polarity: Some(polarity),
+            },
+            positions: vec![PositionObservation {
+                id: "P0".into(),
+                weight: 2.0,
+                left_combined,
+                right_combined,
+            }],
         };
-        let deficit_rms_at_zero_db = variants
-            .iter()
-            .find(|candidate| candidate.settings.sub_level_db == Some(0.0))
-            .and_then(&dip_rms_for)?;
-        let (best_gain_db, deficit_rms_at_best_db) = variants
-            .iter()
-            .filter_map(|candidate| {
-                let gain_db = candidate.settings.sub_level_db?;
-                dip_rms_for(candidate).map(|deficit| (gain_db, deficit))
-            })
-            .min_by(|left, right| left.1.total_cmp(&right.1))?;
+        let captured_ranking = rank_spliced_candidates(
+            captured_paths,
+            common_grid,
+            &[at_captured_level],
+            center_ms,
+            config,
+        )
+        .ok()?;
         Some(SubLevelAdvisory {
-            best_gain_db,
-            deficit_rms_at_best_db,
-            deficit_rms_at_zero_db,
+            best_gain_db: path_trims_db[path_index],
+            deficit_rms_at_best_db: best.metrics.deficit_rms_db,
+            deficit_rms_at_zero_db: captured_ranking.rankings[0].metrics.deficit_rms_db,
         })
     });
     Ok(SeparatedPathOptimizationReport {
@@ -839,6 +1172,248 @@ pub fn optimize_separated_paths(
         arrival_estimates,
         sub_level_advisory,
         ranking,
+    })
+}
+
+/// Level-neutral scoring of synthesized splice candidates (search v3).
+///
+/// Every candidate derives from the same captures, so cross-candidate level
+/// drift is impossible and the measured-mode envelope objective is both
+/// unnecessary and biased here (a hotter branch buys the envelope). Each
+/// candidate is instead charged, per frequency across the common band,
+///
+/// ```text
+/// deficit(f) = max(0, max(main_s(f), sub_s(f), A) - sum_s(f))
+/// ```
+///
+/// where `sum_s` is the candidate's smoothed complex-sum level, the branch
+/// reference is `smooth(max(main_raw, sub_raw))` - the pointwise-louder
+/// branch smoothed *after* the max, so a legitimate level step between
+/// branches cannot leave a smoothing shoulder that reads as a defect (an
+/// aligned sum is never below the louder branch bin by bin, and smoothing
+/// both sides identically preserves that) - and `A` is the candidate's own
+/// raw 200-500 Hz median. The branch reference makes destructive
+/// interference visible even when one branch is much louder (the sum falling
+/// below the louder branch is the definition of cancellation), and the
+/// anchor charges a hole the cut-only EQ cannot legally fill even when the
+/// branches are too weak there to show it. Being *above* the reference earns
+/// nothing, so no candidate can buy the ranking with bandwidth or gain.
+///
+/// The caller must pass paths whose sub is already at deployment level
+/// (`deployment_trimmed_paths`): the anchor comparison is only meaningful at
+/// the level the system will actually play, and at capture level a hot sub
+/// clears the anchor everywhere it plays, hiding its own dips.
+fn rank_spliced_candidates(
+    paths: &[SeparatedCrossoverPaths],
+    common_grid: &[f64],
+    candidates: &[SubIntegrationCandidate],
+    arrival_center_ms: f64,
+    config: &SeparatedPathOptimizationConfig,
+) -> DspResult<SubIntegrationReport> {
+    if candidates.is_empty() {
+        return Err(DspError::EmptyInput("sub-integration candidates"));
+    }
+    let minimum_crossover = paths
+        .iter()
+        .map(|path| path.crossover_hz)
+        .fold(f64::INFINITY, f64::min);
+    let maximum_crossover = paths
+        .iter()
+        .map(|path| path.crossover_hz)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let sum_grid = &candidates[0].positions[0].left_combined.frequencies_hz;
+    let (band_indices, band) =
+        scoring_band(sum_grid, 0.5 * minimum_crossover, 2.0 * maximum_crossover)?;
+    let band_frequencies: Vec<f64> = band_indices.iter().map(|&index| sum_grid[index]).collect();
+    let frequency_weights = log_frequency_weights(&band_frequencies)?;
+    // The branch responses live on the full common grid while the sums live
+    // on the retained band grid; the scoring band is inside both, so the two
+    // index sets address the same physical frequencies.
+    let (branch_band_indices, _) = scoring_band(
+        common_grid,
+        0.5 * minimum_crossover,
+        2.0 * maximum_crossover,
+    )?;
+    if branch_band_indices.len() != band_indices.len() {
+        return Err(DspError::ShapeMismatch(
+            "branch and sum scoring bands must cover the same bins".into(),
+        ));
+    }
+    let branch_reference: Vec<[Vec<f64>; 2]> = paths
+        .iter()
+        .map(|path| {
+            let mut per_channel: [Vec<f64>; 2] = [Vec::new(), Vec::new()];
+            for (channel_index, main) in [&path.left_main, &path.right_main].into_iter().enumerate()
+            {
+                let louder_branch_db: Vec<f64> = main
+                    .magnitude_db
+                    .iter()
+                    .zip(&path.sub.magnitude_db)
+                    .map(|(main_db, sub_db)| main_db.max(*sub_db))
+                    .collect();
+                per_channel[channel_index] = gaussian_log_smooth_at(
+                    common_grid,
+                    &louder_branch_db,
+                    &branch_band_indices,
+                    config.ranking.magnitude_smoothing_octaves,
+                )?;
+            }
+            Ok(per_channel)
+        })
+        .collect::<DspResult<_>>()?;
+
+    let mut rankings = Vec::with_capacity(candidates.len());
+    let mut anchors: Vec<f64> = Vec::new();
+    let mut missing_anchor = false;
+    for candidate in candidates {
+        let path_index = paths
+            .iter()
+            .position(|path| path.crossover_hz == candidate.settings.crossover_hz)
+            .ok_or_else(|| {
+                DspError::InvalidArgument(
+                    "candidate crossover does not match a measured path".into(),
+                )
+            })?;
+        let position = &candidate.positions[0];
+        let mut observations = Vec::with_capacity(2);
+        let mut all_deficits = Vec::with_capacity(2 * band_indices.len());
+        let mut all_weights = Vec::with_capacity(2 * band_indices.len());
+        let mut phase_values = Vec::with_capacity(2);
+        for (channel_index, (channel, response)) in [
+            (Channel::Left, &position.left_combined),
+            (Channel::Right, &position.right_combined),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let sum_smoothed = gaussian_log_smooth_at(
+                sum_grid,
+                &response.magnitude_db,
+                &band_indices,
+                config.ranking.magnitude_smoothing_octaves,
+            )?;
+            let anchor_db = response_anchor_db(sum_grid, &response.magnitude_db)?;
+            match anchor_db {
+                Some(anchor) => anchors.push(anchor),
+                None => missing_anchor = true,
+            }
+            let reference_smoothed = &branch_reference[path_index][channel_index];
+            let deficits: Vec<f64> = (0..band_indices.len())
+                .map(|bin| {
+                    let mut reference = reference_smoothed[bin];
+                    if let Some(anchor) = anchor_db {
+                        reference = reference.max(anchor);
+                    }
+                    (reference - sum_smoothed[bin]).max(0.0)
+                })
+                .collect();
+            let phase = response
+                .phase_rad
+                .as_ref()
+                .expect("synthesized sums carry phase");
+            phase_values.push(group_delay_irregularity_rms_ms(
+                sum_grid,
+                phase,
+                &band_indices,
+                &frequency_weights,
+                config.ranking.group_delay_smoothing_octaves,
+            )?);
+            observations.push(ObservationDeficitMetrics {
+                position_id: position.id.clone(),
+                channel,
+                rms_db: weighted_rms(&deficits, &frequency_weights)?,
+                p95_db: weighted_percentile(&deficits, &frequency_weights, 0.95)?,
+                worst_db: deficits.iter().copied().fold(0.0_f64, f64::max),
+            });
+            all_deficits.extend_from_slice(&deficits);
+            all_weights.extend_from_slice(&frequency_weights);
+        }
+        let deficit_rms_db = weighted_rms(&all_deficits, &all_weights)?;
+        let deficit_p95_db = weighted_percentile(&all_deficits, &all_weights, 0.95)?;
+        let deficit_worst_db = all_deficits.iter().copied().fold(0.0_f64, f64::max);
+        // Group-delay smoothness is reported as a diagnostic but deliberately
+        // NOT scored: an LR crossover's own group-delay bump scales as 1/fc,
+        // so a millisecond-unit smoothness term structurally favors high
+        // crossovers (and under a much louder branch it can prefer a
+        // misaligned delay whose accidental phase curve is smoother than the
+        // aligned one). The interference this term was meant to catch is
+        // already charged by the branch-reference magnitude deficit exactly
+        // where the branches actually overlap.
+        let phase_irregularity_rms_ms = weighted_rms(&phase_values, &[1.0, 1.0])?;
+        // Regularize toward the measured arrival, not toward zero: the
+        // measured offset is the physically privileged delay, and deviating
+        // from it should need magnitude evidence. A zero-referenced penalty
+        // would drag the winner below the true alignment whenever the
+        // deficit slope is shallow (e.g. a much louder branch).
+        let delay_regularization_db = candidate.settings.main_delay_ms.map_or(0.0, |delay| {
+            (delay - arrival_center_ms).abs() * config.ranking.delay_regularization_db_per_ms
+        });
+        let crossover_regularization_db = config.crossover_regularization_db_per_octave
+            * (candidate.settings.crossover_hz / 40.0).log2();
+        let total_score = deficit_rms_db
+            + config.ranking.deficit_p95_weight * deficit_p95_db
+            + config.ranking.deficit_worst_weight * deficit_worst_db
+            + delay_regularization_db
+            + crossover_regularization_db;
+        if !total_score.is_finite() {
+            return Err(DspError::InvalidArgument(format!(
+                "candidate '{}' produced a non-finite score",
+                candidate.id
+            )));
+        }
+        rankings.push(RankedCandidate {
+            rank: 0,
+            id: candidate.id.clone(),
+            settings: candidate.settings.clone(),
+            metrics: CandidateMetrics {
+                deficit_rms_db,
+                deficit_p95_db,
+                deficit_worst_db,
+                worst_seat_rms_db: None,
+                spatial_spread_rms_db: None,
+                phase_irregularity_rms_ms: Some(phase_irregularity_rms_ms),
+                timing_repeatability_rms_ms: None,
+                delay_regularization_db,
+                level_regularization_db: 0.0,
+                total_score,
+            },
+            observations,
+        });
+    }
+    rankings.sort_by(|left, right| {
+        left.metrics
+            .total_score
+            .total_cmp(&right.metrics.total_score)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    for (index, candidate) in rankings.iter_mut().enumerate() {
+        candidate.rank = index + 1;
+    }
+    let anchor_level_spread_db = (!anchors.is_empty()).then(|| {
+        anchors.iter().copied().fold(f64::NEG_INFINITY, f64::max)
+            - anchors.iter().copied().fold(f64::INFINITY, f64::min)
+    });
+    let mut warnings = vec![
+        "Only one listening position is available; spatial overfit penalties are unavailable and confidence is limited."
+            .to_string(),
+        "At least one response lacks repeatable arrival-time evidence; the timing reliability term is unavailable."
+            .to_string(),
+    ];
+    if missing_anchor {
+        warnings.push(
+            "The common grid does not contain enough 200-500 Hz bins to check anchor-level stability."
+                .into(),
+        );
+    }
+    Ok(SubIntegrationReport {
+        band,
+        rankings,
+        spatial_evidence_available: false,
+        phase_evidence_available: true,
+        timing_evidence_available: false,
+        anchor_level_spread_db,
+        needs_confirmation: true,
+        warnings,
     })
 }
 
@@ -877,6 +1452,13 @@ fn validate_separated_optimization(
             "main-delay step must be between 0.01 and 5 ms".into(),
         ));
     }
+    if !config.crossover_regularization_db_per_octave.is_finite()
+        || config.crossover_regularization_db_per_octave < 0.0
+    {
+        return Err(DspError::InvalidArgument(
+            "crossover regularization must be finite and nonnegative".into(),
+        ));
+    }
     let mut ids = HashSet::new();
     let mut crossovers = HashSet::new();
     let common_grid = &paths[0].left_main.frequencies_hz;
@@ -912,16 +1494,214 @@ fn validate_separated_optimization(
     Ok(())
 }
 
-/// Band-limited complex cross-correlation arrival estimate: the lag that best
-/// aligns the sub path to the main path over the octave straddling the
-/// crossover. Both paths already share the marker timeline, so the lag is the
-/// physical sub-minus-main offset (positive = sub late = delay the main).
-fn estimate_relative_arrival_ms(
+/// Synthesize per-crossover isolated states from one wide-band sub capture
+/// and full-range main captures, for `optimize_separated_paths`.
+///
+/// For a candidate crossover `x` the virtual state is
+///
+/// ```text
+/// main'_c(f) = main_c(f) * HP_model(x, f)
+/// sub'(f)    = sub(f)    * LP_model(x, f) / LP_model(f_meas, f)   (measured dial at f_meas)
+/// sub'(f)    = sub(f)    * LP_model(x, f)                          (low-pass bypassed)
+/// ```
+///
+/// This is the explicit model-based counterpart of the measured-states path:
+/// the room, drivers, and placement stay measured complex data, and only the
+/// bass-management filters are modeled. The division replaces the wide
+/// measurement-state low-pass instead of stacking a second filter on top of
+/// it; without it the deployed sub would be modeled with an extra ~1.8 ms of
+/// low-frequency group delay (LR4 at 250 Hz), which would bias the delay
+/// recommendation by about that much. The caller must label the resulting
+/// report via `SeparatedPathOptimizationConfig::synthesized_crossover_model`.
+pub fn synthesize_wide_band_crossover_states(
+    paths: &WideBandIsolatedPaths,
+    config: &WideBandSynthesisConfig,
+) -> DspResult<Vec<SeparatedCrossoverPaths>> {
+    if !(2..=12).contains(&config.candidate_crossovers_hz.len()) {
+        return Err(DspError::InvalidArgument(
+            "wide-band synthesis requires 2 to 12 candidate crossovers".into(),
+        ));
+    }
+    let mut previous = None;
+    for crossover_hz in &config.candidate_crossovers_hz {
+        validate_crossover(*crossover_hz)?;
+        if previous.is_some_and(|value| *crossover_hz <= value) {
+            return Err(DspError::InvalidArgument(
+                "candidate crossovers must be strictly increasing".into(),
+            ));
+        }
+        previous = Some(*crossover_hz);
+    }
+    if let Some(measured_low_pass_hz) = config.sub_measured_low_pass_hz {
+        validate_crossover(measured_low_pass_hz)?;
+        let maximum_candidate = *config
+            .candidate_crossovers_hz
+            .last()
+            .expect("validated nonempty");
+        if maximum_candidate > measured_low_pass_hz {
+            return Err(DspError::InvalidArgument(format!(
+                "candidate crossover {maximum_candidate:.1} Hz exceeds the {measured_low_pass_hz:.1} Hz \
+                 low-pass active during the sub capture; the replacement ratio would amplify \
+                 measurement noise above the measured corner"
+            )));
+        }
+    }
+    let common_grid = &paths.left_main.frequencies_hz;
+    for (label, response) in [
+        ("left full-range main", &paths.left_main),
+        ("right full-range main", &paths.right_main),
+        ("wide-band sub", &paths.sub),
+    ] {
+        validate_response(response, "wide-band isolated path")?;
+        require_same_grid(common_grid, &response.frequencies_hz, label)?;
+        if response.phase_rad.is_none() {
+            return Err(DspError::InvalidArgument(format!(
+                "{label} phase is required for wide-band crossover synthesis"
+            )));
+        }
+    }
+
+    let mut states = Vec::with_capacity(config.candidate_crossovers_hz.len());
+    for (index, &crossover_hz) in config.candidate_crossovers_hz.iter().enumerate() {
+        let high_pass = |frequency_hz: f64| {
+            high_pass_response(config.main_high_pass, crossover_hz, frequency_hz)
+        };
+        let low_pass = |frequency_hz: f64| match config.sub_measured_low_pass_hz {
+            Some(measured_low_pass_hz) => complex_divide(
+                low_pass_response(config.sub_low_pass, crossover_hz, frequency_hz),
+                low_pass_response(config.sub_low_pass, measured_low_pass_hz, frequency_hz),
+            ),
+            None => low_pass_response(config.sub_low_pass, crossover_hz, frequency_hz),
+        };
+        states.push(SeparatedCrossoverPaths {
+            id: format!("XO{:02}", index + 1),
+            crossover_hz,
+            left_main: apply_complex_filter(&paths.left_main, high_pass)?,
+            right_main: apply_complex_filter(&paths.right_main, high_pass)?,
+            sub: apply_complex_filter(&paths.sub, low_pass)?,
+        });
+    }
+    Ok(states)
+}
+
+/// Multiply a measured complex response by a modeled filter, bin by bin.
+fn apply_complex_filter<F>(response: &CombinedResponse, filter: F) -> DspResult<CombinedResponse>
+where
+    F: Fn(f64) -> (f64, f64),
+{
+    let phase_rad = response
+        .phase_rad
+        .as_ref()
+        .expect("validated: wide-band paths carry phase");
+    let mut magnitude_db = Vec::with_capacity(response.frequencies_hz.len());
+    let mut filtered_phase_rad = Vec::with_capacity(response.frequencies_hz.len());
+    for (index, &frequency_hz) in response.frequencies_hz.iter().enumerate() {
+        let (real, imaginary) = filter(frequency_hz);
+        let gain = real.hypot(imaginary);
+        let level_db = response.magnitude_db[index] + 20.0 * gain.max(1.0e-15).log10();
+        let phase = phase_rad[index] + imaginary.atan2(real);
+        if !level_db.is_finite() || !phase.is_finite() {
+            return Err(DspError::NonFinite {
+                context: "wide-band synthesized response",
+                index,
+            });
+        }
+        magnitude_db.push(level_db);
+        filtered_phase_rad.push(phase);
+    }
+    Ok(CombinedResponse {
+        frequencies_hz: response.frequencies_hz.clone(),
+        magnitude_db,
+        phase_rad: Some(filtered_phase_rad),
+        timing: None,
+    })
+}
+
+/// Complex low-pass response of the analog prototype at `frequency_hz`.
+fn low_pass_response(
+    alignment: CrossoverAlignment,
+    corner_hz: f64,
+    frequency_hz: f64,
+) -> (f64, f64) {
+    let wn = frequency_hz / corner_hz;
+    match alignment {
+        // H1(jw) = 1 / (1 + jw); LR2 low-pass is H1 squared.
+        CrossoverAlignment::LinkwitzRiley2 => {
+            let section = complex_divide((1.0, 0.0), (1.0, wn));
+            complex_multiply(section, section)
+        }
+        // H2(jw) = 1 / ((1 - w^2) + j*sqrt(2)*w), the Butterworth Q=1/sqrt(2).
+        CrossoverAlignment::Butterworth2 => {
+            complex_divide((1.0, 0.0), (1.0 - wn * wn, std::f64::consts::SQRT_2 * wn))
+        }
+        // LR4 low-pass is the squared 2nd-order Butterworth.
+        CrossoverAlignment::LinkwitzRiley4 => {
+            let section =
+                complex_divide((1.0, 0.0), (1.0 - wn * wn, std::f64::consts::SQRT_2 * wn));
+            complex_multiply(section, section)
+        }
+    }
+}
+
+/// Complex high-pass response of the analog prototype at `frequency_hz`.
+fn high_pass_response(
+    alignment: CrossoverAlignment,
+    corner_hz: f64,
+    frequency_hz: f64,
+) -> (f64, f64) {
+    let wn = frequency_hz / corner_hz;
+    match alignment {
+        // G1(jw) = jw / (1 + jw); LR2 high-pass is G1 squared.
+        CrossoverAlignment::LinkwitzRiley2 => {
+            let section = complex_divide((0.0, wn), (1.0, wn));
+            complex_multiply(section, section)
+        }
+        // G2(jw) = -w^2 / ((1 - w^2) + j*sqrt(2)*w).
+        CrossoverAlignment::Butterworth2 => complex_divide(
+            (-wn * wn, 0.0),
+            (1.0 - wn * wn, std::f64::consts::SQRT_2 * wn),
+        ),
+        CrossoverAlignment::LinkwitzRiley4 => {
+            let section = complex_divide(
+                (-wn * wn, 0.0),
+                (1.0 - wn * wn, std::f64::consts::SQRT_2 * wn),
+            );
+            complex_multiply(section, section)
+        }
+    }
+}
+
+fn complex_multiply(left: (f64, f64), right: (f64, f64)) -> (f64, f64) {
+    (
+        left.0 * right.0 - left.1 * right.1,
+        left.0 * right.1 + left.1 * right.0,
+    )
+}
+
+fn complex_divide(numerator: (f64, f64), denominator: (f64, f64)) -> (f64, f64) {
+    let magnitude_squared = denominator.0 * denominator.0 + denominator.1 * denominator.1;
+    (
+        (numerator.0 * denominator.0 + numerator.1 * denominator.1) / magnitude_squared,
+        (numerator.1 * denominator.0 - numerator.0 * denominator.1) / magnitude_squared,
+    )
+}
+
+const ARRIVAL_SCAN_STEP_MS: f64 = 0.05;
+const ARRIVAL_SCAN_LIMIT_MS: f64 = 20.0;
+
+/// Band-limited complex cross-correlation of one main/sub pair, evaluated on
+/// the fixed [-ARRIVAL_SCAN_LIMIT_MS, +ARRIVAL_SCAN_LIMIT_MS] lag grid. Both
+/// paths share the marker timeline, so the lag that maximizes the magnitude
+/// is that pair's sub-minus-main offset (positive = sub late = delay the
+/// main). The caller pools these curves across paths - one path's curve can
+/// carry near-periodic aliases when its filtered overlap band is narrow.
+fn arrival_correlation_curve(
     common_grid: &[f64],
     main: &CombinedResponse,
     sub: &CombinedResponse,
-    crossover_hz: f64,
-) -> DspResult<f64> {
+    band_low_hz: f64,
+    band_high_hz: f64,
+) -> DspResult<Vec<f64>> {
     let main_phase = main
         .phase_rad
         .as_ref()
@@ -930,8 +1710,6 @@ fn estimate_relative_arrival_ms(
         .phase_rad
         .as_ref()
         .expect("validated: separated paths carry phase");
-    let band_low_hz = (0.5 * crossover_hz).max(20.0);
-    let band_high_hz = (2.0 * crossover_hz).min(240.0);
     let mut cross = Vec::new();
     for (index, frequency) in common_grid.iter().enumerate() {
         if (band_low_hz..=band_high_hz).contains(frequency) {
@@ -946,12 +1724,9 @@ fn estimate_relative_arrival_ms(
             "not enough {band_low_hz:.0}-{band_high_hz:.0} Hz bins to estimate the sub arrival"
         )));
     }
-    let scan_step_ms = 0.05;
-    let scan_limit_ms = 20.0;
-    let mut best_tau_ms = 0.0;
-    let mut best_magnitude = f64::NEG_INFINITY;
-    let mut tau_ms = -scan_limit_ms;
-    while tau_ms <= scan_limit_ms + 1.0e-9 {
+    let mut curve = Vec::new();
+    let mut tau_ms = -ARRIVAL_SCAN_LIMIT_MS;
+    while tau_ms <= ARRIVAL_SCAN_LIMIT_MS + 1.0e-9 {
         let mut real = 0.0;
         let mut imaginary = 0.0;
         for (frequency, weight, phase) in &cross {
@@ -960,18 +1735,15 @@ fn estimate_relative_arrival_ms(
             imaginary += weight * angle.sin();
         }
         let magnitude = real.hypot(imaginary);
-        if magnitude > best_magnitude {
-            best_magnitude = magnitude;
-            best_tau_ms = tau_ms;
+        if !magnitude.is_finite() {
+            return Err(DspError::InvalidArgument(
+                "sub arrival estimation produced a non-finite correlation".into(),
+            ));
         }
-        tau_ms += scan_step_ms;
+        curve.push(magnitude);
+        tau_ms += ARRIVAL_SCAN_STEP_MS;
     }
-    if !best_magnitude.is_finite() {
-        return Err(DspError::InvalidArgument(
-            "sub arrival estimation produced a non-finite correlation".into(),
-        ));
-    }
-    Ok(best_tau_ms)
+    Ok(curve)
 }
 
 /// Absolute multiples of the hardware delay step inside [low, high]. Snapping
@@ -1974,26 +2746,33 @@ mod tests {
                 delay_minimum_ms: 0.0,
                 delay_maximum_ms: 4.0,
                 delay_step_ms: 1.0,
+                synthesized_crossover_model: None,
+                crossover_regularization_db_per_octave:
+                    SEPARATED_PATH_CROSSOVER_REGULARIZATION_DB_PER_OCTAVE,
                 ranking: RankingConfig::default(),
             },
         )
         .unwrap();
         let best = &report.ranking.rankings[0];
-        // Adaptive windows: xo80's estimated arrival (~2 ms) opens a
-        // half-period window clipped to [0, 4] -> five 1 ms steps; xo100's
-        // (~6 ms) window clips to [1, 4] -> four steps. (5 + 4) * 2 = 18.
-        assert_eq!(report.synthesized_candidate_count, 18);
+        // One anchor arrival from the lowest path (~2 ms) centres every
+        // window: both 2 +/- half-period windows clip to [0, 4] -> five
+        // 1 ms steps each. (5 + 5) * 2 = 20. The xo100 entry's planted 6 ms
+        // offset stays unreachable inside [0, 4], so its best alignment
+        // keeps a residual splice error and the window is range-flagged.
+        assert_eq!(report.synthesized_candidate_count, 20);
         assert_eq!(best.settings.crossover_hz, 80.0);
         assert_eq!(best.settings.main_delay_ms, Some(2.0));
         assert_eq!(best.settings.polarity, Some(Polarity::Inverted));
         assert!(report.ranking.needs_confirmation);
-        // The pre-search arrival estimate found the true sub offsets on the
-        // shared timeline, and the unreachable xo100 window is flagged.
         let xo80 = &report.arrival_estimates[0];
         assert!((xo80.center_ms - 2.0).abs() <= 0.1, "{}", xo80.center_ms);
         assert!(xo80.left_right_spread_ms < 0.1);
         let xo100 = &report.arrival_estimates[1];
-        assert!((xo100.center_ms - 6.0).abs() <= 0.1, "{}", xo100.center_ms);
+        assert!(
+            (xo100.center_ms - xo80.center_ms).abs() < 1.0e-9,
+            "windows share one anchor: {}",
+            xo100.center_ms
+        );
         assert!(xo100.range_limited);
         assert!(report
             .ranking
@@ -2007,6 +2786,637 @@ mod tests {
             .any(|warning| warning.contains("no crossover transfer function")));
     }
 
+    fn wrapped_phase_difference(left: f64, right: f64) -> f64 {
+        let mut delta = left - right;
+        delta -= (delta / (2.0 * PI)).round() * 2.0 * PI;
+        delta.abs()
+    }
+
+    #[test]
+    fn crossover_alignment_models_have_the_textbook_crossover_properties() {
+        let corner_hz = 80.0;
+        // Corner levels: LR alignments are -6.02 dB, BW2 is -3.01 dB.
+        for (alignment, expected_db) in [
+            (CrossoverAlignment::LinkwitzRiley4, -6.020_599_913_279_624),
+            (CrossoverAlignment::LinkwitzRiley2, -6.020_599_913_279_624),
+            (CrossoverAlignment::Butterworth2, -3.010_299_956_639_812),
+        ] {
+            for response in [
+                low_pass_response(alignment, corner_hz, corner_hz),
+                high_pass_response(alignment, corner_hz, corner_hz),
+            ] {
+                let level_db = 20.0 * response.0.hypot(response.1).log10();
+                assert!(
+                    (level_db - expected_db).abs() < 1.0e-9,
+                    "{alignment:?}: {level_db}"
+                );
+            }
+        }
+        for index in 0..200 {
+            let frequency_hz = 10.0 * 2.0_f64.powf(index as f64 / 25.0);
+            // LR4: low-pass and high-pass are in phase everywhere, so their
+            // sum is a unity-magnitude allpass. This is the property that
+            // makes the polarity recommendation depend on the alignment.
+            let low =
+                low_pass_response(CrossoverAlignment::LinkwitzRiley4, corner_hz, frequency_hz);
+            let high =
+                high_pass_response(CrossoverAlignment::LinkwitzRiley4, corner_hz, frequency_hz);
+            let sum = (low.0 + high.0, low.1 + high.1);
+            assert!(
+                (sum.0.hypot(sum.1) - 1.0).abs() < 1.0e-9,
+                "LR4 sum at {frequency_hz}"
+            );
+            assert!(
+                wrapped_phase_difference(low.1.atan2(low.0), high.1.atan2(high.0)) < 1.0e-9,
+                "LR4 phase split at {frequency_hz}"
+            );
+            // LR2: the two sections are 180 degrees apart everywhere, so the
+            // flat sum needs one branch inverted.
+            let low =
+                low_pass_response(CrossoverAlignment::LinkwitzRiley2, corner_hz, frequency_hz);
+            let high =
+                high_pass_response(CrossoverAlignment::LinkwitzRiley2, corner_hz, frequency_hz);
+            let inverted_sum = (low.0 - high.0, low.1 - high.1);
+            assert!(
+                (inverted_sum.0.hypot(inverted_sum.1) - 1.0).abs() < 1.0e-9,
+                "LR2 inverted sum at {frequency_hz}"
+            );
+            assert!(
+                (wrapped_phase_difference(low.1.atan2(low.0), high.1.atan2(high.0)) - PI).abs()
+                    < 1.0e-9,
+                "LR2 phase split at {frequency_hz}"
+            );
+        }
+    }
+
+    #[test]
+    fn wide_band_synthesis_replaces_the_measured_wide_low_pass_exactly() {
+        // The sub's true unfiltered path is captured through the wide 250 Hz
+        // low-pass. Synthesizing an 80 Hz state must reproduce
+        // true_path x LP(80) - substitution - and not
+        // true_path x LP(250) x LP(80) - stacking, which would carry the wide
+        // filter's ~1.8 ms of low-frequency group delay into every candidate.
+        let sub_true = shaped_response(|frequency| -0.01 * (frequency / 20.0), 5.0, false);
+        let main_true = shaped_response(|_| 0.0, 0.0, false);
+        let measured_sub = apply_complex_filter(&sub_true, |frequency_hz| {
+            low_pass_response(CrossoverAlignment::LinkwitzRiley4, 250.0, frequency_hz)
+        })
+        .unwrap();
+        let states = synthesize_wide_band_crossover_states(
+            &WideBandIsolatedPaths {
+                left_main: main_true.clone(),
+                right_main: main_true.clone(),
+                sub: measured_sub,
+            },
+            &WideBandSynthesisConfig {
+                candidate_crossovers_hz: vec![80.0, 100.0],
+                sub_measured_low_pass_hz: Some(250.0),
+                main_high_pass: CrossoverAlignment::LinkwitzRiley4,
+                sub_low_pass: CrossoverAlignment::LinkwitzRiley4,
+            },
+        )
+        .unwrap();
+        let expected_sub = apply_complex_filter(&sub_true, |frequency_hz| {
+            low_pass_response(CrossoverAlignment::LinkwitzRiley4, 80.0, frequency_hz)
+        })
+        .unwrap();
+        let expected_main = apply_complex_filter(&main_true, |frequency_hz| {
+            high_pass_response(CrossoverAlignment::LinkwitzRiley4, 80.0, frequency_hz)
+        })
+        .unwrap();
+        let state = &states[0];
+        assert_eq!(state.id, "XO01");
+        assert_eq!(state.crossover_hz, 80.0);
+        let synthesized_phase = state.sub.phase_rad.as_ref().unwrap();
+        let expected_phase = expected_sub.phase_rad.as_ref().unwrap();
+        for index in 0..state.sub.frequencies_hz.len() {
+            assert!(
+                (state.sub.magnitude_db[index] - expected_sub.magnitude_db[index]).abs() < 1.0e-9,
+                "sub magnitude at bin {index}"
+            );
+            assert!(
+                wrapped_phase_difference(synthesized_phase[index], expected_phase[index]) < 1.0e-9,
+                "sub phase at bin {index}"
+            );
+            assert!(
+                (state.left_main.magnitude_db[index] - expected_main.magnitude_db[index]).abs()
+                    < 1.0e-9,
+                "main magnitude at bin {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn wide_band_synthesis_finds_planted_delay_polarity_and_a_supported_crossover() {
+        // The main rolls off naturally below 70 Hz, so a 40/60 Hz crossover
+        // leaves a hole the sub is no longer allowed to fill; the sub is flat
+        // to 150 Hz, physically 5 ms late, and wired inverted. The search
+        // must recover the plant from a single wide sub capture. With LR
+        // models the filter phases cancel between branches, so the planted
+        // 5 ms remains the exact optimum.
+        let main = shaped_response(
+            |frequency| -24.0 * (70.0 / frequency).log2().max(0.0),
+            0.0,
+            false,
+        );
+        let sub_true = shaped_response(
+            |frequency| -24.0 * (frequency / 150.0).log2().max(0.0),
+            5.0,
+            true,
+        );
+        let measured_sub = apply_complex_filter(&sub_true, |frequency_hz| {
+            low_pass_response(CrossoverAlignment::LinkwitzRiley4, 250.0, frequency_hz)
+        })
+        .unwrap();
+        let states = synthesize_wide_band_crossover_states(
+            &WideBandIsolatedPaths {
+                left_main: main.clone(),
+                right_main: main,
+                sub: measured_sub,
+            },
+            &WideBandSynthesisConfig {
+                candidate_crossovers_hz: vec![40.0, 60.0, 80.0, 100.0],
+                sub_measured_low_pass_hz: Some(250.0),
+                main_high_pass: CrossoverAlignment::LinkwitzRiley4,
+                sub_low_pass: CrossoverAlignment::LinkwitzRiley4,
+            },
+        )
+        .unwrap();
+        let report = optimize_separated_paths(
+            &states,
+            &SeparatedPathOptimizationConfig {
+                measured_main_delay_ms: 0.0,
+                measured_polarity: Polarity::Normal,
+                delay_minimum_ms: -10.0,
+                delay_maximum_ms: 25.0,
+                delay_step_ms: 0.5,
+                synthesized_crossover_model: Some("LR4 high-pass + LR4 low-pass".into()),
+                crossover_regularization_db_per_octave:
+                    SEPARATED_PATH_CROSSOVER_REGULARIZATION_DB_PER_OCTAVE,
+                ranking: RankingConfig::default(),
+            },
+        )
+        .unwrap();
+        let best = &report.ranking.rankings[0];
+        assert!(
+            best.settings.crossover_hz >= 80.0,
+            "crossover {}",
+            best.settings.crossover_hz
+        );
+        let delay = best.settings.main_delay_ms.unwrap();
+        assert!((delay - 5.0).abs() <= 0.5, "delay {delay}");
+        assert_eq!(best.settings.polarity, Some(Polarity::Inverted));
+        assert!(report.ranking.needs_confirmation);
+        assert!(report
+            .ranking
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("synthesized from a filter model")));
+        assert!(!report
+            .ranking
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("no crossover transfer function")));
+    }
+
+    #[test]
+    fn a_hotter_sub_cannot_buy_the_crossover_ranking() {
+        // Both candidates splice cleanly (flat mains, clean aligned sub), and
+        // the sub runs +10 dB hot. Handing the wider band to the louder sub
+        // must not improve the score: the v2 envelope objective ranked the
+        // highest crossover first exactly here (more band energy formed the
+        // cross-candidate envelope), which made the recommendation a
+        // monotonic function of the candidate list on any hot-sub system.
+        let main = shaped_response(|_| 0.0, 0.0, false);
+        let sub = shaped_response(
+            |frequency| 10.0 - 24.0 * (frequency / 150.0).log2().max(0.0),
+            0.0,
+            false,
+        );
+        let states = synthesize_wide_band_crossover_states(
+            &WideBandIsolatedPaths {
+                left_main: main.clone(),
+                right_main: main,
+                sub,
+            },
+            &WideBandSynthesisConfig {
+                candidate_crossovers_hz: vec![60.0, 120.0],
+                sub_measured_low_pass_hz: None,
+                main_high_pass: CrossoverAlignment::LinkwitzRiley4,
+                sub_low_pass: CrossoverAlignment::LinkwitzRiley4,
+            },
+        )
+        .unwrap();
+        let report = optimize_separated_paths(
+            &states,
+            &SeparatedPathOptimizationConfig {
+                measured_main_delay_ms: 0.0,
+                measured_polarity: Polarity::Normal,
+                delay_minimum_ms: -5.0,
+                delay_maximum_ms: 5.0,
+                delay_step_ms: 0.5,
+                synthesized_crossover_model: Some("LR4/LR4".into()),
+                crossover_regularization_db_per_octave:
+                    SEPARATED_PATH_CROSSOVER_REGULARIZATION_DB_PER_OCTAVE,
+                ranking: RankingConfig::default(),
+            },
+        )
+        .unwrap();
+        let best_low = report
+            .ranking
+            .rankings
+            .iter()
+            .find(|candidate| candidate.settings.crossover_hz == 60.0)
+            .unwrap();
+        let best_high = report
+            .ranking
+            .rankings
+            .iter()
+            .find(|candidate| candidate.settings.crossover_hz == 120.0)
+            .unwrap();
+        // Both splices are genuinely clean - neither score is a fabricated
+        // defect - and the hot sub's extra bandwidth buys nothing.
+        assert!(
+            best_low.metrics.deficit_rms_db < 0.8,
+            "{}",
+            best_low.metrics.deficit_rms_db
+        );
+        assert!(
+            best_high.metrics.deficit_rms_db < 0.8,
+            "{}",
+            best_high.metrics.deficit_rms_db
+        );
+        assert!(
+            best_high.metrics.total_score + 0.05 >= best_low.metrics.total_score,
+            "high {} vs low {}",
+            best_high.metrics.total_score,
+            best_low.metrics.total_score
+        );
+        // With both splices clean, the winner is the physically aligned state
+        // at the lower crossover (the documented localization tie-break), not
+        // a level artifact or an accidental smoother-phase misalignment.
+        let winner = &report.ranking.rankings[0];
+        assert_eq!(winner.settings.crossover_hz, 60.0);
+        assert_eq!(winner.settings.main_delay_ms, Some(0.0));
+        assert_eq!(winner.settings.polarity, Some(Polarity::Normal));
+    }
+
+    #[test]
+    fn the_ranking_is_invariant_to_the_captured_sub_level() {
+        // A pure gain change on the captured sub is a microphone/output-level
+        // accident, not room physics. The deployment trim must absorb it
+        // exactly: same winner, same per-crossover ordering, same scores, and
+        // trims that differ by exactly the injected gain. The v3 scorer
+        // failed this - its anchor term compared the sum against a fixed
+        // midband level, so +12 dB of capture gain re-ordered the ranking.
+        let main = shaped_response(|frequency| broad_notch(frequency, 90.0, 6.0), 0.0, false);
+        let sub_shape = |frequency: f64| -24.0 * (frequency / 150.0).log2().max(0.0);
+        let config = SeparatedPathOptimizationConfig {
+            measured_main_delay_ms: 0.0,
+            measured_polarity: Polarity::Normal,
+            delay_minimum_ms: -5.0,
+            delay_maximum_ms: 5.0,
+            delay_step_ms: 0.5,
+            synthesized_crossover_model: Some("LR4/LR4".into()),
+            crossover_regularization_db_per_octave:
+                SEPARATED_PATH_CROSSOVER_REGULARIZATION_DB_PER_OCTAVE,
+            ranking: RankingConfig::default(),
+        };
+        let report_for = |sub_gain_db: f64| {
+            let states = synthesize_wide_band_crossover_states(
+                &WideBandIsolatedPaths {
+                    left_main: main.clone(),
+                    right_main: main.clone(),
+                    sub: shaped_response(
+                        |frequency| sub_shape(frequency) + sub_gain_db,
+                        0.0,
+                        false,
+                    ),
+                },
+                &WideBandSynthesisConfig {
+                    candidate_crossovers_hz: vec![50.0, 80.0, 110.0],
+                    sub_measured_low_pass_hz: None,
+                    main_high_pass: CrossoverAlignment::LinkwitzRiley4,
+                    sub_low_pass: CrossoverAlignment::LinkwitzRiley4,
+                },
+            )
+            .unwrap();
+            optimize_separated_paths(&states, &config).unwrap()
+        };
+        let quiet = report_for(0.0);
+        let hot = report_for(12.0);
+        // Exactly tied mirror-delay entries deep in the list may swap on
+        // ~1e-13 float noise, so the invariance contract is stated on what
+        // the user sees: the winner and each crossover's best entry. The v3
+        // scorer failed even the winner comparison.
+        let winner_quiet = &quiet.ranking.rankings[0];
+        let winner_hot = &hot.ranking.rankings[0];
+        assert_eq!(
+            winner_quiet.settings.crossover_hz,
+            winner_hot.settings.crossover_hz
+        );
+        assert_eq!(
+            winner_quiet.settings.main_delay_ms,
+            winner_hot.settings.main_delay_ms
+        );
+        assert_eq!(winner_quiet.settings.polarity, winner_hot.settings.polarity);
+        for crossover_hz in [50.0, 80.0, 110.0] {
+            let best_of = |report: &SeparatedPathOptimizationReport| {
+                report
+                    .ranking
+                    .rankings
+                    .iter()
+                    .find(|candidate| candidate.settings.crossover_hz == crossover_hz)
+                    .unwrap()
+                    .clone()
+            };
+            let quiet_entry = best_of(&quiet);
+            let hot_entry = best_of(&hot);
+            assert_eq!(
+                quiet_entry.settings.main_delay_ms,
+                hot_entry.settings.main_delay_ms
+            );
+            assert_eq!(quiet_entry.settings.polarity, hot_entry.settings.polarity);
+            assert!(
+                (quiet_entry.metrics.total_score - hot_entry.metrics.total_score).abs() < 1.0e-6,
+                "{} vs {}",
+                quiet_entry.metrics.total_score,
+                hot_entry.metrics.total_score
+            );
+            let quiet_trim = quiet_entry.settings.sub_level_db.unwrap();
+            let hot_trim = hot_entry.settings.sub_level_db.unwrap();
+            assert!(
+                (quiet_trim - hot_trim - 12.0).abs() < 1.0e-9,
+                "trims must absorb the injected gain exactly: {quiet_trim} vs {hot_trim}"
+            );
+        }
+        let advisory = hot.sub_level_advisory.unwrap();
+        assert!(
+            (advisory.best_gain_db - quiet.sub_level_advisory.unwrap().best_gain_db + 12.0).abs()
+                < 1.0e-9
+        );
+    }
+
+    #[test]
+    fn a_hot_sub_cannot_hide_its_own_dips_behind_the_anchor() {
+        // The mains are genuinely clean full-range; the sub runs +10 dB hot
+        // and has a real -12 dB room dip at 95 Hz. Handing the sub the band
+        // that contains its own dip must be charged for it at deployment
+        // level. At capture level the surplus lifts the dip's floor above
+        // the midband anchor, so a level-sensitive anchor sees nothing wrong
+        // with the high crossover - exactly the mechanism that made the
+        // recommendation track the top of the candidate list on real data.
+        let main = shaped_response(|_| 0.0, 0.0, false);
+        let sub = shaped_response(
+            |frequency| {
+                10.0 - 24.0 * (frequency / 150.0).log2().max(0.0)
+                    + broad_notch(frequency, 95.0, 12.0)
+            },
+            0.0,
+            false,
+        );
+        let states = synthesize_wide_band_crossover_states(
+            &WideBandIsolatedPaths {
+                left_main: main.clone(),
+                right_main: main,
+                sub,
+            },
+            &WideBandSynthesisConfig {
+                candidate_crossovers_hz: vec![50.0, 110.0],
+                sub_measured_low_pass_hz: None,
+                main_high_pass: CrossoverAlignment::LinkwitzRiley4,
+                sub_low_pass: CrossoverAlignment::LinkwitzRiley4,
+            },
+        )
+        .unwrap();
+        let report = optimize_separated_paths(
+            &states,
+            &SeparatedPathOptimizationConfig {
+                measured_main_delay_ms: 0.0,
+                measured_polarity: Polarity::Normal,
+                delay_minimum_ms: -5.0,
+                delay_maximum_ms: 5.0,
+                delay_step_ms: 0.5,
+                synthesized_crossover_model: Some("LR4/LR4".into()),
+                crossover_regularization_db_per_octave:
+                    SEPARATED_PATH_CROSSOVER_REGULARIZATION_DB_PER_OCTAVE,
+                ranking: RankingConfig::default(),
+            },
+        )
+        .unwrap();
+        let best_low = report
+            .ranking
+            .rankings
+            .iter()
+            .find(|candidate| candidate.settings.crossover_hz == 50.0)
+            .unwrap();
+        let best_high = report
+            .ranking
+            .rankings
+            .iter()
+            .find(|candidate| candidate.settings.crossover_hz == 110.0)
+            .unwrap();
+        assert!(
+            best_high.metrics.deficit_rms_db > best_low.metrics.deficit_rms_db + 0.1,
+            "the sub's own dip must charge the crossover that exposes it: high {} vs low {}",
+            best_high.metrics.deficit_rms_db,
+            best_low.metrics.deficit_rms_db
+        );
+        assert_eq!(report.ranking.rankings[0].settings.crossover_hz, 50.0);
+        // The winner's reported trim is the deployment calibration, roughly
+        // cancelling the +10 dB surplus.
+        let trim = report.ranking.rankings[0].settings.sub_level_db.unwrap();
+        assert!((-13.0..=-7.0).contains(&trim), "{trim}");
+    }
+
+    #[test]
+    fn the_arrival_window_ignores_a_narrow_band_alias() {
+        // The sub's phase is a clean 3 ms delay below 90 Hz but rides an
+        // extra offset (11 ms) above it - the shape a plate filter plus room
+        // reflections produce. A per-crossover octave band around a high
+        // candidate sees mostly the aliased region and centres the delay
+        // window a bass period away from the true alignment (the real
+        // session's 12-15 ms recommendations); the shared 20 Hz-to-2x-max
+        // band must keep every window on the multi-octave-coherent 3 ms.
+        let main = shaped_response(|_| 0.0, 0.0, false);
+        let frequencies_hz = grid();
+        let sub = CombinedResponse {
+            magnitude_db: frequencies_hz
+                .iter()
+                .map(|frequency| -24.0 * (frequency / 150.0).log2().max(0.0))
+                .collect(),
+            phase_rad: Some(
+                frequencies_hz
+                    .iter()
+                    .map(|frequency| {
+                        let delay_ms = if *frequency < 90.0 { 3.0 } else { 11.0 };
+                        -2.0 * PI * frequency * delay_ms / 1_000.0
+                    })
+                    .collect(),
+            ),
+            timing: None,
+            frequencies_hz,
+        };
+        let states = synthesize_wide_band_crossover_states(
+            &WideBandIsolatedPaths {
+                left_main: main.clone(),
+                right_main: main,
+                sub,
+            },
+            &WideBandSynthesisConfig {
+                candidate_crossovers_hz: vec![40.0, 140.0],
+                sub_measured_low_pass_hz: None,
+                main_high_pass: CrossoverAlignment::LinkwitzRiley4,
+                sub_low_pass: CrossoverAlignment::LinkwitzRiley4,
+            },
+        )
+        .unwrap();
+        let report = optimize_separated_paths(
+            &states,
+            &SeparatedPathOptimizationConfig {
+                measured_main_delay_ms: 0.0,
+                measured_polarity: Polarity::Normal,
+                delay_minimum_ms: -10.0,
+                delay_maximum_ms: 25.0,
+                delay_step_ms: 0.5,
+                synthesized_crossover_model: Some("LR4/LR4".into()),
+                crossover_regularization_db_per_octave:
+                    SEPARATED_PATH_CROSSOVER_REGULARIZATION_DB_PER_OCTAVE,
+                ranking: RankingConfig::default(),
+            },
+        )
+        .unwrap();
+        for estimate in &report.arrival_estimates {
+            assert!(
+                (estimate.center_ms - 3.0).abs() <= 1.0,
+                "{} Hz window centred at {}",
+                estimate.crossover_hz,
+                estimate.center_ms
+            );
+        }
+        let spread =
+            (report.arrival_estimates[0].center_ms - report.arrival_estimates[1].center_ms).abs();
+        assert!(spread < 0.2, "band-inconsistent centres: {spread}");
+        let winner_delay = report.ranking.rankings[0].settings.main_delay_ms.unwrap();
+        assert!((winner_delay - 3.0).abs() <= 1.0, "{winner_delay}");
+    }
+
+    #[test]
+    fn wide_band_candidates_above_the_measured_low_pass_are_rejected() {
+        let flat = shaped_response(|_| 0.0, 0.0, false);
+        let paths = WideBandIsolatedPaths {
+            left_main: flat.clone(),
+            right_main: flat.clone(),
+            sub: flat.clone(),
+        };
+        let error = synthesize_wide_band_crossover_states(
+            &paths,
+            &WideBandSynthesisConfig {
+                candidate_crossovers_hz: vec![80.0, 300.0],
+                sub_measured_low_pass_hz: Some(250.0),
+                main_high_pass: CrossoverAlignment::LinkwitzRiley4,
+                sub_low_pass: CrossoverAlignment::LinkwitzRiley4,
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("exceeds"), "{error}");
+        let error = synthesize_wide_band_crossover_states(
+            &paths,
+            &WideBandSynthesisConfig {
+                candidate_crossovers_hz: vec![80.0],
+                sub_measured_low_pass_hz: Some(250.0),
+                main_high_pass: CrossoverAlignment::LinkwitzRiley4,
+                sub_low_pass: CrossoverAlignment::LinkwitzRiley4,
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("2 to 12"), "{error}");
+        // A genuinely bypassed measurement low-pass has nothing to replace,
+        // so candidates are limited only by the product crossover range.
+        assert!(synthesize_wide_band_crossover_states(
+            &paths,
+            &WideBandSynthesisConfig {
+                candidate_crossovers_hz: vec![80.0, 300.0],
+                sub_measured_low_pass_hz: None,
+                main_high_pass: CrossoverAlignment::LinkwitzRiley4,
+                sub_low_pass: CrossoverAlignment::LinkwitzRiley4,
+            },
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn the_low_pass_substitution_never_amplifies_below_the_measured_corner() {
+        // |LP(x, f)| <= |LP(f_meas, f)| for x <= f_meas at every frequency
+        // and same alignment, so replacing the wide measurement filter with a
+        // candidate filter can only attenuate measurement noise, never raise
+        // it. This is the numerical-safety argument for the division.
+        for alignment in [
+            CrossoverAlignment::LinkwitzRiley4,
+            CrossoverAlignment::LinkwitzRiley2,
+            CrossoverAlignment::Butterworth2,
+        ] {
+            for candidate_hz in [40.0, 120.0, 250.0] {
+                for index in 0..300 {
+                    let frequency_hz = 5.0 * 2.0_f64.powf(index as f64 / 30.0);
+                    let ratio = complex_divide(
+                        low_pass_response(alignment, candidate_hz, frequency_hz),
+                        low_pass_response(alignment, 250.0, frequency_hz),
+                    );
+                    assert!(
+                        ratio.0.hypot(ratio.1) <= 1.0 + 1.0e-12,
+                        "{alignment:?} {candidate_hz} Hz at {frequency_hz} Hz"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_too_fine_delay_step_refines_in_two_stages_instead_of_failing() {
+        // 0.01 ms across the 40 Hz candidate's ~25 ms arrival window needs
+        // ~2,500 values - over the 1,001 per-window cap that v2 rejected
+        // outright. v3 coarsens stage 1 (3x -> 0.03 ms here) and then
+        // restores the full 0.01 ms resolution around each crossover's best,
+        // so the planted 2.00 ms offset - not itself a 0.03 ms multiple -
+        // must still be recovered exactly.
+        let paths = [
+            separated_crossover("xo40", 40.0, 2.0),
+            separated_crossover("xo80", 80.0, 2.0),
+        ];
+        let report = optimize_separated_paths(
+            &paths,
+            &SeparatedPathOptimizationConfig {
+                measured_main_delay_ms: 0.0,
+                measured_polarity: Polarity::Normal,
+                delay_minimum_ms: -10.0,
+                delay_maximum_ms: 25.0,
+                delay_step_ms: 0.01,
+                synthesized_crossover_model: None,
+                crossover_regularization_db_per_octave:
+                    SEPARATED_PATH_CROSSOVER_REGULARIZATION_DB_PER_OCTAVE,
+                ranking: RankingConfig::default(),
+            },
+        )
+        .unwrap();
+        let best = &report.ranking.rankings[0];
+        let delay = best.settings.main_delay_ms.unwrap();
+        assert!((delay - 2.0).abs() < 1.0e-6, "{delay}");
+        assert_eq!(best.settings.polarity, Some(Polarity::Inverted));
+        assert!(report
+            .ranking
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("two stages")));
+        // The aggregate is far beyond what a single v2 grid could have held
+        // per window, yet each stage stayed inside the caps.
+        assert!(
+            report.synthesized_candidate_count > 2_000,
+            "{}",
+            report.synthesized_candidate_count
+        );
+    }
+
     #[test]
     fn isolated_path_search_rejects_unsafe_or_underspecified_grids() {
         let one = [separated_crossover("xo80", 80.0, -6.0)];
@@ -2016,6 +3426,9 @@ mod tests {
             delay_minimum_ms: 0.0,
             delay_maximum_ms: 1.0,
             delay_step_ms: 0.3,
+            synthesized_crossover_model: None,
+            crossover_regularization_db_per_octave:
+                SEPARATED_PATH_CROSSOVER_REGULARIZATION_DB_PER_OCTAVE,
             ranking: RankingConfig::default(),
         };
         assert!(optimize_separated_paths(&one, &config)

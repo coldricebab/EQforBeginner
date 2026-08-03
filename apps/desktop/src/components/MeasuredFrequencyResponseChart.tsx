@@ -1,7 +1,10 @@
 import { useId, useMemo, useState } from "react";
 import type { Messages } from "../i18n";
 import {
+  bandMedianDb,
   buildPath,
+  DISPLAY_ALIGNMENT_HIGH_HZ,
+  DISPLAY_ALIGNMENT_LOW_HZ,
   linearY,
   logX,
   type ChartBounds,
@@ -24,6 +27,13 @@ const CURVES: readonly CurveKind[] = [
   "verified",
 ];
 const CHANNELS: readonly DisplayChannel[] = ["left", "right", "average"];
+/**
+ * Upper bound of the zoomed view, matching what its button says (20–500 Hz).
+ * It cannot be derived from `correctionHighHz`: SECS reports the full 20 kHz
+ * band as its correction range, which collapsed the zoomed view onto the
+ * full-band one.
+ */
+const ZOOM_MAXIMUM_HZ = 500;
 
 function frequencyLabel(frequencyHz: number): string {
   if (frequencyHz >= 1_000) {
@@ -117,7 +127,41 @@ export function MeasuredFrequencyResponseChart({ copy, data }: Props) {
   );
   const maximumFrequency = fullBand
     ? (data.frequenciesHz.at(-1) ?? data.taperEndHz)
-    : data.correctionHighHz;
+    : Math.min(data.correctionHighHz, ZOOM_MAXIMUM_HZ);
+  // Display-only level alignment. A mixed-phase SECS filter attenuates
+  // broadly, so its predicted and verified traces sit well below the raw
+  // measurement and the shapes become hard to compare even though the level
+  // difference is just playback gain. Each curve gets ONE scalar offset,
+  // taken from its own spatial-average trace over the shared 200-500 Hz
+  // reference band, so curve shapes and L/R differences within a curve are
+  // untouched. The applied offsets are printed under the chart - the level
+  // difference is real, it is only moved out of the way, and the numerical
+  // gates never see this.
+  const alignmentOffsetsDb = useMemo(() => {
+    const offsets: Record<CurveKind, number> = {
+      raw: 0,
+      target: 0,
+      predicted: 0,
+      verified: 0,
+    };
+    const reference = bandMedianDb(
+      data.frequenciesHz,
+      data.rawAverageDb,
+      DISPLAY_ALIGNMENT_LOW_HZ,
+      DISPLAY_ALIGNMENT_HIGH_HZ,
+    );
+    if (reference === null) return offsets;
+    for (const curve of CURVES) {
+      const median = bandMedianDb(
+        data.frequenciesHz,
+        series(data, curve, "average"),
+        DISPLAY_ALIGNMENT_LOW_HZ,
+        DISPLAY_ALIGNMENT_HIGH_HZ,
+      );
+      offsets[curve] = median === null ? 0 : reference - median;
+    }
+    return offsets;
+  }, [data]);
   const activeSeries = useMemo(
     () =>
       availableCurves.flatMap((curve) =>
@@ -126,10 +170,12 @@ export function MeasuredFrequencyResponseChart({ copy, data }: Props) {
         ).map((channel) => ({
           curve,
           channel,
-          values: series(data, curve, channel),
+          values: series(data, curve, channel).map(
+            (value) => value + alignmentOffsetsDb[curve],
+          ),
         })),
       ),
-    [availableCurves, data, visibleChannels, visibleCurves],
+    [alignmentOffsetsDb, availableCurves, data, visibleChannels, visibleCurves],
   );
   const visibleLevels = activeSeries.flatMap(({ values }) =>
     values.filter(
@@ -178,8 +224,21 @@ export function MeasuredFrequencyResponseChart({ copy, data }: Props) {
       frequency,
       level: values[index],
     }));
-  const markerLevel = (frequencyHz: number) =>
-    nearestLevel(data.frequenciesHz, data.rawAverageDb, frequencyHz);
+  const markerLevel = (frequencyHz: number) => {
+    const level = nearestLevel(
+      data.frequenciesHz,
+      data.rawAverageDb,
+      frequencyHz,
+    );
+    return level === null ? null : level + alignmentOffsetsDb.raw;
+  };
+  const alignmentSummary = availableCurves
+    .filter((curve) => Math.abs(alignmentOffsetsDb[curve]) >= 0.05)
+    .map(
+      (curve) =>
+        `${copy[curve]} ${alignmentOffsetsDb[curve] >= 0 ? "+" : ""}${alignmentOffsetsDb[curve].toFixed(1)} dB`,
+    )
+    .join(" · ");
   const smoothingDenominator = Math.round(
     1 / data.displaySmoothingFwhmOctaves,
   );
@@ -436,6 +495,14 @@ export function MeasuredFrequencyResponseChart({ copy, data }: Props) {
         </span>
       </div>
       <p className="measured-response-chart__scope">{copy.scopeNote}</p>
+      {alignmentSummary !== "" && (
+        <p className="measured-response-chart__scope">
+          {copy.levelAlignment
+            .replace("{low}", DISPLAY_ALIGNMENT_LOW_HZ.toFixed(0))
+            .replace("{high}", DISPLAY_ALIGNMENT_HIGH_HZ.toFixed(0))
+            .replace("{offsets}", alignmentSummary)}
+        </p>
+      )}
     </section>
   );
 }

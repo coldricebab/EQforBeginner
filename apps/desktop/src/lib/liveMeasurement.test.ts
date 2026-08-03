@@ -4,10 +4,13 @@ import {
   acceptedPairCount,
   captureKey,
   classifyLiveCaptureIssues,
+  expectedSubTripletCount,
   formatMetric,
   hasAcceptedP0,
   liveWizardStages,
   parseCrossoverCandidates,
+  WIDE_BAND_MAIN_POSITION_ID,
+  WIDE_BAND_SUB_POSITION_ID,
   type LiveCaptureKind,
   type LiveCaptureSummary,
   type LiveSubwooferSearchSummary,
@@ -156,6 +159,7 @@ describe("live measurement workflow helpers", () => {
   it("counts a crossover only after both mains and the required sub sweep pass", () => {
     const search: LiveSubwooferSearchSummary = {
       algorithmVersion: "test-plan-v1",
+      mode: "measured_states",
       candidates: [
         { id: "XO01", crossoverHz: 70 },
         { id: "XO02", crossoverHz: 90 },
@@ -166,6 +170,9 @@ describe("live measurement workflow helpers", () => {
       delayMinimumMs: 0,
       delayMaximumMs: 5,
       delayStepMs: 0.05,
+      subMeasuredLowPassHz: null,
+      mainHighPassSlope: null,
+      subLowPassSlope: null,
       fixedTimingReferenceChannel: "right",
       subSweepChannel: "left",
       planPath: "/tmp/plan.json",
@@ -193,6 +200,41 @@ describe("live measurement workflow helpers", () => {
       "XO01",
       "left",
     );
+    expect(acceptedSubTripletCount(captures, search)).toBe(1);
+    expect(expectedSubTripletCount(search)).toBe(2);
+  });
+
+  it("treats the wide-band plan as one shared capture triplet", () => {
+    const search: LiveSubwooferSearchSummary = {
+      algorithmVersion: "test-plan-v2",
+      mode: "wide_band",
+      candidates: [
+        { id: "XO01", crossoverHz: 60 },
+        { id: "XO02", crossoverHz: 90 },
+      ],
+      measuredMainDelayMs: 0,
+      measuredPolarityDegrees: 0,
+      fixedSubLevelDb: 0,
+      delayMinimumMs: -10,
+      delayMaximumMs: 25,
+      delayStepMs: 0.1,
+      subMeasuredLowPassHz: 250,
+      mainHighPassSlope: "lr4",
+      subLowPassSlope: "lr4",
+      fixedTimingReferenceChannel: "right",
+      subSweepChannel: "left",
+      planPath: "/tmp/plan.json",
+    };
+    expect(expectedSubTripletCount(search)).toBe(1);
+    const captures: Record<string, LiveCaptureSummary> = {
+      [captureKey("sub_main_only", WIDE_BAND_MAIN_POSITION_ID, "left")]:
+        capture("sub_main_only", WIDE_BAND_MAIN_POSITION_ID, "left"),
+      [captureKey("sub_main_only", WIDE_BAND_MAIN_POSITION_ID, "right")]:
+        capture("sub_main_only", WIDE_BAND_MAIN_POSITION_ID, "right"),
+    };
+    expect(acceptedSubTripletCount(captures, search)).toBe(0);
+    captures[captureKey("sub_only", WIDE_BAND_SUB_POSITION_ID, "left")] =
+      capture("sub_only", WIDE_BAND_SUB_POSITION_ID, "left");
     expect(acceptedSubTripletCount(captures, search)).toBe(1);
   });
 });

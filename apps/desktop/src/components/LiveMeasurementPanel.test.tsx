@@ -7,8 +7,10 @@ import {
   SUBWOOFER_DELAY_DEFAULTS,
   SweepChannelAnalysis,
   TargetCurveSelector,
+  WIDE_BAND_SEARCH_DEFAULTS,
   ZipDownloadControl,
 } from "./LiveMeasurementPanel";
+import { parseCrossoverCandidates } from "../lib/liveMeasurement";
 
 describe("LiveMeasurementPanel", () => {
   it("starts the sub delay search wide enough for a beginner to get a real answer", () => {
@@ -45,6 +47,29 @@ describe("LiveMeasurementPanel", () => {
     expect(minimum).toBeGreaterThanOrEqual(-20);
     expect(maximum).toBeLessThanOrEqual(50);
     expect(step).toBeLessThanOrEqual(5);
+  });
+
+  it("ships wide-band defaults the backend accepts and hardware can dial", () => {
+    const candidates = parseCrossoverCandidates(
+      WIDE_BAND_SEARCH_DEFAULTS.crossoverCandidates,
+    );
+    // 2-12 ascending 30-200 Hz values, all multiples of the 10 Hz steps
+    // consumer bass management offers.
+    expect(candidates).not.toBeNull();
+    expect(candidates!.length).toBeGreaterThanOrEqual(2);
+    expect(candidates!.length).toBeLessThanOrEqual(12);
+    for (const candidate of candidates!) {
+      expect(candidate % 10).toBe(0);
+    }
+    // Every default candidate must sit at or below the default measured dial,
+    // or the backend rejects the plan (the low-pass replacement ratio would
+    // amplify noise above the dial).
+    const dial = Number(WIDE_BAND_SEARCH_DEFAULTS.subMeasuredLowPassHz);
+    expect(dial).toBeGreaterThanOrEqual(120);
+    expect(dial).toBeLessThanOrEqual(500);
+    expect(Math.max(...candidates!)).toBeLessThanOrEqual(dial);
+    // LR4 is the declared default slope on both branches.
+    expect(WIDE_BAND_SEARCH_DEFAULTS.slope).toBe("lr4");
   });
 
   it("requires an explicit 2.0 or 2.1 choice before starting the live flow", () => {

@@ -68,7 +68,8 @@ Run this only in the native Tauri app; the browser preview cannot open the micro
    different LUFS gain to each sweep file, silently breaking the main-to-sub relative
    level that the crossover comparison depends on. The app cross-checks the timing
    markers' RMS across every isolated capture and refuses the search beyond a 0.3 dB
-   spread.
+   spread (0.5 dB in wide-band mode, where the wide dial's high-pass attenuates the
+   marker band by a bounded amount on one capture).
 6. Pipeline order and chain invariants (2.1): the crossover search (isolated
    captures) must be finished and its winner confirmed on the hardware **before**
    any multi-seat baseline capture, and every baseline/verification sweep is a
@@ -81,13 +82,38 @@ Run this only in the native Tauri app; the browser preview cannot open the micro
    verification measurement (the app enforces this by dropping them), so plan
    to lock the 2.1 settings first.
 7. For a 2.1 project, complete **2.1 sub integration settings** before Raw capture.
-   Enter 2–12 ascending crossover values that the hardware can actually apply (3–5 is
-   the recommended session size: every candidate costs three sweeps, so 12 candidates
-   mean 36 captures at one microphone position), plus
-   the main-relative delay, 0/180-degree polarity, and sub level that are active during
-   all isolated measurements. The app rejects a one-crossover plan because it cannot
-   identify a crossover preference. It also requires both uploaded sweep WAVs to carry
-   their start/end markers on the same fixed L or R reference speaker.
+   Pick a search mode, then enter 2–12 ascending crossover values that the hardware
+   can actually apply, plus the main-relative delay, 0/180-degree polarity, and sub
+   level that are active during all isolated measurements. The app rejects a
+   one-crossover plan because it cannot identify a crossover preference. It also
+   requires both uploaded sweep WAVs to carry their start/end markers on the same
+   fixed L or R reference speaker.
+
+   **Wide-band mode (default, three sweeps total).** The sub is captured once with
+   the bass-management crossover dialed to its maximum (enter that dial value;
+   120–500 Hz, and every candidate must stay at or below it), and both mains are
+   captured once with the sub output off, which removes the speaker high-pass and
+   makes them full range. Each candidate crossover state is then *synthesized*: the
+   mains are multiplied by the declared high-pass model and the sub by the declared
+   low-pass model divided by the same model at the measured dial - a replacement,
+   not a second filter on top, because the wide dial's ~1.8 ms of low-frequency
+   group delay (LR4 at 250 Hz) would otherwise bias the delay recommendation by
+   about that much. With the same alignment and candidates at or below the dial the
+   replacement ratio never exceeds unity at any frequency, so it cannot amplify
+   measurement noise. Declare the slopes your device really applies (WiiM Amp
+   Ultra: LR4/LR4, the default); if the true slopes differ - especially 12 versus
+   24 dB/oct, which flips the relative phase at the crossover - the delay and
+   polarity recommendation can be wrong, and the report says so. Leave any low-pass
+   knob on the subwoofer itself at maximum/bypass during the capture *and* in
+   normal listening, since it is part of the measured sub response. The
+   cross-capture marker-level gate widens from 0.3 to 0.5 dB in this mode because
+   the wide dial's high-pass attenuates the reference speaker's >=650 Hz marker
+   band by a bounded ~0.2 dB.
+
+   **Measured-states mode (model-free fallback, three sweeps per candidate).** Every
+   candidate crossover is physically configured and measured; no filter model is
+   assumed. Use it when the device's slopes are unknown or unusual. 3–5 candidates
+   are the practical session size there (12 candidates mean 36 captures).
 
    The delay minimum, maximum, and step describe **what the amplifier can do**, not
    what to search. The search measures where the sub actually arrives and then looks
@@ -99,25 +125,39 @@ Run this only in the native Tauri app; the browser preview cannot open the micro
    at 80 Hz), and 0.1 ms is a step real amplifiers can be set to. Narrow them only to
    match a specific amplifier's limits; if the window is clipped the result reports
    `range_limited` rather than silently searching less.
-   At P0, perform L main-only, R main-only, and sub-only captures for every crossover:
+   At P0, perform the isolated captures (three total in wide-band mode; per crossover
+   in measured-states mode):
 
    - Power the amplifier off and wait before disconnecting or reconnecting speaker
      cables. Never handle a live amplifier output.
-   - For main-only, disable/disconnect the sub path; the opposite main may remain
+   - For the main captures, wide-band mode turns the sub *output* off (no signal can
+     reach the sub, and the mains play full range); measured-states mode
+     disables/disconnects the sub path per crossover. The opposite main may remain
      connected because it emits only the out-of-sweep timing marker.
-   - For sub-only, play the channel opposite the fixed timing-reference speaker.
-     Disconnect that channel's main while leaving the fixed-reference main connected
-     for the markers. With the bundled `*_refR.wav` files, play the L WAV and retain
-     the R main as the marker speaker.
-   - Restore the same measured delay, polarity, sub level, amplifier volume, microphone
-     gain, and P0 microphone position for every triplet.
+   - For the sub capture, play the channel opposite the fixed timing-reference
+     speaker. Mute or disconnect that channel's main while leaving the
+     fixed-reference main connected for the markers. With the bundled `*_refR.wav`
+     files, play the L WAV and retain the R main as the marker speaker.
+   - Keep the same measured delay, polarity, sub level, amplifier volume, microphone
+     gain, and P0 microphone position for every capture, and keep the volume
+     identical across the sub-output toggle in wide-band mode.
 
-   The app then reuses the Phase 3 scorer to rank physically measured crossover states
-   and synthesized main-delay/0/180-degree polarity alternatives. It does not synthesize
-   an unmeasured crossover filter and does not search sub level. Apply the displayed
-   recommendation manually and confirm it. The subsequent Raw P0 L+Sub/R+Sub captures
-   are mandatory combined-path evidence, not optional cleanup. Stereo projects skip
-   this stage.
+   The app then ranks the crossover states (measured or synthesized as declared
+   above) against synthesized main-delay/0/180-degree polarity alternatives with a
+   level-neutral splice objective: each candidate is first scored with its sub
+   level-matched into the mains' midband (the calibration you will apply at
+   deployment; the trim is part of the recommendation and shown per entry), and is
+   then charged only where its summed response falls below its own louder branch or
+   its own midband anchor, so a sub captured hotter than the mains can neither buy
+   the ranking with bandwidth nor hide its own dips behind the surplus. The delay
+   window is anchored on the lowest crossover's unambiguous arrival estimate
+   (keep at least one candidate at or below 50 Hz). The sub level is never varied
+   to improve a score. A negative recommended main delay means the same alignment
+   is dialed as a positive delay on the subwoofer output instead.
+   Apply the displayed recommendation manually and confirm it. The subsequent Raw P0 L+Sub/R+Sub captures
+   are mandatory combined-path evidence, not optional cleanup - in wide-band mode
+   they are also the first measurement of the hardware's real filters at the chosen
+   crossover. Stereo projects skip this stage.
 8. Keep crossover, delay, polarity/phase, sub level, amplifier volume, and microphone
    gain unchanged. Keep the microphone upright in the same 90-degree orientation.
    In 2.1, each L or R playback must keep the normal bass-managed sub path active, so

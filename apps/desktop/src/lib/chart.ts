@@ -51,6 +51,44 @@ export function buildPath(
     .join(" ");
 }
 
+/**
+ * Reference band for display-only level alignment of the result curves. It
+ * matches the 200–500 Hz anchor the DSP core already uses for level-neutral
+ * comparisons: above most room modes, below the correction taper, and
+ * present in both chart views.
+ */
+export const DISPLAY_ALIGNMENT_LOW_HZ = 200;
+export const DISPLAY_ALIGNMENT_HIGH_HZ = 500;
+
+/**
+ * Median level over an inclusive frequency band, or `null` when the band
+ * holds no finite sample. The median (not the mean) keeps a single deep
+ * modal dip inside the band from dragging the alignment.
+ */
+export function bandMedianDb(
+  frequenciesHz: readonly number[],
+  levelsDb: readonly number[],
+  lowHz: number,
+  highHz: number,
+): number | null {
+  const values = frequenciesHz
+    .map((frequency, index) => ({ frequency, level: levelsDb[index] }))
+    .filter(
+      ({ frequency, level }) =>
+        frequency >= lowHz &&
+        frequency <= highHz &&
+        typeof level === "number" &&
+        Number.isFinite(level),
+    )
+    .map(({ level }) => level)
+    .sort((a, b) => a - b);
+  if (values.length === 0) return null;
+  const middle = Math.floor(values.length / 2);
+  return values.length % 2 === 1
+    ? values[middle]
+    : 0.5 * (values[middle - 1] + values[middle]);
+}
+
 export function geometricFrequencies(
   minFrequency: number,
   maxFrequency: number,

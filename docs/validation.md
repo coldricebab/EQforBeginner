@@ -44,8 +44,15 @@ Accepted-cache restore is fail closed. It scans prior projects newest-first and 
 the first accepted snapshot for each measurement kind/position/channel key, allowing
 older compatible projects only to fill keys missing from newer ones. Every contributing
 project must have exact system mode, microphone device/channel, calibration SHA-256,
-channel-specific sweep SHA-256, manual single-sub settings/search plan, sample rate,
-project format, and deconvolution version. It rejects missing raw WAVs,
+channel-specific sweep SHA-256, sample rate, project format, and deconvolution version.
+Separated-path plan compatibility is capture-relevant rather than whole-plan: the
+hardware state held during the isolated captures (measured delay, polarity, sub level)
+and the marker/sweep routing must match exactly, a wide-band sub capture additionally
+binds to the low-pass dial it was made through, and a measured-mode capture binds to
+its own candidate's physical crossover - while the candidate list (wide-band), delay
+search range/step, and slope models are pure search/synthesis parameters that may
+change freely over the same captures. Baseline restore binds to the confirmed hardware
+setup, not to the search plan. It rejects missing raw WAVs,
 non-finite/inconsistent arrays, failed snapshots, verification snapshots, and paths
 outside their source project.
 The legacy isolated-recognizer result (no longer mounted as a product panel) is fixed
@@ -229,7 +236,7 @@ warning.
 
 ### Live separated-path search gates
 
-The live `phase3-separated-path-delay-polarity-search-v2` adapter additionally fails
+The live `phase3-separated-path-delay-polarity-search-v4` adapter additionally fails
 closed unless all of the following hold:
 
 - 2–12 unique, strictly increasing real crossover settings are declared in the
@@ -254,16 +261,50 @@ closed unless all of the following hold:
   calibration hash, sweep hash, microphone device, and input channel.
 - Every response has finite magnitude and phase on one exact common grid with at least
   three admitted bins.
-- Delay bounds/step are finite, increasing, exact-step divisible, limited to 1,001
-  values, and the complete crossover/delay/polarity search remains at or below 10,000
-  candidates.
+- Delay bounds and step are finite and increasing. Each candidate's arrival-centred
+  half-period window holds at most 1,001 step-snapped values and the complete
+  crossover/delay/polarity search at most 10,000 candidates. A step too fine for
+  those caps is not refused: the run-time grid coarsens the stage-one scan to the
+  finest step multiple that fits and then refines at the full requested resolution
+  around each crossover's stage-one optimum, reporting the two-stage run as a
+  warning.
+
+In the wide-band search mode (`phase3-wide-band-crossover-synthesis-v1`) the same
+adapter instead enforces:
+
+- The plan must declare both filter-slope models (LR4/LR2/BW2 per branch); a
+  measured-states plan with model fields, or a wide plan without them, is rejected.
+- The dial value entered for the sub capture must be finite in 120–500 Hz and every
+  candidate crossover must sit at or below it, because the low-pass replacement
+  ratio `LP(candidate)/LP(dial)` is bounded by unity only in that direction; above
+  the dial it would amplify measurement noise.
+- Exactly three capture roles exist: `FULL` L/R mains (kind `sub_main_only`) and one
+  `WIDE` sub (kind `sub_only`, opposite the marker speaker). The measured-mode
+  `XO##` vocabulary is rejected while a wide plan is active, and vice versa.
+- The sub-only leakage check is judged against the dial instead of a candidate
+  crossover; with the dial at 250 Hz its 2.2x checked band exceeds the 500 Hz
+  analysis cap and the check honestly skips (protocol muting is the remaining
+  guard), and a declared bypass has no corner to judge against.
+- A full-range main legitimately contains deep bass, so the main-only sub-band
+  leakage test does not apply (the sub output being off also means no signal can
+  reach the sub). Instead, a main whose 40–100 Hz mean sits more than 30 dB below
+  its own 200–500 Hz anchor is flagged `main_full_range_low_band_missing` as a
+  non-rejecting diagnostic - it usually means bass management was left on, but a
+  small speaker's natural rolloff can approach the same shape, so it never rejects.
+- The cross-capture start-marker level gate widens from 0.3 to 0.5 dB, because the
+  wide dial's high-pass attenuates the reference speaker's >=650 Hz marker band by
+  a bounded ~0.2 dB on the sub capture only; a real volume change still trips it.
 
 Changing the plan, sweep, calibration, or any isolated capture invalidates the ranking
 and applied-setting evidence. When a ranking exists, the backend accepts only its exact
-crossover, delay, polarity, and fixed sub level as the user-declared hardware state.
+crossover, delay, and polarity, and a sub level within 0.5 dB of the recommended one
+(the measured level plus the winner's deployment trim; the tolerance covers level-dial
+granularity) as the user-declared hardware state.
 It then preserves the isolated evidence but still requires new combined Raw captures.
 The live UI labels this a predicted recommendation because a numerical
-predicted-versus-combined confirmation gate is not yet implemented.
+predicted-versus-combined confirmation gate is not yet implemented; in wide-band mode
+the report additionally warns that the recommendation inherits the declared slope
+models rather than per-state measurements.
 
 ### Current measured-fixture regression
 
@@ -444,7 +485,13 @@ same weighted spatial energy averages used by Phase 4 validation; Target is eval
 on the full retained grid with the exact per-channel alignment offsets; Verified is
 the newly captured filtered P0 L/R magnitude. Raw, Predicted, and Verified are
 Gaussian-smoothed at 1/12-octave FWHM on the bounded output grid for display only;
-Target is interpolated without smoothing. This transformation does not feed any RMSE,
+Target is interpolated without smoothing. The chart additionally applies one scalar
+level offset per curve before drawing, so that each curve's 200-500 Hz median sits on
+the Raw curve's: a mixed-phase SECS filter attenuates broadly, which otherwise pushes
+its Predicted and Verified traces off the readable range even though the difference is
+playback gain. The offset is per curve (not per channel), so curve shapes and the L/R
+difference inside a curve are unchanged, and the applied values are printed under the
+chart. This transformation does not feed any RMSE,
 protected-dip, headroom, binding, or export gate. All 12 displayed series must:
 
 - share one finite, strictly increasing log-spaced result grid;
