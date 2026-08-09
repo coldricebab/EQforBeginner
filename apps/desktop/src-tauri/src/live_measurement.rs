@@ -30,8 +30,10 @@ use eqforbeginner_dsp_core::phase6::{
     Phase6DesignIntent, Phase6NativeResult, PHASE6_ALGORITHM_VERSION, ROON_NATIVE_SAMPLE_RATES,
 };
 use eqforbeginner_dsp_core::secs::{
-    design_secs_stereo_filter, secs_next_fast_len, secs_resample_poly, SecsConfig,
-    SecsResolutionMode, SECS_ALGORITHM_VERSION, SECS_AUTO_DELAY_MAX_MS, SECS_AUTO_DELAY_MIN_MS,
+    design_secs_stereo_filter, secs_auto_delay_ceiling_ms, secs_filter_group_delay_report,
+    secs_next_fast_len, secs_resample_poly, SecsConfig, SecsResolutionMode, SECS_ALGORITHM_VERSION,
+    SECS_AUTO_DELAY_MAX_MS, SECS_AUTO_DELAY_MIN_MS, SECS_MAXIMUM_DELAY_CEILING_MS,
+    SECS_PHASE_GUARD_VERSION,
 };
 use eqforbeginner_dsp_core::smoothing::gaussian_log_frequency_smooth_at_db;
 use eqforbeginner_dsp_core::spatial::weighted_energy_average_db;
@@ -49,7 +51,8 @@ use eqforbeginner_dsp_core::target::{
 };
 use eqforbeginner_dsp_core::validation::{
     fft_convolve, log_frequency_smoothed_curve, log_frequency_smoothed_rmse_db,
-    validate_frequency_prediction, ValidationIssue, ValidationReport, ValidationThresholds,
+    program_material_peak_growth_db, validate_frequency_prediction, ValidationIssue,
+    ValidationReport, ValidationThresholds,
 };
 use eqforbeginner_dsp_core::wireless_sweep::{
     recognize_wireless_sweep, WirelessClockDriftEvidence, WirelessSweepDetection,
@@ -93,7 +96,11 @@ pub const LIVE_HEADROOM_VERSION: &str = "validation-signal-and-response-peak-v3"
 /// SECS packages add a program-material peak-growth basis on top of v3: a
 /// full-band mixed-phase filter grows broadband time-domain peaks by several
 /// dB even at a ~0 dB response peak (see `secs_program_peak_growth_db`).
-pub const SECS_HEADROOM_VERSION: &str = "validation-signal-and-response-peak-v3+program-peak-v1";
+/// v2 replaced the fixed square-wave grid with a swept adaptive scan after a
+/// real package's growth continuum proved sharper than any fixed grid: the
+/// v1 grid read 7.28 dB while a 70.5 Hz square (an ordinary clipped bass
+/// note) measured 8.6 dB through the same member - past the recommendation.
+pub const SECS_HEADROOM_VERSION: &str = "validation-signal-and-response-peak-v3+program-peak-v2";
 pub const LIVE_RESULT_PLOT_VERSION: &str = "measured-fr-result-plot-v2";
 pub const LIVE_RESULT_PLOT_SMOOTHING_FWHM_OCTAVES: f64 = 1.0 / 12.0;
 pub const LIVE_CAPTURE_ENDPOINT_VERSION: &str = "known-marker-capture-endpoint-v4";
@@ -618,6 +625,11 @@ pub struct LiveMeasurementCacheRestoreSummary {
     pub restored_captures: Vec<LiveCaptureSummary>,
     pub scanned_snapshot_count: usize,
     pub compatible_snapshot_count: usize,
+    /// How many restored measurements were admitted ONLY because the debug
+    /// evidence relaxation was on (mismatched subwoofer conditions or
+    /// microphone). Nonzero means this session's evidence is mixed and must
+    /// not be treated as a clean measurement set.
+    pub debug_relaxed_snapshot_count: usize,
 }
 
 /// Which cached measurement kinds a restore may touch. The dedicated
@@ -685,6 +697,34 @@ pub struct LiveSecsDesignSettings {
     /// stored before this field existed keep meaning what they ran.
     #[serde(default)]
     pub target_curve: LiveSecsTargetCurve,
+    /// Improved-SECS extension (not in SECS.py; the UI defaults it on): the
+    /// phase guard neutralizes excess-phase corrections the causal pre-ring
+    /// window cannot realize (see `SecsConfig::phase_guard`), and the
+    /// designed filter must pass the group-delay gate or the design fails.
+    /// With this off the original algorithm runs bit for bit and a gate
+    /// violation only warns. Defaults to `false` so settings stored before
+    /// this field existed keep meaning what they ran.
+    #[serde(default)]
+    pub improved_phase: bool,
+    /// Ceiling for the design's target delay and low-band pre-ring budget,
+    /// ms. At the SECS.py value (10) everything is original; raising it is a
+    /// music-only trade (latency has no cost without video) that makes late
+    /// bass beyond the 10 ms budget genuinely correctable. When raised, the
+    /// design uses the ceiling as its target delay outright - the automatic
+    /// 2-10 ms search is magnitude-driven and cannot see the phase benefit
+    /// the user is opting into. `None` means automatic: the design probes
+    /// how late the room's own bass actually arrives and resolves the
+    /// smallest ceiling that covers it (a ceiling past the requirement buys
+    /// nothing and only adds early-energy spread and playback lag);
+    /// requires the improved phase path, and resolves to the original 10
+    /// otherwise. Settings stored before this field existed deserialize to
+    /// the original 10 so they keep meaning what they ran.
+    #[serde(default = "default_secs_maximum_delay_ms")]
+    pub maximum_delay_ms: Option<f64>,
+}
+
+fn default_secs_maximum_delay_ms() -> Option<f64> {
+    Some(SECS_AUTO_DELAY_MAX_MS)
 }
 
 impl Default for LiveSecsDesignSettings {
@@ -700,6 +740,12 @@ impl Default for LiveSecsDesignSettings {
             fixed_delay_ms: None,
             multi_position: true,
             target_curve: LiveSecsTargetCurve::Flat,
+            // The product default is the improved path; stored settings
+            // without the field still deserialize to `false` (what they ran).
+            improved_phase: true,
+            // Automatic ceiling: the design measures the room's late-bass
+            // requirement and resolves the smallest covering ceiling.
+            maximum_delay_ms: None,
         }
     }
 }
@@ -774,6 +820,32 @@ fn validate_secs_settings(settings: &LiveSecsDesignSettings) -> Result<(), Strin
     if !(100.0..=5_000.0).contains(&settings.curtain_hz) {
         return Err("SECS curtain must be between 100 and 5000 Hz".to_string());
     }
+    if let Some(maximum_delay_ms) = settings.maximum_delay_ms {
+        if !maximum_delay_ms.is_finite()
+            || !(SECS_AUTO_DELAY_MAX_MS..=SECS_MAXIMUM_DELAY_CEILING_MS).contains(&maximum_delay_ms)
+        {
+            return Err(format!(
+                "SECS maximum delay must be between {SECS_AUTO_DELAY_MAX_MS} and {SECS_MAXIMUM_DELAY_CEILING_MS} ms"
+            ));
+        }
+        if maximum_delay_ms > SECS_AUTO_DELAY_MAX_MS {
+            if settings.latency_mode != LiveSecsLatencyMode::Normal {
+                return Err(
+                    "an extended SECS delay ceiling only applies in the normal (mixed-phase) latency mode"
+                        .to_string(),
+                );
+            }
+            // The extended machinery (bulk-advance split, flat-left window,
+            // budget-aware guard and gate) exists on the improved path only;
+            // the original algorithm at an extended fixed delay reproduces
+            // the measured failure the improvement was built to fix.
+            if !settings.improved_phase {
+                return Err(
+                    "an extended SECS delay ceiling requires the improved phase option".to_string(),
+                );
+            }
+        }
+    }
     match settings.fixed_delay_ms {
         None => {}
         Some(delay) => {
@@ -782,12 +854,22 @@ fn validate_secs_settings(settings: &LiveSecsDesignSettings) -> Result<(), Strin
                     "a fixed SECS delay only applies in the normal latency mode".to_string()
                 );
             }
-            if !delay.is_finite()
-                || !(SECS_AUTO_DELAY_MIN_MS..=SECS_AUTO_DELAY_MAX_MS).contains(&delay)
-            {
+            // With an automatic ceiling the fixed delay itself sets the
+            // budget (the user is choosing the latency by hand), bounded by
+            // the hard ceiling; an extended fixed delay still needs the
+            // improved path, exactly like an extended manual ceiling.
+            let ceiling = settings
+                .maximum_delay_ms
+                .unwrap_or(SECS_MAXIMUM_DELAY_CEILING_MS);
+            if !delay.is_finite() || !(SECS_AUTO_DELAY_MIN_MS..=ceiling).contains(&delay) {
                 return Err(format!(
-                    "SECS fixed delay must be between {SECS_AUTO_DELAY_MIN_MS} and {SECS_AUTO_DELAY_MAX_MS} ms"
+                    "SECS fixed delay must be between {SECS_AUTO_DELAY_MIN_MS} and {ceiling:.0} ms"
                 ));
+            }
+            if delay > SECS_AUTO_DELAY_MAX_MS && !settings.improved_phase {
+                return Err(
+                    "an extended SECS delay ceiling requires the improved phase option".to_string(),
+                );
             }
         }
     }
@@ -795,7 +877,15 @@ fn validate_secs_settings(settings: &LiveSecsDesignSettings) -> Result<(), Strin
 }
 
 /// The SECS design configuration a settings choice produces at one rate.
-fn secs_config_for(settings: &LiveSecsDesignSettings, sample_rate_hz: u32) -> SecsConfig {
+/// `maximum_delay_ms` is the RESOLVED ceiling - an automatic settings value
+/// (`None`) is resolved against the measured pair before this is called, and
+/// the export path replays the resolved value the trial recorded - so taps
+/// sizing and the design budget always reflect what actually runs.
+fn secs_config_for(
+    settings: &LiveSecsDesignSettings,
+    maximum_delay_ms: f64,
+    sample_rate_hz: u32,
+) -> SecsConfig {
     SecsConfig {
         sample_rate_hz,
         max_boost_db: settings.max_boost_db,
@@ -808,7 +898,7 @@ fn secs_config_for(settings: &LiveSecsDesignSettings, sample_rate_hz: u32) -> Se
             LiveSecsResolution::Normal => SecsResolutionMode::Balanced,
             LiveSecsResolution::High => SecsResolutionMode::Precise,
         },
-        taps: ((SECS_AUTO_DELAY_MAX_MS + 500.0) * f64::from(sample_rate_hz) / 1000.0) as usize,
+        taps: ((maximum_delay_ms + 500.0) * f64::from(sample_rate_hz) / 1000.0) as usize,
         hf_min_phase_reference_hz: settings.curtain_hz,
         low_latency: settings.latency_mode == LiveSecsLatencyMode::Low,
         zero_latency: settings.latency_mode == LiveSecsLatencyMode::Zero,
@@ -817,6 +907,8 @@ fn secs_config_for(settings: &LiveSecsDesignSettings, sample_rate_hz: u32) -> Se
         // pure settings-to-config mapping deliberately does not see.
         target_overlay: None,
         shared_low_frequency_hz: None,
+        phase_guard: settings.improved_phase,
+        maximum_delay_ms,
     }
 }
 
@@ -845,6 +937,16 @@ pub struct LiveSecsDesignSummary {
     pub sample_rate_hz: u32,
     pub taps: usize,
     pub auto_delay_ms: f64,
+    /// The delay ceiling the design actually ran with. Equals the settings
+    /// value when one was chosen by hand; with the automatic setting
+    /// (`settings.maximum_delay_ms == None`) this is the resolved result of
+    /// the requirement probe, and the export path replays exactly this value
+    /// so every rate carries the same budget the trial verified.
+    pub maximum_delay_resolved_ms: f64,
+    /// Measured low-band advance requirement (worst channel) when the
+    /// automatic ceiling probe ran; `None` when the ceiling was manual or
+    /// the probe did not apply (original algorithm / low-latency modes).
+    pub delay_requirement_ms: Option<f64>,
     pub low_cutoff_hz: f64,
     pub high_cutoff_hz: f64,
     pub preamp_db: f64,
@@ -856,10 +958,27 @@ pub struct LiveSecsDesignSummary {
     pub right_predicted_rmse_db: f64,
     pub trial_wav_path: String,
     pub trial_zip_path: String,
+    /// Group delay of the designed 48 kHz filter itself, per gate band
+    /// (worst of L/R, relative to the filter's own 1-16 kHz baseline).
+    /// Judged from the taps alone at design time - an all-pass timing defect
+    /// is invisible to every magnitude metric and to per-channel sweeps, so
+    /// this is the only place it can be caught. With `improved_phase` the
+    /// gate is hard (design fails); with the original algorithm it warns.
+    pub group_delay_report: Vec<LiveSecsGroupDelayBand>,
     /// Predicted-only raw/target/predicted display curves (verified curves
     /// empty until a real remeasurement exists).
     pub frequency_response: LiveFrequencyResponsePlot,
     pub warning: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveSecsGroupDelayBand {
+    pub low_hz: f64,
+    pub high_hz: f64,
+    pub group_delay_ms: f64,
+    pub limit_ms: f64,
+    pub exceeded: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -2024,7 +2143,7 @@ impl LiveMeasurementState {
                     .to_string(),
             );
         }
-        let (session_id, evidence_generation, search, paths) = {
+        let (session_id, evidence_generation, search, paths, arrival_reference) = {
             let guard = self
                 .session
                 .lock()
@@ -2041,156 +2160,168 @@ impl LiveMeasurementState {
                 .subwoofer_search
                 .clone()
                 .ok_or_else(|| "save a separated-path crossover search plan first".to_string())?;
-            let paths =
-                match search.mode {
-                    LiveSubwooferSearchMode::MeasuredStates => {
-                        let mut paths = Vec::with_capacity(search.candidates.len());
-                        let mut marker_levels: Vec<(String, Option<f64>)> = Vec::new();
-                        for candidate in &search.candidates {
-                            let left_key = (
-                                LiveCaptureKind::SubMainOnly,
-                                candidate.id.clone(),
-                                LiveChannel::Left,
-                            );
-                            let right_key = (
-                                LiveCaptureKind::SubMainOnly,
-                                candidate.id.clone(),
-                                LiveChannel::Right,
-                            );
-                            let sub_key = (
-                                LiveCaptureKind::SubOnly,
-                                candidate.id.clone(),
-                                search.sub_sweep_channel,
-                            );
-                            let left = session.measurements.get(&left_key).ok_or_else(|| {
-                                format!(
-                                    "capture the {} Hz left main-only path before optimization",
-                                    candidate.crossover_hz
-                                )
-                            })?;
-                            let right = session.measurements.get(&right_key).ok_or_else(|| {
-                                format!(
-                                    "capture the {} Hz right main-only path before optimization",
-                                    candidate.crossover_hz
-                                )
-                            })?;
-                            let sub = session.measurements.get(&sub_key).ok_or_else(|| {
-                                format!(
-                                    "capture the {} Hz sub-only path before optimization",
-                                    candidate.crossover_hz
-                                )
-                            })?;
-                            for measurement in [left, right, sub] {
-                                validate_stored_evidence(session, measurement)?;
-                            }
-                            for (role, measurement) in [
-                                ("left main-only", left),
-                                ("right main-only", right),
-                                ("sub-only", sub),
-                            ] {
-                                marker_levels.push((
-                                    format!("the {} Hz {role} capture", candidate.crossover_hz),
-                                    measurement.summary.start_marker_rms_dbfs,
-                                ));
-                            }
-                            paths.push(SeparatedCrossoverPaths {
-                                id: candidate.id.clone(),
-                                crossover_hz: candidate.crossover_hz,
-                                left_main: isolated_measurement_response(
-                                    left,
-                                    "left main-only capture",
-                                )?,
-                                right_main: isolated_measurement_response(
-                                    right,
-                                    "right main-only capture",
-                                )?,
-                                sub: isolated_measurement_response(sub, "sub-only capture")?,
-                            });
-                        }
-                        validate_isolated_marker_levels(&marker_levels)?;
-                        paths
-                    }
-                    LiveSubwooferSearchMode::WideBand => {
+            let (paths, arrival_reference) = match search.mode {
+                LiveSubwooferSearchMode::MeasuredStates => {
+                    let mut paths = Vec::with_capacity(search.candidates.len());
+                    let mut marker_levels: Vec<(String, Option<f64>)> = Vec::new();
+                    for candidate in &search.candidates {
                         let left_key = (
                             LiveCaptureKind::SubMainOnly,
-                            WIDE_BAND_MAIN_POSITION_ID.to_string(),
+                            candidate.id.clone(),
                             LiveChannel::Left,
                         );
                         let right_key = (
                             LiveCaptureKind::SubMainOnly,
-                            WIDE_BAND_MAIN_POSITION_ID.to_string(),
+                            candidate.id.clone(),
                             LiveChannel::Right,
                         );
                         let sub_key = (
                             LiveCaptureKind::SubOnly,
-                            WIDE_BAND_SUB_POSITION_ID.to_string(),
+                            candidate.id.clone(),
                             search.sub_sweep_channel,
                         );
                         let left = session.measurements.get(&left_key).ok_or_else(|| {
-                            "capture the left full-range main path before optimization".to_string()
+                            format!(
+                                "capture the {} Hz left main-only path before optimization",
+                                candidate.crossover_hz
+                            )
                         })?;
                         let right = session.measurements.get(&right_key).ok_or_else(|| {
-                            "capture the right full-range main path before optimization".to_string()
+                            format!(
+                                "capture the {} Hz right main-only path before optimization",
+                                candidate.crossover_hz
+                            )
                         })?;
                         let sub = session.measurements.get(&sub_key).ok_or_else(|| {
-                            "capture the wide-band sub path before optimization".to_string()
+                            format!(
+                                "capture the {} Hz sub-only path before optimization",
+                                candidate.crossover_hz
+                            )
                         })?;
                         for measurement in [left, right, sub] {
                             validate_stored_evidence(session, measurement)?;
                         }
-                        let marker_levels: Vec<(String, Option<f64>)> = [
-                            ("the left full-range main capture", left),
-                            ("the right full-range main capture", right),
-                            ("the wide-band sub capture", sub),
-                        ]
-                        .into_iter()
-                        .map(|(role, measurement)| {
-                            (role.to_string(), measurement.summary.start_marker_rms_dbfs)
-                        })
-                        .collect();
-                        validate_isolated_marker_levels_within(
-                            &marker_levels,
-                            MAXIMUM_WIDE_BAND_MARKER_LEVEL_DEVIATION_DB,
-                        )?;
-                        let (main_slope, sub_slope) =
-                            match (search.main_high_pass_slope, search.sub_low_pass_slope) {
-                                (Some(main_slope), Some(sub_slope)) => (main_slope, sub_slope),
-                                _ => return Err(
+                        for (role, measurement) in [
+                            ("left main-only", left),
+                            ("right main-only", right),
+                            ("sub-only", sub),
+                        ] {
+                            marker_levels.push((
+                                format!("the {} Hz {role} capture", candidate.crossover_hz),
+                                measurement.summary.start_marker_rms_dbfs,
+                            ));
+                        }
+                        paths.push(SeparatedCrossoverPaths {
+                            id: candidate.id.clone(),
+                            crossover_hz: candidate.crossover_hz,
+                            left_main: isolated_measurement_response(
+                                left,
+                                "left main-only capture",
+                            )?,
+                            right_main: isolated_measurement_response(
+                                right,
+                                "right main-only capture",
+                            )?,
+                            sub: isolated_measurement_response(sub, "sub-only capture")?,
+                        });
+                    }
+                    validate_isolated_marker_levels(&marker_levels)?;
+                    // No unfiltered capture exists in measured mode; the
+                    // core falls back to the lowest-crossover path for
+                    // the arrival anchor and warns when that is
+                    // ambiguous.
+                    (paths, None)
+                }
+                LiveSubwooferSearchMode::WideBand => {
+                    let left_key = (
+                        LiveCaptureKind::SubMainOnly,
+                        WIDE_BAND_MAIN_POSITION_ID.to_string(),
+                        LiveChannel::Left,
+                    );
+                    let right_key = (
+                        LiveCaptureKind::SubMainOnly,
+                        WIDE_BAND_MAIN_POSITION_ID.to_string(),
+                        LiveChannel::Right,
+                    );
+                    let sub_key = (
+                        LiveCaptureKind::SubOnly,
+                        WIDE_BAND_SUB_POSITION_ID.to_string(),
+                        search.sub_sweep_channel,
+                    );
+                    let left = session.measurements.get(&left_key).ok_or_else(|| {
+                        "capture the left full-range main path before optimization".to_string()
+                    })?;
+                    let right = session.measurements.get(&right_key).ok_or_else(|| {
+                        "capture the right full-range main path before optimization".to_string()
+                    })?;
+                    let sub = session.measurements.get(&sub_key).ok_or_else(|| {
+                        "capture the wide-band sub path before optimization".to_string()
+                    })?;
+                    for measurement in [left, right, sub] {
+                        validate_stored_evidence(session, measurement)?;
+                    }
+                    let marker_levels: Vec<(String, Option<f64>)> = [
+                        ("the left full-range main capture", left),
+                        ("the right full-range main capture", right),
+                        ("the wide-band sub capture", sub),
+                    ]
+                    .into_iter()
+                    .map(|(role, measurement)| {
+                        (role.to_string(), measurement.summary.start_marker_rms_dbfs)
+                    })
+                    .collect();
+                    validate_isolated_marker_levels_within(
+                        &marker_levels,
+                        MAXIMUM_WIDE_BAND_MARKER_LEVEL_DEVIATION_DB,
+                    )?;
+                    let (main_slope, sub_slope) =
+                        match (search.main_high_pass_slope, search.sub_low_pass_slope) {
+                            (Some(main_slope), Some(sub_slope)) => (main_slope, sub_slope),
+                            _ => {
+                                return Err(
                                     "the wide-band search plan is missing its filter-slope models"
                                         .to_string(),
-                                ),
-                            };
-                        synthesize_wide_band_crossover_states(
-                            &WideBandIsolatedPaths {
-                                left_main: isolated_measurement_response(
-                                    left,
-                                    "left full-range main capture",
-                                )?,
-                                right_main: isolated_measurement_response(
-                                    right,
-                                    "right full-range main capture",
-                                )?,
-                                sub: isolated_measurement_response(sub, "wide-band sub capture")?,
-                            },
-                            &WideBandSynthesisConfig {
-                                candidate_crossovers_hz: search
-                                    .candidates
-                                    .iter()
-                                    .map(|candidate| candidate.crossover_hz)
-                                    .collect(),
-                                sub_measured_low_pass_hz: search.sub_measured_low_pass_hz,
-                                main_high_pass: main_slope.alignment(),
-                                sub_low_pass: sub_slope.alignment(),
-                            },
-                        )
-                        .map_err(|error| format!("wide-band crossover synthesis failed: {error}"))?
-                    }
-                };
+                                )
+                            }
+                        };
+                    let raw_paths = WideBandIsolatedPaths {
+                        left_main: isolated_measurement_response(
+                            left,
+                            "left full-range main capture",
+                        )?,
+                        right_main: isolated_measurement_response(
+                            right,
+                            "right full-range main capture",
+                        )?,
+                        sub: isolated_measurement_response(sub, "wide-band sub capture")?,
+                    };
+                    let synthesized = synthesize_wide_band_crossover_states(
+                        &raw_paths,
+                        &WideBandSynthesisConfig {
+                            candidate_crossovers_hz: search
+                                .candidates
+                                .iter()
+                                .map(|candidate| candidate.crossover_hz)
+                                .collect(),
+                            sub_measured_low_pass_hz: search.sub_measured_low_pass_hz,
+                            main_high_pass: main_slope.alignment(),
+                            sub_low_pass: sub_slope.alignment(),
+                        },
+                    )
+                    .map_err(|error| format!("wide-band crossover synthesis failed: {error}"))?;
+                    // The raw captures double as the candidate-set-
+                    // independent arrival anchor (v5): the sub-minus-main
+                    // arrival is a property of the hardware, not of the
+                    // crossover list being tried.
+                    (synthesized, Some(raw_paths))
+                }
+            };
             (
                 session.id.clone(),
                 session.evidence_generation,
                 search,
                 paths,
+                arrival_reference,
             )
         };
         let measured_polarity = match search.measured_polarity_degrees {
@@ -2235,6 +2366,7 @@ impl LiveMeasurementState {
                 synthesized_crossover_model,
                 crossover_regularization_db_per_octave:
                     SEPARATED_PATH_CROSSOVER_REGULARIZATION_DB_PER_OCTAVE,
+                arrival_reference,
                 ranking: RankingConfig::default(),
             },
         )
@@ -3450,6 +3582,29 @@ mod tests {
     }
 
     #[test]
+    fn program_peak_growth_finds_an_off_grid_alignment() {
+        // Three equal taps 7.2 ms apart align every harmonic of a 138.9 Hz
+        // tone: any signal of that period grows by the full L1, 20log10(√3·3/√3)
+        // ... i.e. 3/√3 = √3 per tap scaling: L1 = 3·(1/√3) = √3 → +4.77 dB.
+        // 138.9 Hz sits between the fixed v1 square grid's 90 and 150 Hz
+        // tones, which measured only a fraction of it - exactly the class of
+        // miss (a sharp growth peak between grid points) that let a real
+        // package under-recommend by 1.4 dB. The swept scan must find it.
+        let spacing = (0.0072 * 48_000.0) as usize;
+        let mut comb = vec![0.0; spacing * 2 + 1];
+        let amplitude = 1.0 / 3.0f64.sqrt();
+        comb[0] = amplitude;
+        comb[spacing] = amplitude;
+        comb[spacing * 2] = amplitude;
+        let growth = secs_program_peak_growth_db(48_000, &comb).unwrap();
+        let l1_db = 20.0 * (3.0 * amplitude).log10();
+        assert!(
+            growth >= l1_db - 0.35 && growth <= l1_db + 0.01,
+            "off-grid alignment growth {growth:.2} dB vs L1 {l1_db:.2} dB"
+        );
+    }
+
+    #[test]
     fn secs_settings_are_range_validated_and_a_21_project_is_not_refused() {
         // Range validation runs before any session state is touched.
         let state = LiveMeasurementState::default();
@@ -3465,10 +3620,12 @@ mod tests {
             fixed_delay_ms: Some(1.0),
             ..LiveSecsDesignSettings::default()
         };
+        // The default ceiling is automatic, so a hand-fixed delay is bounded
+        // by the hard ceiling.
         assert!(state
             .design_secs_trial(delay)
             .unwrap_err()
-            .contains("2 and 10"));
+            .contains("2 and 250"));
         let conflict = LiveSecsDesignSettings {
             latency_mode: LiveSecsLatencyMode::Zero,
             fixed_delay_ms: Some(5.0),
@@ -3505,6 +3662,91 @@ mod tests {
             error.contains("calibration and both measurement sweeps"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn the_maximum_delay_setting_deserializes_to_what_it_ran() {
+        // Records stored before the extended-delay option existed carry no
+        // `maximumDelayMs` field: they ran the original 10 ms budget, and
+        // must keep meaning that - never "automatic".
+        let era_fields = serde_json::json!({
+            "maxBoostDb": 6.0,
+            "tiltDbPerOctave": 0.0,
+            "bassBoostDb": 0.0,
+            "bassFrequencyHz": 80.0,
+            "resolution": "normal",
+            "curtainHz": 300.0,
+            "latencyMode": "normal",
+            "fixedDelayMs": null,
+            "multiPosition": true,
+        });
+        let old: LiveSecsDesignSettings = serde_json::from_value(era_fields.clone()).unwrap();
+        assert_eq!(old.maximum_delay_ms, Some(SECS_AUTO_DELAY_MAX_MS));
+        assert!(!old.improved_phase);
+
+        // An explicit number stays that number; an explicit null is the
+        // automatic setting.
+        let mut manual = era_fields.clone();
+        manual["maximumDelayMs"] = serde_json::json!(60.0);
+        let manual: LiveSecsDesignSettings = serde_json::from_value(manual).unwrap();
+        assert_eq!(manual.maximum_delay_ms, Some(60.0));
+        let mut automatic = era_fields;
+        automatic["maximumDelayMs"] = serde_json::Value::Null;
+        let automatic: LiveSecsDesignSettings = serde_json::from_value(automatic).unwrap();
+        assert_eq!(automatic.maximum_delay_ms, None);
+
+        // The product default asks for the automatic ceiling and it
+        // round-trips as an explicit null, not a missing field.
+        let default = LiveSecsDesignSettings::default();
+        assert_eq!(default.maximum_delay_ms, None);
+        let round_tripped: LiveSecsDesignSettings =
+            serde_json::from_value(serde_json::to_value(default).unwrap()).unwrap();
+        assert_eq!(round_tripped, default);
+    }
+
+    #[test]
+    fn an_extended_delay_requires_the_improved_path() {
+        // The extended machinery (bulk split, flat-left window, asymmetric
+        // gate budget) exists on the improved path only; the original
+        // algorithm at an extended delay reproduces the measured failure the
+        // improvement fixed, so validation refuses the combination.
+        let manual = LiveSecsDesignSettings {
+            maximum_delay_ms: Some(60.0),
+            improved_phase: false,
+            ..LiveSecsDesignSettings::default()
+        };
+        assert!(validate_secs_settings(&manual)
+            .unwrap_err()
+            .contains("improved phase"));
+        let fixed_extended = LiveSecsDesignSettings {
+            maximum_delay_ms: None,
+            fixed_delay_ms: Some(40.0),
+            improved_phase: false,
+            ..LiveSecsDesignSettings::default()
+        };
+        assert!(validate_secs_settings(&fixed_extended)
+            .unwrap_err()
+            .contains("improved phase"));
+        // On the improved path both forms are accepted.
+        let manual_improved = LiveSecsDesignSettings {
+            maximum_delay_ms: Some(60.0),
+            ..LiveSecsDesignSettings::default()
+        };
+        assert!(validate_secs_settings(&manual_improved).is_ok());
+        let fixed_improved = LiveSecsDesignSettings {
+            maximum_delay_ms: None,
+            fixed_delay_ms: Some(40.0),
+            ..LiveSecsDesignSettings::default()
+        };
+        assert!(validate_secs_settings(&fixed_improved).is_ok());
+        // The hard ceiling still bounds everything.
+        let over = LiveSecsDesignSettings {
+            fixed_delay_ms: Some(260.0),
+            ..LiveSecsDesignSettings::default()
+        };
+        assert!(validate_secs_settings(&over)
+            .unwrap_err()
+            .contains("2 and 250"));
     }
 
     #[test]
@@ -3589,6 +3831,29 @@ mod tests {
             text
         };
         assert!(readme.contains("active below 90 Hz"), "{readme}");
+    }
+
+    #[test]
+    fn a_21_secs_design_requires_the_confirmed_crossover() {
+        // In a 2.1 project every crossover-aware design stage (shared-sub
+        // commonization, the phase guard's L/R reconciliation) needs the
+        // confirmed crossover; without a setup the design must refuse
+        // instead of silently proceeding crossover-blind.
+        let temporary = tempdir().unwrap();
+        let state = LiveMeasurementState::default();
+        state
+            .start_session_with_mode(temporary.path(), LiveSystemMode::SingleSub21)
+            .unwrap();
+        state
+            .import_calibration("umik.txt", "10 0\n24000 0\n")
+            .unwrap();
+        let wav = test_sweep_wav();
+        state.import_sweep(LiveChannel::Left, &wav).unwrap();
+        state.import_sweep(LiveChannel::Right, &wav).unwrap();
+        let error = state
+            .design_secs_trial(LiveSecsDesignSettings::default())
+            .unwrap_err();
+        assert!(error.contains("bass-management crossover"), "{error}");
     }
 
     #[test]
@@ -5042,7 +5307,7 @@ mod tests {
             .import_sweep(LiveChannel::Right, &wav)
             .unwrap();
         let restored = restored_state
-            .restore_accepted_measurements("synthetic::input", 0, LiveRestoreScope::General)
+            .restore_accepted_measurements("synthetic::input", 0, LiveRestoreScope::General, false)
             .unwrap();
         assert_eq!(
             restored.source_session_id.as_deref(),
@@ -5074,9 +5339,52 @@ mod tests {
             .import_sweep(LiveChannel::Right, &wav)
             .unwrap();
         let wrong_device = wrong_device_state
-            .restore_accepted_measurements("different::input", 0, LiveRestoreScope::General)
+            .restore_accepted_measurements("different::input", 0, LiveRestoreScope::General, false)
             .unwrap();
         assert!(wrong_device.restored_captures.is_empty());
+
+        // Debug relaxation (UI checkbox): the same mismatched microphone is
+        // admitted, but the evidence is marked - counted in the summary and
+        // stamped on every measurement it let through.
+        let debug_state = LiveMeasurementState::default();
+        debug_state.start_session(temporary.path()).unwrap();
+        debug_state
+            .import_calibration("same.txt", calibration_text)
+            .unwrap();
+        debug_state.import_sweep(LiveChannel::Left, &wav).unwrap();
+        debug_state.import_sweep(LiveChannel::Right, &wav).unwrap();
+        let relaxed = debug_state
+            .restore_accepted_measurements("different::input", 0, LiveRestoreScope::General, true)
+            .unwrap();
+        assert_eq!(relaxed.restored_captures.len(), 1);
+        assert_eq!(relaxed.debug_relaxed_snapshot_count, 1);
+        assert!(relaxed.restored_captures[0]
+            .diagnostic_codes
+            .iter()
+            .any(|code| code == DEBUG_RELAXED_EVIDENCE_DIAGNOSTIC));
+
+        // With everything matching, the checkbox changes nothing and stamps
+        // nothing: only genuinely relaxed admissions are marked.
+        let matching_state = LiveMeasurementState::default();
+        matching_state.start_session(temporary.path()).unwrap();
+        matching_state
+            .import_calibration("same.txt", calibration_text)
+            .unwrap();
+        matching_state
+            .import_sweep(LiveChannel::Left, &wav)
+            .unwrap();
+        matching_state
+            .import_sweep(LiveChannel::Right, &wav)
+            .unwrap();
+        let matching = matching_state
+            .restore_accepted_measurements("synthetic::input", 0, LiveRestoreScope::General, true)
+            .unwrap();
+        assert_eq!(matching.restored_captures.len(), 1);
+        assert_eq!(matching.debug_relaxed_snapshot_count, 0);
+        assert!(matching.restored_captures[0]
+            .diagnostic_codes
+            .iter()
+            .all(|code| code != DEBUG_RELAXED_EVIDENCE_DIAGNOSTIC));
     }
 
     #[test]
@@ -5161,7 +5469,7 @@ mod tests {
             .import_sweep(LiveChannel::Right, &wav)
             .unwrap();
         let restored = restored_state
-            .restore_accepted_measurements("synthetic::input", 0, LiveRestoreScope::General)
+            .restore_accepted_measurements("synthetic::input", 0, LiveRestoreScope::General, false)
             .unwrap();
 
         assert_eq!(restored.restored_captures.len(), 2);
@@ -5402,15 +5710,44 @@ mod tests {
         let secs = state
             .design_secs_trial(LiveSecsDesignSettings::default())
             .unwrap();
-        assert_eq!(secs.algorithm_version, SECS_ALGORITHM_VERSION);
+        // The default settings run the improved path (phase guard on), and
+        // the version label says so honestly.
+        assert!(secs.settings.improved_phase);
+        assert_eq!(
+            secs.algorithm_version,
+            format!("{SECS_ALGORITHM_VERSION}+{SECS_PHASE_GUARD_VERSION}")
+        );
+        // The group-delay gate ran and this clean fixture passes it: every
+        // band is reported with its limit and none exceeds.
+        assert!(!secs.group_delay_report.is_empty());
+        for band in &secs.group_delay_report {
+            assert!(
+                !band.exceeded,
+                "{}-{} Hz: {} ms (limit {})",
+                band.low_hz, band.high_hz, band.group_delay_ms, band.limit_ms
+            );
+        }
         assert_eq!(secs.position_id, "P0");
         assert!(secs.warning.contains("Predicted-only"));
+        assert!(!secs.warning.contains("GROUP-DELAY GATE EXCEEDED"));
         assert!(Path::new(&secs.trial_wav_path).is_file());
         assert!(Path::new(&secs.trial_zip_path).is_file());
         assert!(
             (SECS_AUTO_DELAY_MIN_MS..=SECS_AUTO_DELAY_MAX_MS).contains(&secs.auto_delay_ms),
             "auto delay {} outside the coarse grid",
             secs.auto_delay_ms
+        );
+        // The default settings ask for the automatic ceiling; this clean
+        // fixture has no late bass, so the probe records its (small)
+        // requirement and no extended latency is spent.
+        assert!(secs.settings.maximum_delay_ms.is_none());
+        assert_eq!(secs.maximum_delay_resolved_ms, SECS_AUTO_DELAY_MAX_MS);
+        let requirement = secs
+            .delay_requirement_ms
+            .expect("the automatic ceiling probe must record its measurement");
+        assert!(
+            requirement <= SECS_AUTO_DELAY_MAX_MS,
+            "clean fixture probed {requirement} ms"
         );
         // Multi-position is on by default but only P0 is accepted, so the
         // average falls back to the plain single-point path.
@@ -7067,7 +7404,10 @@ fn validate_secs_closed_loop(
         corrected_peak_frequencies_hz: Vec::new(),
     };
     Ok(LiveVerificationSummary {
-        algorithm_version: format!("{SECS_ALGORITHM_VERSION}+{LIVE_CLOSED_LOOP_VERSION}"),
+        algorithm_version: format!(
+            "{}+{LIVE_CLOSED_LOOP_VERSION}",
+            secs.summary.algorithm_version
+        ),
         passed: left_passed && right_passed && issues.is_empty(),
         left_passed,
         right_passed,
@@ -7580,75 +7920,16 @@ struct FinalSecsProjectSnapshot {
 /// Program-material peak-growth basis for the SECS headroom.
 ///
 /// The v3 basis measures the registered sweep and the maximum
-/// frequency-response gain. A sweep is a single frequency at every instant
-/// and the peak-normalized SECS filter has a ~0 dB response peak, but a
-/// full-band mixed-phase filter rearranges the partials of broadband program
-/// material in time: the mathematical bound is the L1 norm (+16..+17.5 dB on
-/// the 2026-07-30 live package) and real content lands several dB of growth.
-/// On that live package the v3 basis recommended 1.3 dB while real playback
-/// still clipped at 3 dB; deterministic program proxies measured +2.8..+6.4
-/// dB of true-peak growth depending on the rate member. This function
-/// convolves one member's taps with those full-scale proxies and returns the
-/// worst sample-peak growth in dB:
-/// - low-frequency square waves (40/60/90/150 Hz), the measured worst case,
-/// - decaying kick bursts (35/50/80/120 Hz),
-/// - hard-clipped fixed-seed noise as a dense-master stand-in.
-///
-/// Everything is deterministic (fixed xorshift seed, no clock), so the same
-/// package always reports the same headroom.
+/// frequency-response gain; a full-band mixed-phase filter grows broadband
+/// program peaks several dB past both (the 2026-07-30 live package clipped
+/// at the v3-recommended 1.3 dB). The measurement itself - swept square-wave
+/// scan plus kick bursts and clipped noise, all deterministic - is pure DSP
+/// and lives in `eqforbeginner_dsp_core::validation`
+/// (`program_material_peak_growth_db`, see its comment for the v2 scan
+/// rationale); this wrapper only maps the error type.
 fn secs_program_peak_growth_db(sample_rate_hz: u32, taps: &[f64]) -> Result<f64, String> {
-    let rate = f64::from(sample_rate_hz);
-    let mut signals: Vec<Vec<f64>> = Vec::new();
-
-    // Low-frequency square waves, long enough for the full filter length
-    // (~0.51 s) to build the output peak up.
-    let mut squares = Vec::new();
-    for frequency_hz in [40.0f64, 60.0, 90.0, 150.0] {
-        let samples = (0.75 * rate) as usize;
-        for index in 0..samples {
-            let phase = (2.0 * std::f64::consts::PI * frequency_hz * index as f64 / rate).sin();
-            squares.push(0.98 * if phase >= 0.0 { 1.0 } else { -1.0 });
-        }
-    }
-    signals.push(squares);
-
-    // Kick-drum-like decaying sine bursts.
-    let mut kicks = Vec::new();
-    for frequency_hz in [35.0f64, 50.0, 80.0, 120.0] {
-        let samples = (0.4 * rate) as usize;
-        for index in 0..samples {
-            let t = index as f64 / rate;
-            kicks.push((2.0 * std::f64::consts::PI * frequency_hz * t).sin() * (-t / 0.12).exp());
-        }
-        kicks.extend(std::iter::repeat_n(0.0, (0.05 * rate) as usize));
-    }
-    signals.push(kicks);
-
-    // Hard-clipped noise from a fixed-seed xorshift64* generator.
-    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
-    let mut noise = Vec::with_capacity((1.5 * rate) as usize);
-    for _ in 0..(1.5 * rate) as usize {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        let uniform =
-            (state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64 / (1u64 << 53) as f64;
-        noise.push(((uniform * 2.0 - 1.0) * 1.5).clamp(-1.0, 1.0));
-    }
-    signals.push(noise);
-
-    let mut worst_growth_db = 0.0f64;
-    for signal in &signals {
-        let input_peak = signal.iter().fold(0.0f64, |peak, v| peak.max(v.abs()));
-        if input_peak <= 0.0 {
-            return Err("program-proxy signal has zero peak".to_string());
-        }
-        let filtered = fft_convolve(signal, taps)
-            .map_err(|error| format!("program-proxy convolution failed: {error}"))?;
-        let output_peak = filtered.iter().fold(0.0f64, |peak, v| peak.max(v.abs()));
-        worst_growth_db = worst_growth_db.max(20.0 * (output_peak / input_peak).log10());
-    }
-    Ok(worst_growth_db)
+    program_material_peak_growth_db(sample_rate_hz, taps)
+        .map_err(|error| format!("program-proxy peak growth failed: {error}"))
 }
 
 /// Headroom v3 for a SECS package, computed from the verified 48 kHz taps
@@ -8466,9 +8747,15 @@ impl LiveMeasurementState {
                 .as_ref()
                 .map(|(left, right)| (left.as_slice(), right.as_slice()));
             // Exactly the settings the verified trial ran with, at this
-            // rate, and with the trial's delay choice locked (in the
-            // low/zero latency modes the design forces delay 0 itself).
-            let mut config = secs_config_for(&secs.settings, sample_rate_hz);
+            // rate, with the trial's delay choice locked (in the low/zero
+            // latency modes the design forces delay 0 itself) and the
+            // trial's RESOLVED ceiling replayed - an automatic ceiling must
+            // not be re-probed here, the verified budget is what ships.
+            let mut config = secs_config_for(
+                &secs.settings,
+                secs.summary.maximum_delay_resolved_ms,
+                sample_rate_hz,
+            );
             config.target_delay_ms = locked_delay_ms;
             config.target_overlay = secs.target_overlay.clone();
             config.shared_low_frequency_hz = secs.shared_low_frequency_hz;
@@ -8700,12 +8987,11 @@ impl LiveMeasurementState {
             session.id,
             if verified { "verified" } else { "predicted" },
         ));
+        let secs_algorithm_label = secs.summary.algorithm_version.clone();
         let algorithm_version = if verified {
-            format!(
-                "{SECS_ALGORITHM_VERSION}+{LIVE_CLOSED_LOOP_VERSION}+{SECS_NATIVE_RERUN_VERSION}"
-            )
+            format!("{secs_algorithm_label}+{LIVE_CLOSED_LOOP_VERSION}+{SECS_NATIVE_RERUN_VERSION}")
         } else {
-            format!("{SECS_ALGORITHM_VERSION}+predicted-only+{SECS_NATIVE_RERUN_VERSION}")
+            format!("{secs_algorithm_label}+predicted-only+{SECS_NATIVE_RERUN_VERSION}")
         };
         let verification_readme_line = if verified {
             "Closed-loop P0 L/R verification: passed (judged 20-650 Hz on smoothed\n\
@@ -8725,7 +9011,7 @@ impl LiveMeasurementState {
         let readme = format!(
             "EQforBeginner {} developer-beta convolution (SECS advanced option)\n\
              Project: {}\n\
-             Algorithm: {SECS_ALGORITHM_VERSION} - single-point (P0) full-band correction\n\
+             Algorithm: {secs_algorithm_label} - single-point (P0) full-band correction\n\
              ported from SECS by 한플 (Hanpeul), MIT-licensed by the original\n\
              author. Original: https://gall.dcinside.com/mgallery/board/view/\n\
              ?id=speakers&no=514096 - see THIRD-PARTY-NOTICES.md.\n\
@@ -8745,13 +9031,14 @@ impl LiveMeasurementState {
              Any member response peak above 0 dB created by the level alignment is\n\
              included in the recommended headroom.\n\
              Recommended Roon headroom: {recommended_headroom_db:.1} dB\n\
-             Headroom basis (v3+program-peak-v1): the largest of the 4x-oversampled\n\
+             Headroom basis (v3+program-peak-v2): the largest of the 4x-oversampled\n\
              registered-sweep ratio ({measured_true_peak_ratio_db:.3} dB), the filter's\n\
              maximum frequency-response gain ({maximum_filter_response_gain_db:.3} dB),\n\
-             and the measured peak growth of full-scale program-material proxies\n\
-             through every rate member ({program_peak_growth_db:.3} dB - a full-band\n\
-             mixed-phase filter grows broadband peaks in time even at a 0 dB response\n\
-             peak), plus {HEADROOM_SAFETY_MARGIN_DB:.1} dB inter-sample safety margin.\n\
+             and the measured peak growth of full-scale program proxies through every\n\
+             rate member ({program_peak_growth_db:.3} dB; a swept square-wave scan over\n\
+             20-320 Hz plus kick bursts and clipped noise - a full-band mixed-phase\n\
+             filter grows broadband peaks in time even at a 0 dB response peak, worst\n\
+             at a starting note's onset), plus {HEADROOM_SAFETY_MARGIN_DB:.1} dB inter-sample safety margin.\n\
              The L1 worst-case bound ({fir_worst_case_peak_bound_db:.3} dB) gives the\n\
              mathematically absolute-safe setting of {absolute_safe_headroom_db:.1} dB.\n\
              Disable every previous convolution, load only this ZIP, set the recommended\n\
@@ -10899,6 +11186,11 @@ struct CachedMeasurementSnapshot {
     calibrated_impulse_samples: Vec<f64>,
 }
 
+/// Diagnostic stamped onto every measurement admitted through the debug
+/// evidence relaxation, so a design or package built on such evidence stays
+/// identifiable in its stored snapshot after the fact.
+const DEBUG_RELAXED_EVIDENCE_DIAGNOSTIC: &str = "debug_relaxed_evidence_restore";
+
 fn cached_subwoofer_setup_matches(
     cached: Option<&CachedSubwooferSetup>,
     current: Option<&LiveSubwooferSetupSummary>,
@@ -10974,22 +11266,41 @@ fn cached_subwoofer_search_matches(
     }
 }
 
+/// `debug_relax_evidence` is DEBUG ONLY (UI checkbox, default off). It drops
+/// the two evidence families that bind a capture to the physical state it
+/// was made in - every subwoofer condition (the confirmed setup for
+/// baselines, the isolated-capture hardware state and routing for
+/// main-only/sub-only captures) and the microphone identity (device and
+/// channel). Those gates exist because a measurement made under a different
+/// hardware state is not evidence for this one; while debugging the search
+/// they otherwise force a full remeasurement after any recommendation
+/// change. What still gates, because it decides whether the data is even
+/// comparable: project/deconvolution version, sample rate, system mode,
+/// acceptance and issue codes, calibration and sweep hashes, and the refusal
+/// of verification/trial-bound snapshots. Anything admitted only by this
+/// relaxation is stamped with `DEBUG_RELAXED_EVIDENCE_DIAGNOSTIC` and
+/// counted in the restore summary.
 fn cached_snapshot_matches_session(
     cached: &CachedMeasurementSnapshot,
     session: &LiveSession,
     input_device_id: &str,
     input_channel_index: u16,
+    debug_relax_evidence: bool,
 ) -> bool {
     if cached.project_version != LIVE_MEASUREMENT_PROJECT_VERSION
         || cached.deconvolution_algorithm != KNOWN_SWEEP_DECONVOLUTION_VERSION
         || cached.sample_rate_hz != PROJECT_SAMPLE_RATE_HZ
         || cached.system_mode != session.system_mode
-        || cached.input_device_id != input_device_id
-        || cached.input_channel_index != input_channel_index
         || !cached.accepted
         || !cached.issue_codes.is_empty()
         || cached.trial_design_sha256.is_some()
         || cached.capture_kind == LiveCaptureKind::Verification
+    {
+        return false;
+    }
+    if !debug_relax_evidence
+        && (cached.input_device_id != input_device_id
+            || cached.input_channel_index != input_channel_index)
     {
         return false;
     }
@@ -11008,22 +11319,26 @@ fn cached_snapshot_matches_session(
         LiveCaptureKind::SubMainOnly | LiveCaptureKind::SubOnly => {
             session.system_mode == LiveSystemMode::SingleSub21
                 && session.subwoofer_search.is_some()
-                && cached_subwoofer_search_matches(
-                    cached.subwoofer_search.as_ref(),
-                    session.subwoofer_search.as_ref(),
-                    cached.capture_kind,
-                    &cached.position_id,
-                )
+                && (debug_relax_evidence
+                    || cached_subwoofer_search_matches(
+                        cached.subwoofer_search.as_ref(),
+                        session.subwoofer_search.as_ref(),
+                        cached.capture_kind,
+                        &cached.position_id,
+                    ))
         }
         // A baseline's physical state is the confirmed hardware setup plus
         // the calibration/sweeps/microphone checked above; the search plan's
         // candidate list and search parameters cannot influence it, so a
         // plan edited after the baselines were captured does not invalidate
         // them - the setup comparison is the physical gate.
-        LiveCaptureKind::Baseline => cached_subwoofer_setup_matches(
-            cached.subwoofer_setup.as_ref(),
-            session.subwoofer_setup.as_ref(),
-        ),
+        LiveCaptureKind::Baseline => {
+            debug_relax_evidence
+                || cached_subwoofer_setup_matches(
+                    cached.subwoofer_setup.as_ref(),
+                    session.subwoofer_setup.as_ref(),
+                )
+        }
         LiveCaptureKind::Verification => false,
     }
 }
@@ -11144,12 +11459,21 @@ fn restore_cached_snapshot(
 }
 
 impl LiveMeasurementState {
+    /// `debug_relax_evidence` is the UI's developer-only checkbox; see
+    /// `cached_snapshot_matches_session` for exactly what it drops. It is
+    /// honoured in development builds only - a distributed (release) build
+    /// forces it off here regardless of what the caller asks for, so the
+    /// shipped product can never mix evidence from a different hardware
+    /// state. The UI hides the checkbox in release builds as well; this is
+    /// the independent backstop.
     pub fn restore_accepted_measurements(
         &self,
         input_device_id: &str,
         input_channel_index: u16,
         scope: LiveRestoreScope,
+        debug_relax_evidence: bool,
     ) -> Result<LiveMeasurementCacheRestoreSummary, String> {
+        let debug_relax_evidence = debug_relax_evidence && cfg!(debug_assertions);
         if input_device_id.trim().is_empty() {
             return Err("measurement cache restore requires an input device".to_string());
         }
@@ -11230,6 +11554,7 @@ impl LiveMeasurementState {
 
         let mut scanned_snapshot_count = 0_usize;
         let mut compatible_snapshot_count = 0_usize;
+        let mut debug_relaxed_snapshot_count = 0_usize;
         let mut selected_source_sessions = Vec::new();
         let mut selected =
             BTreeMap::<(LiveCaptureKind, String, LiveChannel), StoredMeasurement>::new();
@@ -11265,9 +11590,20 @@ impl LiveMeasurementState {
                     session,
                     input_device_id,
                     input_channel_index,
+                    debug_relax_evidence,
                 ) {
                     continue;
                 }
+                // Admitted only because the debug relaxation is on: stamp it
+                // so the evidence stays identifiable downstream.
+                let relaxed_admission = debug_relax_evidence
+                    && !cached_snapshot_matches_session(
+                        &cached,
+                        session,
+                        input_device_id,
+                        input_channel_index,
+                        false,
+                    );
                 let Ok(position_id) =
                     validate_position_id(&cached.position_id, cached.capture_kind)
                 else {
@@ -11306,7 +11642,16 @@ impl LiveMeasurementState {
                 let kind = cached.capture_kind;
                 let channel = cached.channel;
                 compatible_snapshot_count = compatible_snapshot_count.saturating_add(1);
-                if let Ok(restored) = restore_cached_snapshot(cached, &snapshot_path, evidence) {
+                if let Ok(mut restored) = restore_cached_snapshot(cached, &snapshot_path, evidence)
+                {
+                    if relaxed_admission {
+                        debug_relaxed_snapshot_count =
+                            debug_relaxed_snapshot_count.saturating_add(1);
+                        restored
+                            .summary
+                            .diagnostic_codes
+                            .push(DEBUG_RELAXED_EVIDENCE_DIAGNOSTIC.to_string());
+                    }
                     source_measurements.insert((kind, position_id, channel), restored);
                 }
             }
@@ -11368,6 +11713,7 @@ impl LiveMeasurementState {
             restored_captures,
             scanned_snapshot_count,
             compatible_snapshot_count,
+            debug_relaxed_snapshot_count,
         })
     }
 }
@@ -12336,6 +12682,24 @@ impl LiveMeasurementState {
                         .to_string(),
                 );
             }
+            // Fail closed instead of designing crossover-blind: in a 2.1
+            // project every crossover-aware stage (the shared-sub-band
+            // magnitude/excess commonization and the phase guard's L/R
+            // reconciliation) hangs off the confirmed crossover. The
+            // baseline-evidence gate already makes this state unreachable
+            // today (2.1 baselines bind to the setup that was active), but
+            // that is a distant invariant; the design must not silently
+            // proceed without the crossover if it ever loosens.
+            if session.system_mode == LiveSystemMode::SingleSub21
+                && session.subwoofer_setup.is_none()
+            {
+                return Err(
+                    "a confirmed subwoofer setup (crossover, delay, polarity, sub level) is \
+                     required before a 2.1 filter design; the design must know the \
+                     bass-management crossover to commonize the shared sub band"
+                        .to_string(),
+                );
+            }
             let left = p0_measurement(session, LiveCaptureKind::Baseline, LiveChannel::Left)?;
             let right = p0_measurement(session, LiveCaptureKind::Baseline, LiveChannel::Right)?;
             if left.calibrated_impulse_samples.is_empty()
@@ -12390,14 +12754,51 @@ impl LiveMeasurementState {
             )
         };
 
+        // Resolve the delay ceiling first: a manual choice is used as-is;
+        // the automatic setting probes how late this pair's own bass
+        // actually arrives and resolves the smallest covering ceiling
+        // (the original 10 ms when nothing needs more - no latency is spent
+        // that the room does not ask for). The probe only applies on the
+        // improved mixed-phase path; everywhere else the extended machinery
+        // does not exist and the original budget is the correct resolution.
+        let mut delay_requirement_ms = None;
+        let resolved_maximum_delay_ms = match settings.maximum_delay_ms {
+            Some(value) => value,
+            None => {
+                if !settings.improved_phase || settings.latency_mode != LiveSecsLatencyMode::Normal
+                {
+                    SECS_AUTO_DELAY_MAX_MS
+                } else if let Some(fixed) = settings.fixed_delay_ms {
+                    // A hand-fixed delay IS the latency choice; the ceiling
+                    // follows it instead of the probe.
+                    fixed.max(SECS_AUTO_DELAY_MAX_MS)
+                } else {
+                    let resolved = secs_auto_delay_ceiling_ms(
+                        &left_impulse,
+                        &right_impulse,
+                        PROJECT_SAMPLE_RATE_HZ,
+                    )
+                    .map_err(|error| format!("SECS delay-requirement probe failed: {error}"))?;
+                    delay_requirement_ms = Some(resolved.requirement_ms);
+                    resolved.ceiling_ms
+                }
+            }
+        };
         // The user's advanced-option settings drive the design; a fixed
         // delay narrows the search to that single candidate, and the
         // low/zero latency modes design minimum phase only.
-        let mut config = secs_config_for(&settings, PROJECT_SAMPLE_RATE_HZ);
+        let mut config =
+            secs_config_for(&settings, resolved_maximum_delay_ms, PROJECT_SAMPLE_RATE_HZ);
         config.target_overlay = target_overlay.clone();
         config.shared_low_frequency_hz = shared_low_frequency_hz;
         let taps = config.taps;
-        let fixed_delay = settings.fixed_delay_ms;
+        // Extended ceiling without an explicit fixed delay: use the ceiling
+        // as the delay. The 2-10 ms automatic search judges magnitude only
+        // and would squander the phase budget.
+        let fixed_delay = settings.fixed_delay_ms.or_else(|| {
+            (resolved_maximum_delay_ms > SECS_AUTO_DELAY_MAX_MS)
+                .then_some(resolved_maximum_delay_ms)
+        });
         // Multi-position magnitude: seat-weighted RMS average on the P0 FFT
         // grid. With only P0 accepted this is exactly the P0 magnitude, so
         // the plain path is used and the summary reports one position.
@@ -12428,6 +12829,64 @@ impl LiveMeasurementState {
             magnitude_overrides,
         )
         .map_err(|error| format!("SECS design failed: {error}"))?;
+        let algorithm_version_label = if settings.improved_phase {
+            format!("{SECS_ALGORITHM_VERSION}+{SECS_PHASE_GUARD_VERSION}")
+        } else {
+            SECS_ALGORITHM_VERSION.to_string()
+        };
+
+        // Group-delay gate, judged from the designed taps alone: an all-pass
+        // timing defect changes no magnitude anywhere, so no other design or
+        // validation metric can see it (a real 2026-08-03 filter shipped
+        // 70-200 ms of low-band delay with every magnitude number green).
+        let left_group_delay = secs_filter_group_delay_report(
+            &design.left_taps,
+            PROJECT_SAMPLE_RATE_HZ,
+            design.auto_delay_ms,
+        )
+        .map_err(|error| format!("SECS group-delay report failed: {error}"))?;
+        let right_group_delay = secs_filter_group_delay_report(
+            &design.right_taps,
+            PROJECT_SAMPLE_RATE_HZ,
+            design.auto_delay_ms,
+        )
+        .map_err(|error| format!("SECS group-delay report failed: {error}"))?;
+        let group_delay_report: Vec<LiveSecsGroupDelayBand> = left_group_delay
+            .iter()
+            .zip(&right_group_delay)
+            .map(|(left_band, right_band)| {
+                let worst = if left_band.group_delay_ms.abs() >= right_band.group_delay_ms.abs() {
+                    left_band
+                } else {
+                    right_band
+                };
+                LiveSecsGroupDelayBand {
+                    low_hz: left_band.low_hz,
+                    high_hz: left_band.high_hz,
+                    group_delay_ms: worst.group_delay_ms,
+                    limit_ms: left_band.limit_ms,
+                    exceeded: worst.exceeded,
+                }
+            })
+            .collect();
+        let group_delay_text = group_delay_report
+            .iter()
+            .map(|band| {
+                format!(
+                    "{:.0}-{:.0} Hz {:+.1} ms (limit {:.0})",
+                    band.low_hz, band.high_hz, band.group_delay_ms, band.limit_ms
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let group_delay_exceeded = group_delay_report.iter().any(|band| band.exceeded);
+        if settings.improved_phase && group_delay_exceeded {
+            return Err(format!(
+                "the designed filter exceeds the group-delay gate even with the phase guard on \
+                 ({group_delay_text}); this is unexpected - use a minimum-phase latency mode and \
+                 report the session"
+            ));
+        }
 
         // Honest predicted numbers over the product band: RMSE of P0 against
         // the SECS target before and after applying the designed filter. The
@@ -12590,7 +13049,7 @@ impl LiveMeasurementState {
              limits) plus minimum-phase magnitude EQ toward an adaptive target.\n\
              Settings: boost cap +{:.1} dB, tilt {:.1} dB/oct, bass +{:.1} dB @ {:.0} Hz,\n\
              resolution {:?}, curtain {:.0} Hz, latency {:?}, target delay {:.1} ms\n\
-             ({}).\n\
+             ({}), delay ceiling {:.0} ms ({}).\n\
              Target curve: {}.\n\
              In a 2.1 project this corrects each channel's combined main+sub path as\n\
              measured; below the confirmed crossover the L/R correction is commonized\n\
@@ -12610,6 +13069,15 @@ impl LiveMeasurementState {
             } else {
                 "automatic search"
             },
+            resolved_maximum_delay_ms,
+            match delay_requirement_ms {
+                Some(requirement) => format!(
+                    "resolved automatically from the measured low-band requirement {requirement:.1} ms"
+                ),
+                None if settings.maximum_delay_ms.is_none() =>
+                    "automatic setting, original budget".to_string(),
+                None => "chosen by the user".to_string(),
+            },
             match target_overlay.as_ref() {
                 Some(curve) => format!("{} ({})", curve.name(), curve.version()),
                 None => "SECS adaptive flat target".to_string(),
@@ -12624,14 +13092,14 @@ impl LiveMeasurementState {
         create_roon_zip(
             &trial_zip_path,
             std::slice::from_ref(&trial_wav_path),
-            SECS_ALGORITHM_VERSION,
+            &algorithm_version_label,
             &readme,
         )
         .map_err(|error| format!("could not create SECS trial Roon ZIP: {error}"))?;
 
         let summary = LiveSecsDesignSummary {
             settings,
-            algorithm_version: SECS_ALGORITHM_VERSION.to_string(),
+            algorithm_version: algorithm_version_label,
             position_id: "P0".to_string(),
             position_count,
             multi_position_applied: magnitude_overrides.is_some(),
@@ -12639,6 +13107,8 @@ impl LiveMeasurementState {
             sample_rate_hz: PROJECT_SAMPLE_RATE_HZ,
             taps,
             auto_delay_ms: design.auto_delay_ms,
+            maximum_delay_resolved_ms: resolved_maximum_delay_ms,
+            delay_requirement_ms,
             low_cutoff_hz: design.low_cutoff_hz,
             high_cutoff_hz: design.high_cutoff_hz,
             preamp_db: design.preamp_db,
@@ -12650,10 +13120,24 @@ impl LiveMeasurementState {
             right_predicted_rmse_db,
             trial_wav_path: trial_wav_path.display().to_string(),
             trial_zip_path: trial_zip_path.display().to_string(),
+            group_delay_report,
             frequency_response: frequency_response_plot,
-            warning:
-                "Predicted-only SECS trial designed from P0 alone. Final export stays locked until a new P0 L/R capture is made with this exact filter active in Roon."
-                    .to_string(),
+            warning: {
+                let mut warning =
+                    "Predicted-only SECS trial designed from P0 alone. Final export stays locked until a new P0 L/R capture is made with this exact filter active in Roon."
+                        .to_string();
+                if group_delay_exceeded {
+                    // Only reachable with the original algorithm (the
+                    // improved path fails the design instead).
+                    warning.push_str(&format!(
+                        " GROUP-DELAY GATE EXCEEDED ({group_delay_text}): the filter itself \
+                         delays these bands audibly relative to the treble - a magnitude-only \
+                         chart cannot show this. Consider the improved SECS option or a \
+                         minimum-phase latency mode."
+                    ));
+                }
+                warning
+            },
         };
 
         let mut guard = self

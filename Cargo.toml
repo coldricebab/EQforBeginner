@@ -6,7 +6,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"
@@ -20,3 +20,16 @@ codegen-units = 1
 lto = true
 opt-level = "s"
 strip = true
+
+# DSP math dominates the debug-build test time (the SECS design and the
+# program-peak headroom scan), and unoptimized loops are ~10x slower.
+# Compiling the math dependency and the pure-DSP crate optimized keeps the
+# application crates fully debuggable while keeping the closed-loop e2e in
+# minutes instead of tens of minutes. Rust float semantics are IEEE-exact at
+# every opt-level, so results are bit-identical (the SECS.py parity fixture
+# pins this).
+[profile.dev.package.rustfft]
+opt-level = 3
+
+[profile.dev.package.eqforbeginner-dsp-core]
+opt-level = 2

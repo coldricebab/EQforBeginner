@@ -11,6 +11,19 @@ use std::f64::consts::{LN_2, PI};
 
 const MIN_CROSSOVER_HZ: f64 = 10.0;
 const MAX_CROSSOVER_HZ: f64 = 1_000.0;
+/// Fixed scoring band for the separated-path search (v5). v4 derived the
+/// band from the LISTED candidates (0.5x the minimum to 2x the maximum
+/// crossover), which made every candidate's score - including a candidate
+/// present in both lists - depend on which other crossovers the user
+/// happened to include (field data 2026-08-09: 20-240 Hz with a 40 Hz
+/// candidate, 25-240 Hz without one, and the 50 Hz candidate's best delay
+/// moved between runs). The product's validated correction band is 20-500 Hz
+/// everywhere else; above twice any offered crossover both branches are
+/// main-dominated and near-identical across candidates, so the fixed band
+/// adds the same contribution to every candidate, preserving the ranking
+/// order while making each candidate's score independent of the list.
+const SUB_SCORING_BAND_LOW_HZ: f64 = 20.0;
+const SUB_SCORING_BAND_HIGH_HZ: f64 = 500.0;
 const MAX_ABS_MAGNITUDE_DB: f64 = 1_000.0;
 const MAX_ABS_DELAY_MS: f64 = 1_000.0;
 const MIN_SUB_LEVEL_DB: f64 = -120.0;
@@ -69,7 +82,7 @@ pub const SUB_INTEGRATION_ALGORITHM_VERSION: &str = "phase3-single-sub-ranking-v
 ///    candidate sits above 55 Hz gets a warning that its anchor is
 ///    ambiguous.
 pub const SEPARATED_PATH_OPTIMIZATION_VERSION: &str =
-    "phase3-separated-path-delay-polarity-search-v4";
+    "phase3-separated-path-delay-polarity-search-v5";
 /// Tie-breaking preference for lower crossovers, in score dB per octave above
 /// 40 Hz. This encodes textbook practice - a single subwoofer becomes
 /// localizable and collapses stereo bass as the handoff rises - not any
@@ -324,6 +337,25 @@ pub struct SeparatedPathOptimizationConfig {
     /// Score dB per octave above 40 Hz added to each candidate; see
     /// `SEPARATED_PATH_CROSSOVER_REGULARIZATION_DB_PER_OCTAVE`.
     pub crossover_regularization_db_per_octave: f64,
+    /// The raw (unfiltered) isolated captures the candidate states were
+    /// synthesized from, when they exist (wide-band mode). The sub-minus-main
+    /// arrival is a property of the drivers and placement, not of the
+    /// candidate list, and v4 estimated it from the lowest-crossover
+    /// CANDIDATE path - which made the whole search depend on which
+    /// crossovers the user listed. Field data (2026-08-09, same captures):
+    /// with a 40 Hz candidate present the anchor read -1.2 ms and the search
+    /// chose 70 Hz / 0.38 ms; with the list starting at 50 Hz the fallback
+    /// band widened to 20-100 Hz, a correlation alias one bass cycle away
+    /// (+11.15 ms) beat the true peak, and every candidate's delay window -
+    /// including 70's own - shifted a cycle (winner 80 Hz / 11.35 ms).
+    /// `Some` anchors the arrival on these raw curves instead, as the
+    /// median over a fixed band family with edge-degenerate members
+    /// rejected (see `ARRIVAL_REFERENCE_BANDS_HZ`) - set-independent by
+    /// construction and robust to a room whose low band is phase-incoherent
+    /// on one channel. `None` (measured mode, where no unfiltered capture
+    /// exists) keeps the lowest-path fallback and the report warns when the
+    /// lowest crossover is high enough for the ambiguity to fit the scan.
+    pub arrival_reference: Option<WideBandIsolatedPaths>,
     pub ranking: RankingConfig,
 }
 
@@ -794,16 +826,15 @@ pub fn optimize_separated_paths(
         deployment_trimmed_paths(paths, &config.ranking)?;
     let paths = &trimmed_paths[..];
 
-    let minimum_crossover_hz = paths
-        .iter()
-        .map(|path| path.crossover_hz)
-        .fold(f64::INFINITY, f64::min);
     let common_grid = &paths[0].left_main.frequencies_hz;
+    // Fixed product band (v5): deriving the low edge from the listed
+    // candidates made the synthesized sums - and with them every score -
+    // depend on the candidate list.
     let retained_indices = common_grid
         .iter()
         .enumerate()
         .filter_map(|(index, frequency_hz)| {
-            (*frequency_hz >= (0.4 * minimum_crossover_hz).max(20.0) && *frequency_hz <= 500.0)
+            (*frequency_hz >= SUB_SCORING_BAND_LOW_HZ && *frequency_hz <= SUB_SCORING_BAND_HIGH_HZ)
                 .then_some(index)
         })
         .collect::<Vec<_>>();
@@ -819,47 +850,132 @@ pub fn optimize_separated_paths(
     // 0-5 ms grid cannot cover a DSP sub whose processing latency plus
     // placement offset exceeds it, and 5 ms is only 144 degrees at 80 Hz
     // (2026-07-29 expert review, finding 2).
-    // One arrival per channel for the whole search, taken from the
-    // lowest-crossover path. The true sub-minus-main offset is a property of
-    // the drivers and placement, not of the crossover dial, so every path
-    // shares it - but each path can only be measured over its own filtered
-    // overlap band, and a band centred on frequency f has correlation
-    // aliases spaced at roughly 1/f. For the lowest path that spacing
-    // (>= 20 ms at a 50 Hz candidate) falls outside the +/-20 ms scan, so
-    // its peak is the one unambiguous anchor; a high-crossover path's own
-    // estimate can lock a full bass cycle away (the real session recommended
-    // 12-15 ms - one period at its band centroid - while its 40 Hz path
-    // measured the true sub-early offset of about -1 ms). Precision beyond a
-    // couple of milliseconds is not required here: the center only places
-    // the half-period search window, and the splice scoring picks the exact
+    // One arrival per channel for the whole search. The true sub-minus-main
+    // offset is a property of the drivers and placement, not of the
+    // crossover dial, so every path shares it - and (v5) it must therefore
+    // never depend on which crossovers the user happened to list.
+    //
+    // Preferred anchor: the raw wide-band captures the states were
+    // synthesized from, over the fixed 20-45 Hz band. The unfiltered mains
+    // still carry full content there and a <= 45 Hz carrier puts the
+    // correlation's cycle ambiguity at >= 22 ms, outside the +/-20 ms scan -
+    // unambiguous and candidate-set-independent by construction.
+    //
+    // Fallback (measured mode, no raw captures): the lowest-crossover
+    // candidate path, measured over its own filtered overlap band. A band
+    // centred on frequency f has correlation aliases spaced at roughly 1/f;
+    // at a 40 Hz lowest candidate that spacing (~25 ms) falls outside the
+    // scan, but from ~50 Hz up an alias fits inside it and can beat the true
+    // peak (field data 2026-08-09: the same captures read -1.2 ms with a
+    // 40 Hz candidate present and +11.15 ms - one 81 Hz cycle away - without
+    // one, flipping the winner from 70 Hz / 0.38 ms to 80 Hz / 11.35 ms).
+    // That ambiguity is warned about below. Precision beyond a couple of
+    // milliseconds is not required here: the center only places the
+    // half-period search window, and the splice scoring picks the exact
     // delay inside it.
     let anchor_path = paths
         .iter()
         .min_by(|left, right| left.crossover_hz.total_cmp(&right.crossover_hz))
         .expect("validated: at least two paths");
-    let arrival_band_low_hz = 20.0;
-    let arrival_band_high_hz = (2.0 * anchor_path.crossover_hz).min(240.0);
-    let mut channel_arrivals_ms = [0.0_f64; 2];
-    for (channel_index, main) in [&anchor_path.left_main, &anchor_path.right_main]
-        .into_iter()
-        .enumerate()
-    {
-        let curve = arrival_correlation_curve(
-            common_grid,
-            main,
-            &anchor_path.sub,
-            arrival_band_low_hz,
-            arrival_band_high_hz,
-        )?;
+    let mut arrival_warnings: Vec<String> = Vec::new();
+    let scan_last_index = (2.0 * ARRIVAL_SCAN_LIMIT_MS / ARRIVAL_SCAN_STEP_MS).round() as usize;
+    // Correlation peak for one channel/band; `true` marks a peak pinned to a
+    // scan edge (a degenerate correlation, not an arrival).
+    let correlation_peak = |main: &CombinedResponse,
+                            sub: &CombinedResponse,
+                            low_hz: f64,
+                            high_hz: f64|
+     -> DspResult<(f64, bool)> {
+        let curve = arrival_correlation_curve(common_grid, main, sub, low_hz, high_hz)?;
         let best_index = curve
             .iter()
             .enumerate()
             .max_by(|left, right| left.1.total_cmp(right.1))
             .map(|(index, _)| index)
             .expect("scan grid is nonempty");
-        channel_arrivals_ms[channel_index] =
-            -ARRIVAL_SCAN_LIMIT_MS + best_index as f64 * ARRIVAL_SCAN_STEP_MS;
+        Ok((
+            -ARRIVAL_SCAN_LIMIT_MS + best_index as f64 * ARRIVAL_SCAN_STEP_MS,
+            best_index == 0 || best_index >= scan_last_index,
+        ))
+    };
+    let median_ms = |values: &mut Vec<f64>| -> f64 {
+        values.sort_by(f64::total_cmp);
+        let middle = values.len() / 2;
+        if values.len() % 2 == 0 {
+            0.5 * (values[middle - 1] + values[middle])
+        } else {
+            values[middle]
+        }
+    };
+    // Per-channel arrival estimates. With a raw reference: the median over
+    // the fixed band family, per channel, after rejecting edge-degenerate
+    // members (see ARRIVAL_REFERENCE_BANDS_HZ). Fallback: the lowest
+    // candidate path over its own filtered band, as measured mode requires.
+    let mut reference_arrivals: Option<[f64; 2]> = None;
+    if let Some(reference) = &config.arrival_reference {
+        let mut per_channel: [Vec<f64>; 2] = [Vec::new(), Vec::new()];
+        let mut pooled: Vec<f64> = Vec::new();
+        for (channel_index, main) in [&reference.left_main, &reference.right_main]
+            .into_iter()
+            .enumerate()
+        {
+            for (low_hz, high_hz) in ARRIVAL_REFERENCE_BANDS_HZ {
+                if let Ok((tau_ms, at_edge)) =
+                    correlation_peak(main, &reference.sub, low_hz, high_hz)
+                {
+                    if !at_edge {
+                        per_channel[channel_index].push(tau_ms);
+                        pooled.push(tau_ms);
+                    }
+                }
+            }
+        }
+        if pooled.len() >= 2 {
+            let pooled_median = median_ms(&mut pooled);
+            let mut arrivals = [pooled_median; 2];
+            for (channel_index, estimates) in per_channel.iter_mut().enumerate() {
+                if !estimates.is_empty() {
+                    arrivals[channel_index] = median_ms(estimates);
+                }
+            }
+            reference_arrivals = Some(arrivals);
+        } else {
+            arrival_warnings.push(
+                "The raw-capture arrival anchor was degenerate in every band (correlation \
+                 peaks pinned to the scan edge); the anchor fell back to the lowest \
+                 crossover candidate's path - treat the recommended delay with caution."
+                    .to_string(),
+            );
+        }
     }
+    let channel_arrivals_ms = match reference_arrivals {
+        Some(arrivals) => arrivals,
+        None => {
+            if config.arrival_reference.is_none()
+                && 1_000.0 / anchor_path.crossover_hz <= ARRIVAL_SCAN_LIMIT_MS
+            {
+                arrival_warnings.push(format!(
+                    "The sub-arrival anchor was estimated from the lowest measured \
+                     crossover ({:.0} Hz); at that band a correlation alias one bass \
+                     cycle away fits inside the +/-{ARRIVAL_SCAN_LIMIT_MS:.0} ms scan \
+                     and the anchor - and with it every candidate's delay window - can \
+                     lock a cycle off. Include one candidate at or below 40 Hz (or use \
+                     the wide-band mode) for an unambiguous anchor.",
+                    anchor_path.crossover_hz
+                ));
+            }
+            let band_high_hz = (2.0 * anchor_path.crossover_hz).min(240.0);
+            let mut arrivals = [0.0_f64; 2];
+            for (channel_index, main) in [&anchor_path.left_main, &anchor_path.right_main]
+                .into_iter()
+                .enumerate()
+            {
+                let (tau_ms, _) = correlation_peak(main, &anchor_path.sub, 20.0, band_high_hz)?;
+                arrivals[channel_index] = tau_ms;
+            }
+            arrivals
+        }
+    };
     let center_ms = 0.5 * (channel_arrivals_ms[0] + channel_arrivals_ms[1]);
     let left_right_spread_ms = (channel_arrivals_ms[0] - channel_arrivals_ms[1]).abs();
     let mut arrival_estimates = Vec::with_capacity(paths.len());
@@ -882,29 +998,29 @@ pub fn optimize_separated_paths(
         });
     }
 
-    // Stage-1 grid granularity: the smallest integer multiple of the hardware
-    // step whose windows respect both the 1,001-value per-window cap and the
-    // 10,000-candidate total. A multiplier of 1 reproduces the v2 grid
-    // exactly; a finer request (0.01 ms across a 25 ms window at a 40 Hz
-    // candidate needs 2,501 values) coarsens stage 1 and a refinement pass
-    // below restores the full requested resolution. Coarse multiples of the
-    // step remain values the user can dial. The score varies over delay on a
-    // scale of roughly one period of the highest scored frequency (>= ~2 ms
-    // at the 500 Hz band edge), hundreds of times any coarse step chosen
-    // here, so the coarse scan cannot skip past the optimum's basin.
+    // Stage-1 grid granularity, PER PATH (v5): each path's coarse step is
+    // the smallest integer multiple of the hardware step that fits its own
+    // arrival window under the 1,001-values-per-window cap. v4 chose one
+    // multiplier from the widest window in the SET (to also meet a shared
+    // 10,000-candidate total), which made every path's coarse grid - and,
+    // through stage 2's refinement window of one coarse step around the
+    // coarse best, occasionally the final fine-step choice - depend on which
+    // other crossovers were listed. A path's grid now depends on its own
+    // window alone; the total stays bounded by paths (<= 12) x 1,001 values
+    // x 2 polarities. Coarse multiples of the step remain values the user
+    // can dial, and the score varies over delay on a scale of roughly one
+    // period of the highest scored frequency (>= ~2 ms at the 500 Hz band
+    // edge), hundreds of times any coarse step chosen here, so the coarse
+    // scan cannot skip past the optimum's basin.
     let overflowed = || DspError::InvalidArgument("separated-path search size overflowed".into());
-    let maximum_span_ms = arrival_estimates
-        .iter()
-        .map(|estimate| estimate.window_high_ms - estimate.window_low_ms)
-        .fold(0.0_f64, f64::max);
-    let mut multiplier =
-        ((maximum_span_ms / (1_000.0 * config.delay_step_ms)).ceil() as usize).max(1);
-    let (path_grids, coarse_step_ms, mut candidate_count) = loop {
-        let coarse_step_ms = multiplier as f64 * config.delay_step_ms;
-        let mut grids = Vec::with_capacity(arrival_estimates.len());
-        let mut count = 0_usize;
-        let mut fits = true;
-        for estimate in &arrival_estimates {
+    let mut path_grids = Vec::with_capacity(arrival_estimates.len());
+    let mut path_coarse_steps_ms = Vec::with_capacity(arrival_estimates.len());
+    let mut candidate_count = 0_usize;
+    for estimate in &arrival_estimates {
+        let span_ms = estimate.window_high_ms - estimate.window_low_ms;
+        let mut multiplier = ((span_ms / (1_000.0 * config.delay_step_ms)).ceil() as usize).max(1);
+        let (grid, coarse_step_ms) = loop {
+            let coarse_step_ms = multiplier as f64 * config.delay_step_ms;
             // `snapped_delay_grid` fails above 1,001 values per window; that
             // simply means this granularity is still too fine.
             match snapped_delay_grid(
@@ -912,23 +1028,16 @@ pub fn optimize_separated_paths(
                 estimate.window_high_ms,
                 coarse_step_ms,
             ) {
-                Ok(grid) => {
-                    count = count
-                        .checked_add(grid.len().checked_mul(2).ok_or_else(overflowed)?)
-                        .ok_or_else(overflowed)?;
-                    grids.push(grid);
-                }
-                Err(_) => {
-                    fits = false;
-                    break;
-                }
+                Ok(grid) => break (grid, coarse_step_ms),
+                Err(_) => multiplier = multiplier.checked_add(1).ok_or_else(overflowed)?,
             }
-        }
-        if fits && count <= 10_000 {
-            break (grids, coarse_step_ms, count);
-        }
-        multiplier = multiplier.checked_add(1).ok_or_else(overflowed)?;
-    };
+        };
+        candidate_count = candidate_count
+            .checked_add(grid.len().checked_mul(2).ok_or_else(overflowed)?)
+            .ok_or_else(overflowed)?;
+        path_grids.push(grid);
+        path_coarse_steps_ms.push(coarse_step_ms);
+    }
 
     let synthesize_grid_candidates =
         |grids: &[Vec<f64>]| -> DspResult<Vec<SubIntegrationCandidate>> {
@@ -992,9 +1101,17 @@ pub fn optimize_separated_paths(
     // stage-1 optimum (clipped to its arrival window). Each fine window
     // contains its own coarse winner, so the final ranking can only match or
     // improve on stage 1, and every candidate stays a hardware-step multiple.
-    if multiplier > 1 {
+    let coarsest_step_ms = path_coarse_steps_ms
+        .iter()
+        .copied()
+        .fold(config.delay_step_ms, f64::max);
+    if coarsest_step_ms > config.delay_step_ms + 1.0e-12 {
         let mut fine_grids = Vec::with_capacity(paths.len());
-        for (path, estimate) in paths.iter().zip(&arrival_estimates) {
+        for ((path, estimate), path_coarse_step_ms) in paths
+            .iter()
+            .zip(&arrival_estimates)
+            .zip(&path_coarse_steps_ms)
+        {
             let best_delay_ms = ranking
                 .rankings
                 .iter()
@@ -1003,8 +1120,8 @@ pub fn optimize_separated_paths(
                 .ok_or_else(|| {
                     DspError::InvalidArgument("stage-one ranking lost a crossover candidate".into())
                 })?;
-            let refine_low_ms = (best_delay_ms - coarse_step_ms).max(estimate.window_low_ms);
-            let refine_high_ms = (best_delay_ms + coarse_step_ms).min(estimate.window_high_ms);
+            let refine_low_ms = (best_delay_ms - path_coarse_step_ms).max(estimate.window_low_ms);
+            let refine_high_ms = (best_delay_ms + path_coarse_step_ms).min(estimate.window_high_ms);
             fine_grids.push(snapped_delay_grid(
                 refine_low_ms,
                 refine_high_ms,
@@ -1017,20 +1134,12 @@ pub fn optimize_separated_paths(
             .ok_or_else(overflowed)?;
         ranking = rank_spliced_candidates(paths, common_grid, &fine_candidates, center_ms, config)?;
         ranking.warnings.push(format!(
-            "A {:.2} ms delay step over these arrival windows exceeds the candidate limits, so \
-             the search ran in two stages: a {coarse_step_ms:.2} ms scan of every window, then \
-             the full {:.2} ms resolution within +/-{coarse_step_ms:.2} ms of each crossover's \
-             best delay. Both stages contain only hardware-step multiples.",
+            "A {:.2} ms delay step over these arrival windows exceeds the per-window candidate \
+             limit, so the search ran in two stages: a coarse scan of every window (per-window \
+             steps up to {coarsest_step_ms:.2} ms), then the full {:.2} ms resolution within one \
+             coarse step of each crossover's best delay. Both stages contain only hardware-step \
+             multiples.",
             config.delay_step_ms, config.delay_step_ms,
-        ));
-    }
-    if anchor_path.crossover_hz > 55.0 {
-        ranking.warnings.push(format!(
-            "The lowest crossover candidate ({:.0} Hz) anchors the delay window, and its \
-             correlation ambiguity spacing (~{:.0} ms) falls inside the scan range; include a \
-             candidate at or below 50 Hz so the arrival anchor cannot lock a bass cycle off.",
-            anchor_path.crossover_hz,
-            1_000.0 / anchor_path.crossover_hz,
         ));
     }
     for estimate in &arrival_estimates {
@@ -1106,6 +1215,7 @@ pub fn optimize_separated_paths(
             .join(", "),
     ));
     ranking.warnings.extend(trim_warnings);
+    ranking.warnings.extend(arrival_warnings);
     // Sub-level advisory: the deployment trim the winner was scored at, plus
     // the deficit the same candidate keeps at the captured sub level, so the
     // report shows what applying the level change is worth. Nothing rescans
@@ -1213,17 +1323,9 @@ fn rank_spliced_candidates(
     if candidates.is_empty() {
         return Err(DspError::EmptyInput("sub-integration candidates"));
     }
-    let minimum_crossover = paths
-        .iter()
-        .map(|path| path.crossover_hz)
-        .fold(f64::INFINITY, f64::min);
-    let maximum_crossover = paths
-        .iter()
-        .map(|path| path.crossover_hz)
-        .fold(f64::NEG_INFINITY, f64::max);
     let sum_grid = &candidates[0].positions[0].left_combined.frequencies_hz;
     let (band_indices, band) =
-        scoring_band(sum_grid, 0.5 * minimum_crossover, 2.0 * maximum_crossover)?;
+        scoring_band(sum_grid, SUB_SCORING_BAND_LOW_HZ, SUB_SCORING_BAND_HIGH_HZ)?;
     let band_frequencies: Vec<f64> = band_indices.iter().map(|&index| sum_grid[index]).collect();
     let frequency_weights = log_frequency_weights(&band_frequencies)?;
     // The branch responses live on the full common grid while the sums live
@@ -1231,8 +1333,8 @@ fn rank_spliced_candidates(
     // index sets address the same physical frequencies.
     let (branch_band_indices, _) = scoring_band(
         common_grid,
-        0.5 * minimum_crossover,
-        2.0 * maximum_crossover,
+        SUB_SCORING_BAND_LOW_HZ,
+        SUB_SCORING_BAND_HIGH_HZ,
     )?;
     if branch_band_indices.len() != band_indices.len() {
         return Err(DspError::ShapeMismatch(
@@ -1458,6 +1560,22 @@ fn validate_separated_optimization(
         return Err(DspError::InvalidArgument(
             "crossover regularization must be finite and nonnegative".into(),
         ));
+    }
+    if let Some(reference) = &config.arrival_reference {
+        let common_grid = &paths[0].left_main.frequencies_hz;
+        for (label, response) in [
+            ("arrival-reference left main", &reference.left_main),
+            ("arrival-reference right main", &reference.right_main),
+            ("arrival-reference sub", &reference.sub),
+        ] {
+            validate_response(response, label)?;
+            require_same_grid(common_grid, &response.frequencies_hz, label)?;
+            if response.phase_rad.is_none() {
+                return Err(DspError::InvalidArgument(format!(
+                    "{label} phase is required for the arrival anchor"
+                )));
+            }
+        }
     }
     let mut ids = HashSet::new();
     let mut crossovers = HashSet::new();
@@ -1688,6 +1806,21 @@ fn complex_divide(numerator: (f64, f64), denominator: (f64, f64)) -> (f64, f64) 
 
 const ARRIVAL_SCAN_STEP_MS: f64 = 0.05;
 const ARRIVAL_SCAN_LIMIT_MS: f64 = 20.0;
+/// Arrival-anchor bands when the raw wide-band captures are available (v5).
+/// No single band is trustworthy in every room: measured on the 2026-08-03
+/// captures, 20-45 Hz alone degenerated on the left channel (peak pinned to
+/// the -20 ms scan edge - the room's sub/main relative phase is incoherent
+/// that low, the same incoherence the SECS phase diagnostics measured),
+/// while bands reaching past ~80 Hz drifted a half cycle (+4.65 ms) or
+/// pinned to +20 ms on the right. The anchor therefore takes the MEDIAN of
+/// this fixed band family evaluated per channel, after rejecting any
+/// estimate whose peak sits at a scan edge (a pinned peak is a degenerate
+/// correlation, not an arrival). All top edges stay at or below 80 Hz so
+/// every member's cycle ambiguity (>= ~15 ms at the effective carrier)
+/// stays out of reach of the median. On the same captures the family reads
+/// {-1.40, -0.40, +4.25, -0.65, +0.50} ms after rejection -> median
+/// -0.40 ms, consistent across channels to under 1 ms.
+const ARRIVAL_REFERENCE_BANDS_HZ: [(f64, f64); 3] = [(20.0, 45.0), (20.0, 60.0), (20.0, 80.0)];
 
 /// Band-limited complex cross-correlation of one main/sub pair, evaluated on
 /// the fixed [-ARRIVAL_SCAN_LIMIT_MS, +ARRIVAL_SCAN_LIMIT_MS] lag grid. Both
@@ -2749,6 +2882,7 @@ mod tests {
                 synthesized_crossover_model: None,
                 crossover_regularization_db_per_octave:
                     SEPARATED_PATH_CROSSOVER_REGULARIZATION_DB_PER_OCTAVE,
+                arrival_reference: None,
                 ranking: RankingConfig::default(),
             },
         )
@@ -2953,6 +3087,7 @@ mod tests {
                 synthesized_crossover_model: Some("LR4 high-pass + LR4 low-pass".into()),
                 crossover_regularization_db_per_octave:
                     SEPARATED_PATH_CROSSOVER_REGULARIZATION_DB_PER_OCTAVE,
+                arrival_reference: None,
                 ranking: RankingConfig::default(),
             },
         )
@@ -3018,6 +3153,7 @@ mod tests {
                 synthesized_crossover_model: Some("LR4/LR4".into()),
                 crossover_regularization_db_per_octave:
                     SEPARATED_PATH_CROSSOVER_REGULARIZATION_DB_PER_OCTAVE,
+                arrival_reference: None,
                 ranking: RankingConfig::default(),
             },
         )
@@ -3080,6 +3216,7 @@ mod tests {
             synthesized_crossover_model: Some("LR4/LR4".into()),
             crossover_regularization_db_per_octave:
                 SEPARATED_PATH_CROSSOVER_REGULARIZATION_DB_PER_OCTAVE,
+            arrival_reference: None,
             ranking: RankingConfig::default(),
         };
         let report_for = |sub_gain_db: f64| {
@@ -3200,6 +3337,7 @@ mod tests {
                 synthesized_crossover_model: Some("LR4/LR4".into()),
                 crossover_regularization_db_per_octave:
                     SEPARATED_PATH_CROSSOVER_REGULARIZATION_DB_PER_OCTAVE,
+                arrival_reference: None,
                 ranking: RankingConfig::default(),
             },
         )
@@ -3216,8 +3354,13 @@ mod tests {
             .iter()
             .find(|candidate| candidate.settings.crossover_hz == 110.0)
             .unwrap();
+        // The margin shrank from 0.1 when v5 fixed the scoring band at
+        // 20-500 Hz (the wider band adds main-dominated bins that are
+        // identical for both candidates, diluting the contrast without
+        // changing the order); the winner assertion below is the functional
+        // pin.
         assert!(
-            best_high.metrics.deficit_rms_db > best_low.metrics.deficit_rms_db + 0.1,
+            best_high.metrics.deficit_rms_db > best_low.metrics.deficit_rms_db + 0.05,
             "the sub's own dip must charge the crossover that exposes it: high {} vs low {}",
             best_high.metrics.deficit_rms_db,
             best_low.metrics.deficit_rms_db
@@ -3282,6 +3425,7 @@ mod tests {
                 synthesized_crossover_model: Some("LR4/LR4".into()),
                 crossover_regularization_db_per_octave:
                     SEPARATED_PATH_CROSSOVER_REGULARIZATION_DB_PER_OCTAVE,
+                arrival_reference: None,
                 ranking: RankingConfig::default(),
             },
         )
@@ -3395,6 +3539,7 @@ mod tests {
                 synthesized_crossover_model: None,
                 crossover_regularization_db_per_octave:
                     SEPARATED_PATH_CROSSOVER_REGULARIZATION_DB_PER_OCTAVE,
+                arrival_reference: None,
                 ranking: RankingConfig::default(),
             },
         )
@@ -3429,6 +3574,7 @@ mod tests {
             synthesized_crossover_model: None,
             crossover_regularization_db_per_octave:
                 SEPARATED_PATH_CROSSOVER_REGULARIZATION_DB_PER_OCTAVE,
+            arrival_reference: None,
             ranking: RankingConfig::default(),
         };
         assert!(optimize_separated_paths(&one, &config)
@@ -3461,5 +3607,148 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("between 0.01 and 5"));
+    }
+
+    #[test]
+    fn the_arrival_anchor_and_winner_are_candidate_set_invariant_in_wide_mode() {
+        // v4 anchored the arrival on the lowest-crossover CANDIDATE path, so
+        // dropping the 40 Hz candidate widened the anchor band, let a
+        // correlation alias one bass cycle away win, and moved every
+        // candidate's delay window - field data (2026-08-09) flipped
+        // 70 Hz / 0.38 ms to 80 Hz / 11.35 ms with identical captures. v5
+        // anchors on the raw wide-band captures, so nothing about the
+        // estimate may depend on which crossovers are listed.
+        let sub_true = shaped_response(|frequency| -0.01 * (frequency / 20.0), 5.0, false);
+        let main_true = shaped_response(|_| 0.0, 0.0, false);
+        let raw = WideBandIsolatedPaths {
+            left_main: main_true.clone(),
+            right_main: main_true,
+            sub: apply_complex_filter(&sub_true, |frequency_hz| {
+                low_pass_response(CrossoverAlignment::LinkwitzRiley4, 250.0, frequency_hz)
+            })
+            .unwrap(),
+        };
+        let optimize = |candidates: &[f64]| {
+            let states = synthesize_wide_band_crossover_states(
+                &raw,
+                &WideBandSynthesisConfig {
+                    candidate_crossovers_hz: candidates.to_vec(),
+                    sub_measured_low_pass_hz: Some(250.0),
+                    main_high_pass: CrossoverAlignment::LinkwitzRiley4,
+                    sub_low_pass: CrossoverAlignment::LinkwitzRiley4,
+                },
+            )
+            .unwrap();
+            optimize_separated_paths(
+                &states,
+                &SeparatedPathOptimizationConfig {
+                    measured_main_delay_ms: 0.0,
+                    measured_polarity: Polarity::Normal,
+                    delay_minimum_ms: -10.0,
+                    delay_maximum_ms: 25.0,
+                    delay_step_ms: 0.05,
+                    synthesized_crossover_model: Some("test LR4".into()),
+                    crossover_regularization_db_per_octave:
+                        SEPARATED_PATH_CROSSOVER_REGULARIZATION_DB_PER_OCTAVE,
+                    arrival_reference: Some(raw.clone()),
+                    ranking: RankingConfig::default(),
+                },
+            )
+            .unwrap()
+        };
+        let with_forty = optimize(&[40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 100.0, 110.0, 120.0]);
+        let without_forty = optimize(&[50.0, 60.0, 70.0, 80.0, 90.0, 100.0, 110.0, 120.0]);
+
+        assert_eq!(
+            with_forty.arrival_estimates[0].center_ms, without_forty.arrival_estimates[0].center_ms,
+            "the arrival anchor moved with the candidate list"
+        );
+        let best_for = |report: &SeparatedPathOptimizationReport, crossover_hz: f64| {
+            report
+                .ranking
+                .rankings
+                .iter()
+                .find(|candidate| candidate.settings.crossover_hz == crossover_hz)
+                .map(|candidate| {
+                    (
+                        candidate.settings.main_delay_ms.unwrap(),
+                        candidate.settings.polarity.unwrap(),
+                    )
+                })
+                .expect("every listed crossover is ranked")
+        };
+        for crossover_hz in [50.0, 60.0, 70.0, 80.0, 90.0, 100.0, 110.0, 120.0] {
+            assert_eq!(
+                best_for(&with_forty, crossover_hz),
+                best_for(&without_forty, crossover_hz),
+                "the {crossover_hz} Hz candidate's own best setting moved with the list"
+            );
+        }
+    }
+
+    #[test]
+    fn a_high_lowest_crossover_without_a_reference_warns_about_ambiguity() {
+        // Measured mode has no unfiltered capture; the lowest-path fallback
+        // is kept but must say out loud when its band can lock a bass cycle
+        // away (the class of silent failure the v5 anchor removes for the
+        // wide mode).
+        let sub_true = shaped_response(|frequency| -0.01 * (frequency / 20.0), 5.0, false);
+        let main_true = shaped_response(|_| 0.0, 0.0, false);
+        let raw = WideBandIsolatedPaths {
+            left_main: main_true.clone(),
+            right_main: main_true,
+            sub: apply_complex_filter(&sub_true, |frequency_hz| {
+                low_pass_response(CrossoverAlignment::LinkwitzRiley4, 250.0, frequency_hz)
+            })
+            .unwrap(),
+        };
+        let optimize = |candidates: &[f64]| {
+            let states = synthesize_wide_band_crossover_states(
+                &raw,
+                &WideBandSynthesisConfig {
+                    candidate_crossovers_hz: candidates.to_vec(),
+                    sub_measured_low_pass_hz: Some(250.0),
+                    main_high_pass: CrossoverAlignment::LinkwitzRiley4,
+                    sub_low_pass: CrossoverAlignment::LinkwitzRiley4,
+                },
+            )
+            .unwrap();
+            optimize_separated_paths(
+                &states,
+                &SeparatedPathOptimizationConfig {
+                    measured_main_delay_ms: 0.0,
+                    measured_polarity: Polarity::Normal,
+                    delay_minimum_ms: -10.0,
+                    delay_maximum_ms: 25.0,
+                    delay_step_ms: 0.05,
+                    synthesized_crossover_model: Some("test LR4".into()),
+                    crossover_regularization_db_per_octave:
+                        SEPARATED_PATH_CROSSOVER_REGULARIZATION_DB_PER_OCTAVE,
+                    arrival_reference: None,
+                    ranking: RankingConfig::default(),
+                },
+            )
+            .unwrap()
+        };
+        let ambiguous = optimize(&[50.0, 80.0]);
+        assert!(
+            ambiguous
+                .ranking
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("at or below 40 Hz")),
+            "warnings: {:?}",
+            ambiguous.ranking.warnings
+        );
+        let anchored = optimize(&[40.0, 80.0]);
+        assert!(
+            !anchored
+                .ranking
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("at or below 40 Hz")),
+            "warnings: {:?}",
+            anchored.ranking.warnings
+        );
     }
 }

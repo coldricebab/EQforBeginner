@@ -491,6 +491,12 @@ export const en: Messages = {
     subwooferSettingsPath: "Settings evidence file",
     subwooferSetupLimits: "Input bounds: crossover 30–200 Hz · main-relative delay -20–50 ms · polarity 0/180° · sub level -30 to +12 dB",
     restoreAcceptedMeasurements: "Restore accepted measurement cache",
+    debugRelaxRestore:
+      "Debug mode — restore even when subwoofer settings or microphone differ",
+    debugRelaxRestoreNote:
+      "Warning: this restores cached measurements whose subwoofer conditions (crossover, delay, polarity, level) or microphone (device, channel) differ from this session. Evidence from a different hardware state is then mixed in, so results are for diagnosis only - do not base a real correction decision on them. Measurements admitted this way carry the debug_relaxed_evidence_restore diagnostic code. (Calibration and sweep files, sample rate, and system mode are still checked.)",
+    debugRelaxedRestoreCount:
+      "⚠ {count} of these were admitted only by debug mode - the evidence is mixed.",
     restoringAcceptedMeasurements: "Checking hashes and hardware settings…",
     restoredAcceptedMeasurements: "Restored {count} accepted measurements with the exact same microphone, calibration, sweeps, and hardware settings.",
     noAcceptedMeasurementsToRestore: "No previous accepted measurements exactly match the current inputs.",
@@ -519,33 +525,33 @@ export const en: Messages = {
     position: "Position",
     positionLabels: {
       P0: "P0 center",
-      P1: "P1 surround 1",
-      P2: "P2 surround 2",
-      P3: "P3 surround 3",
-      P4: "P4 surround 4",
-      P5: "P5 surround 5",
-      P6: "P6 surround 6",
-      P7: "P7 surround 7",
-      P8: "P8 surround 8",
+      P1: "P1 upper front-left",
+      P2: "P2 upper front-right",
+      P3: "P3 upper back-right",
+      P4: "P4 upper back-left",
+      P5: "P5 lower front-left",
+      P6: "P6 lower front-right",
+      P7: "P7 lower back-right",
+      P8: "P8 lower back-left",
       P0_END: "P0 end repeat",
     },
     positionDetails: {
-      P0: "Normal head center · ear height",
-      P1: "About 25–30 cm left of P0",
-      P2: "About 25–30 cm right of P0",
-      P3: "About 20–25 cm toward the speakers",
-      P4: "About 20–25 cm behind P0",
-      P5: "About 10–15 cm directly above P0",
-      P6: "About 25–30 cm diagonally behind-left of P0",
-      P7: "About 25–30 cm diagonally behind-right of P0",
-      P8: "About 10–15 cm directly below P0",
+      P0: "Normal head center · ear height (the exact center of the box)",
+      P1: "Upper front-left corner: 25–30 cm left · 20–25 cm toward the speakers · 10–15 cm up",
+      P2: "Upper front-right corner: 25–30 cm right · 20–25 cm toward the speakers · 10–15 cm up",
+      P3: "Upper back-right corner: 25–30 cm right · 20–25 cm behind · 10–15 cm up",
+      P4: "Upper back-left corner: 25–30 cm left · 20–25 cm behind · 10–15 cm up",
+      P5: "Lower front-left corner: 25–30 cm left · 20–25 cm toward the speakers · 10–15 cm down",
+      P6: "Lower front-right corner: 25–30 cm right · 20–25 cm toward the speakers · 10–15 cm down",
+      P7: "Lower back-right corner: 25–30 cm right · 20–25 cm behind · 10–15 cm down",
+      P8: "Lower back-left corner: 25–30 cm left · 20–25 cm behind · 10–15 cm down",
       P0_END: "Return approximately to the starting center area and repeat",
     },
     positionGuide: {
       title: "Where should the microphone go?",
-      body: "Sample a small listening volume around P0. You are not measuring the whole sofa, and ruler-perfect placement is unnecessary.",
+      body: "Sample the eight corners of a small box centered on P0: P1–P4 are the four corners 10–15 cm above ear height, P5–P8 the same four corners 10–15 cm below. Walking the upper four first and then the lower four means changing height only once, and ruler-perfect placement is unnecessary.",
       diagramLabel:
-        "Top view of P0 through P4 plus P6 and P7, and side view of raised P5 and lowered P8",
+        "Top view of the box's four corner columns (P1·P5, P2·P6, P3·P7, P4·P8) and side view of the upper P1–P4 and lower P5–P8 levels",
       speakers: "Speakers",
       listeningArea: "Listening area",
       topView: "Top view",
@@ -553,7 +559,7 @@ export const en: Messages = {
       floor: "Floor",
       earHeight: "Ear height",
       microphone: "Microphone",
-      note: "Keep the microphone upright in its 90° calibration orientation. Do not change stand height, amplifier volume, or microphone gain through P0_END.",
+      note: "Keep the microphone upright in its 90° calibration orientation. Change only the height — 10–15 cm up for P1–P4, down for P5–P8 — and keep amplifier volume and microphone gain unchanged through P0_END.",
     },
     channelLabels: { left: "L sweep", right: "R sweep" },
     pairProgress: "{complete}/{total} accepted L/R positions · A trial can use P0 alone, but all positions and the end repeat are recommended.",
@@ -661,6 +667,23 @@ export const en: Messages = {
     secsDelayMode: "Target delay",
     secsDelayAuto: "Automatic search (2-10 ms)",
     secsDelayFixed: "Fixed (ms, 2-10)",
+    secsImprovedPhase:
+      "Improved SECS: guard unrealizable phase corrections and gate group delay (recommended)",
+    secsImprovedPhaseNote:
+      "Where the room's bass arrives later than the pre-ring budget can advance, the original mixed-phase corrector turns the intended advance into extra delay (a real filter delayed 20–120 Hz by 70–200 ms while every magnitude chart looked fine). The improved path leaves those bands uncorrected instead, and the designed filter must pass a group-delay gate. Unchecked runs the original SECS algorithm bit for bit.",
+    secsGroupDelayReport:
+      "Filter's own group delay vs its treble (worst channel): {bands}. A magnitude chart cannot show this; it is judged from the designed filter alone.",
+    secsGroupDelayLimit: "limit {limit} ms",
+    secsMaxDelay: "Delay ceiling",
+    secsMaxDelayAuto: "Automatic (recommended) — measured optimum",
+    secsMaxDelayAutoNote:
+      "The design first measures how late this room's bass actually arrives, then sets the ceiling itself: requirement + 10 ms headroom (5 ms steps, up to 250 ms). Without late bass it stays at the original 10 ms and spends no extra latency. A ceiling far past the requirement buys nothing and only adds early-energy smear and playback lag, so 'just enough' is the optimum. When an extended ceiling is chosen the filter is music-only (unusable with video).",
+    secsMaxDelayAutoResult:
+      "Delay ceiling resolved automatically: measured low-band requirement {need} ms → ceiling {ceiling} ms",
+    secsMaxDelayDefault: "10 ms (original, video-safe)",
+    secsMaxDelayOption: "{ms} ms (music only)",
+    secsMaxDelayNote:
+      "An extended ceiling is used as the filter's delay outright, so playback lags by that much — fine for music, unusable with video. In return, bass arriving later than 10 ms (a sub chain's DSP latency plus room storage is often 40-60 ms) becomes genuinely correctable instead of being left alone by the guard. Mid/high pre-ringing stays capped regardless. Verify by measurement and by ear.",
     secsMultiPosition:
       "Average all measured positions for the tonal correction (recommended; phase stays on P0)",
     secsFollowTarget:

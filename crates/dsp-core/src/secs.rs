@@ -43,6 +43,38 @@ type C64 = Complex<f64>;
 
 /// Algorithm identifier recorded on SECS-designed artifacts.
 pub const SECS_ALGORITHM_VERSION: &str = "secs-port-v1";
+/// Version suffix recorded when the phase guard (app extension) is active.
+pub const SECS_PHASE_GUARD_VERSION: &str = "phase-guard-v1";
+
+/// The phase guard leaves the excess corrector alone unless it makes the
+/// residual group delay worse than no correction by more than this margin.
+/// The margin absorbs finite-difference estimation noise on the smoothed
+/// spectra; it sits far below the commonly cited low-frequency group-delay
+/// audibility floor (~20-40 ms), so a genuinely useful correction is never
+/// guarded away.
+pub const SECS_PHASE_GUARD_TOLERANCE_MS: f64 = 5.0;
+/// Share of each group-delay gate band's limit the excess corrector itself
+/// may spend. The gate judges the whole filter; the minimum-phase side owns
+/// the rest of the budget (measured ~+3 ms on real captures, far inside the
+/// remaining 40%). A causal all-pass can only *delay* by large amounts -
+/// large advance is impossible - and a filter-side delay beyond the gate
+/// limit is exactly what the gate forbids, so bounding the corrector here
+/// cannot remove a correction the gate would have allowed.
+pub const SECS_PHASE_GUARD_BAND_BUDGET_RATIO: f64 = 0.6;
+
+/// Group-delay gate bands: (low Hz, high Hz, |group delay| limit in ms
+/// relative to the filter's own 1-16 kHz baseline). The limits follow the
+/// shape of published audibility thresholds (Blauert & Laws-style: a few ms
+/// in the midrange, relaxing toward low frequencies where 20-40 ms is the
+/// commonly cited floor) with a margin: a filter inside these bounds cannot
+/// smear timing audibly on its own. The real 2026-08-03 session shipped
+/// 70-200 ms of low-band delay - one to two orders past every threshold -
+/// because nothing judged group delay anywhere in the pipeline.
+pub const SECS_GROUP_DELAY_GATE_BANDS: [(f64, f64, f64); 3] = [
+    (20.0, 100.0, 30.0),
+    (100.0, 300.0, 15.0),
+    (300.0, 1_000.0, 8.0),
+];
 
 /// SECS constants, mirrored from the top of SECS.py.
 pub const SECS_PHASE_PRERING_LOW_MIN_MS: f64 = 2.0;
@@ -51,6 +83,31 @@ pub const SECS_PHASE_PRERING_MID_MAX_MS: f64 = 10.0;
 pub const SECS_PHASE_PRERING_HIGH_MAX_MS: f64 = 5.0;
 pub const SECS_AUTO_DELAY_MIN_MS: f64 = 2.0;
 pub const SECS_AUTO_DELAY_MAX_MS: f64 = 10.0;
+/// Hard ceiling for the extended-delay option (app extension). A room's
+/// bass excess rarely passes 100 ms; 250 ms covers any real system with
+/// margin while keeping tap counts and design time bounded.
+pub const SECS_MAXIMUM_DELAY_CEILING_MS: f64 = 250.0;
+/// Headroom the automatic ceiling adds on top of the measured low-band
+/// advance requirement. The extended low-band window is flat out to the
+/// ceiling with a [`SECS_PHASE_PRERING_MID_MAX_MS`] cosine taper on its far
+/// edge, so content advanced by the measured requirement only stays in the
+/// flat region when the ceiling exceeds the requirement by at least the
+/// taper length. Purely window geometry - not tuned to any observed result.
+pub const SECS_AUTO_CEILING_HEADROOM_MS: f64 = SECS_PHASE_PRERING_MID_MAX_MS;
+/// Rounding step for the automatically resolved ceiling: latency is a
+/// user-facing number, and a stable 5 ms grid keeps repeated designs of the
+/// same room from flickering between near-identical resolved values.
+pub const SECS_AUTO_CEILING_STEP_MS: f64 = 5.0;
+/// Band-wise bulk-advance profile centers, Hz (half-octave steps, one octave
+/// wide each, clamped to 16-100 Hz), for the diagnostic profile
+/// [`secs_low_band_advance_profile_ms`]. A room's low-band lateness is not
+/// one number (the 2026-08-03 captures trail ~42 ms at 20-40 Hz vs ~57 ms at
+/// 40-70 Hz by energy median), but rotating the design by a per-band profile
+/// was measured worse in every variant - see the bulk-split comment in
+/// `precompute_secs_channel` - so the profile serves diagnosis only: it
+/// reports per band what the matched filter reads and how coherent (i.e.
+/// how trustworthy) that reading is.
+pub const SECS_BULK_PROFILE_CENTERS_HZ: [f64; 4] = [25.0, 35.36, 50.0, 70.71];
 pub const SECS_AUTO_DELAY_COARSE_STEP_MS: f64 = 1.0;
 pub const SECS_AUTO_DELAY_WEIGHT_GAIN: f64 = 2.0;
 pub const SECS_CHANNEL_BALANCE_BAND_LOW_HZ: f64 = 20.0;
@@ -142,6 +199,30 @@ pub struct SecsConfig {
     /// split there thins mono bass in a way per-channel verification sweeps
     /// can never observe. `None` keeps the plain stereo path (parity-pinned).
     pub shared_low_frequency_hz: Option<f64>,
+    /// App extension (not in SECS.py): guard the mixed-phase corrector
+    /// against unrealizable corrections. The ideal excess inverse wants to
+    /// *advance* late bass, but the causal pre-ring window only allows
+    /// `target_delay_ms` (2-10 ms) of advance; where the room needs more,
+    /// the truncated-then-renormalized all-pass turns the intended advance
+    /// into extra *delay* (a real 2026-08-03 filter delayed 20-120 Hz by
+    /// 70-200 ms while every magnitude metric looked fine). With the guard
+    /// on, the windowed corrector is compared per frequency against no
+    /// correction; wherever it worsens the residual group delay beyond
+    /// [`SECS_PHASE_GUARD_TOLERANCE_MS`] it is blended back to unity - "no
+    /// phase correction here" instead of "wrong phase correction here".
+    /// `false` reproduces the original algorithm bit for bit.
+    pub phase_guard: bool,
+    /// App extension: ceiling for `target_delay_ms` and for the low-band
+    /// pre-ring window that gives the excess corrector its advance
+    /// capability. At the SECS.py value ([`SECS_AUTO_DELAY_MAX_MS`], 10 ms)
+    /// every path is bit-exact original. Raising it is a music-only trade:
+    /// the filter's latency grows by the same amount (irrelevant without
+    /// video), and late bass beyond 10 ms - a sub chain's DSP latency plus
+    /// modal storage measured 38-57 ms on a real system - becomes genuinely
+    /// correctable instead of guarded away. Mid/high pre-ring windows keep
+    /// their own 10/5 ms caps regardless, so the audibility-sensitive bands
+    /// never gain pre-ringing from this.
+    pub maximum_delay_ms: f64,
 }
 
 /// One channel's reusable analysis, mirror of `precompute_secs_channel`.
@@ -269,6 +350,37 @@ fn sample_shift_phase(freqs: &[f64], sample_rate_hz: f64, shift_samples: f64) ->
 
 /// `get_asymmetric_window`: raised-cosine tapers of `left_ms` before t=0 and
 /// `right_ms` after (`f64::INFINITY` keeps the entire right side).
+/// Flat-topped variant for the extended-delay low band: unity out to
+/// `left_ms - taper_ms`, cosine only over the last `taper_ms`. The original
+/// window tapers across its whole left extent, which erased a restored
+/// 51 ms bulk advance sitting at 85% of a 60 ms window (gain 0.056) - the
+/// advanced low-band energy IS the correction and must survive its window.
+/// Only the extended improved path uses this; every original path keeps the
+/// SECS.py window bit for bit.
+fn asymmetric_window_flat_left(
+    n: usize,
+    sample_rate_hz: f64,
+    left_ms: f64,
+    taper_ms: f64,
+) -> Vec<f64> {
+    let mut window = vec![0.0; n];
+    let left_samples = (left_ms * sample_rate_hz / 1000.0) as isize;
+    let taper_samples = ((taper_ms * sample_rate_hz / 1000.0) as isize).max(1);
+    let flat_samples = (left_samples - taper_samples).max(0);
+    let distance = centered_distance(n);
+    for (slot, dist) in window.iter_mut().zip(distance.iter()) {
+        let dist = *dist;
+        // The whole right side and the flat part of the left side are unity.
+        if dist >= -flat_samples {
+            *slot = 1.0;
+        } else if dist >= -left_samples {
+            let into_taper = (-dist - flat_samples) as f64 / taper_samples as f64;
+            *slot = 0.5 * (1.0 + (std::f64::consts::PI * into_taper).cos());
+        }
+    }
+    window
+}
+
 fn asymmetric_window(n: usize, sample_rate_hz: f64, left_ms: f64, right_ms: f64) -> Vec<f64> {
     let mut window = vec![0.0; n];
     let left_samples = (left_ms * sample_rate_hz / 1000.0) as isize;
@@ -652,6 +764,234 @@ fn find_natural_high_cutoff(f_pos: &[f64], mag_smoothed: &[f64]) -> f64 {
 /// re-anchored to 0 dB at [`SECS_TARGET_OVERLAY_ANCHOR_HZ`], evaluated by the
 /// caller - multiplies the adaptive target after the ideal-envelope cap,
 /// exactly like the bass shelf.
+/// Peak-aligned excess-phase inverse of one IR on its own FFT grid - the
+/// exact object the mixed-phase corrector inverts (conj(H/H_min)). Shared by
+/// `precompute_secs_channel` and the delay-requirement probe so the probe
+/// judges precisely what the design will be asked to correct.
+struct SecsExcessInverse {
+    freqs: Vec<f64>,
+    own_magnitude: Vec<f64>,
+    excess_inv_h: Vec<C64>,
+}
+
+fn secs_excess_phase_inverse(ir: &[f64], sample_rate_hz: f64) -> SecsExcessInverse {
+    let n = ir.len();
+    let freqs = fft_frequencies(n, sample_rate_hz);
+    let peak_index = argmax_abs(ir);
+    let h_raw = fft_real(ir, n);
+    let shift = sample_shift_phase(&freqs, sample_rate_hz, peak_index as f64);
+    let h_shifted: Vec<C64> = h_raw.iter().zip(shift.iter()).map(|(h, s)| h * s).collect();
+    let own_magnitude: Vec<f64> = h_raw.iter().map(|h| h.norm()).collect();
+    let min_h = minimum_phase_from_magnitude(&own_magnitude);
+    let excess_inv_h: Vec<C64> = h_shifted
+        .iter()
+        .zip(min_h.iter())
+        .map(|(h, m)| (h / (m + 1e-12)).conj())
+        .collect();
+    SecsExcessInverse {
+        freqs,
+        own_magnitude,
+        excess_inv_h,
+    }
+}
+
+/// Matched-filter scan for the common advance the excess-phase inverse asks
+/// for within one frequency band: the bulk delay whose removal maximizes the
+/// coherent sum over the band's bins, on a 0.5 ms grid. Returns the best
+/// delay and its coherence (peak coherent sum over the incoherent sum, 1 =
+/// the whole band is one clean delay).
+fn band_advance_scan_ms(
+    freqs: &[f64],
+    excess_inv_h: &[C64],
+    low_hz: f64,
+    high_hz: f64,
+    maximum_ms: f64,
+) -> (f64, f64) {
+    let band: Vec<usize> = (0..freqs.len())
+        .filter(|index| {
+            let frequency = freqs[*index];
+            frequency > low_hz && frequency < high_hz
+        })
+        .collect();
+    let incoherent: f64 = band.iter().map(|&index| excess_inv_h[index].norm()).sum();
+    if incoherent <= 0.0 {
+        return (0.0, 0.0);
+    }
+    let mut best_ms = 0.0_f64;
+    let mut best_score = f64::NEG_INFINITY;
+    let mut candidate_ms = 0.0;
+    while candidate_ms <= maximum_ms + 1e-9 {
+        let score = band
+            .iter()
+            .map(|&index| {
+                let rotation = C64::from_polar(
+                    1.0,
+                    -2.0 * std::f64::consts::PI * freqs[index] * candidate_ms / 1000.0,
+                );
+                excess_inv_h[index] * rotation
+            })
+            .sum::<C64>()
+            .norm();
+        if score > best_score {
+            best_score = score;
+            best_ms = candidate_ms;
+        }
+        candidate_ms += 0.5;
+    }
+    (best_ms, (best_score / incoherent).clamp(0.0, 1.0))
+}
+
+/// One band of the diagnostic bulk-advance profile.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SecsAdvanceProfileBand {
+    pub center_hz: f64,
+    pub low_hz: f64,
+    pub high_hz: f64,
+    /// The band's own matched-filter reading. Meaningful only as far as
+    /// `coherence` stands above `noise_floor` - a band whose excess has no
+    /// single arrival cannot nominate a delay (a real 20-40 Hz capture at
+    /// coherence 0.22 read "207 ms").
+    pub advance_ms: f64,
+    /// Peak coherent sum over the incoherent sum (1 = the band is one clean
+    /// delay; low values mean the band has no single arrival to speak of).
+    pub coherence: f64,
+    /// Expected coherence of pure noise for this band's bin count
+    /// (0.886/sqrt(N), the Rayleigh mean of N unit phasors).
+    pub noise_floor: f64,
+    /// Trustworthiness on a 0-1 scale: 0 at the noise floor, 1 at four
+    /// times the noise floor.
+    pub weight: f64,
+}
+
+/// Diagnostic band-wise bulk-advance profile of one impulse response: what
+/// the matched filter of [`band_advance_scan_ms`] reads in each octave-wide
+/// band around [`SECS_BULK_PROFILE_CENTERS_HZ`], with each reading's
+/// coherence and noise floor so a junk reading is recognizable as such.
+/// Diagnosis only - the design's bulk split deliberately stays on the
+/// wide-band scalar estimate (see the comment in `precompute_secs_channel`).
+pub fn secs_low_band_advance_profile_ms(
+    ir: &[f64],
+    sample_rate_hz: u32,
+) -> DspResult<Vec<SecsAdvanceProfileBand>> {
+    if ir.is_empty() {
+        return Err(DspError::EmptyInput("SECS impulse response"));
+    }
+    for (index, value) in ir.iter().enumerate() {
+        if !value.is_finite() {
+            return Err(DspError::NonFinite {
+                context: "SECS impulse response",
+                index,
+            });
+        }
+    }
+    let inverse = secs_excess_phase_inverse(ir, f64::from(sample_rate_hz));
+    Ok(SECS_BULK_PROFILE_CENTERS_HZ
+        .iter()
+        .map(|&center_hz| {
+            let low_hz = (center_hz / std::f64::consts::SQRT_2).max(16.0);
+            let high_hz = (center_hz * std::f64::consts::SQRT_2).min(100.0);
+            let (advance_ms, coherence) = band_advance_scan_ms(
+                &inverse.freqs,
+                &inverse.excess_inv_h,
+                low_hz,
+                high_hz,
+                SECS_MAXIMUM_DELAY_CEILING_MS,
+            );
+            let bins = inverse
+                .freqs
+                .iter()
+                .filter(|frequency| **frequency > low_hz && **frequency < high_hz)
+                .count();
+            let noise_floor = if bins > 0 {
+                0.886 / (bins as f64).sqrt()
+            } else {
+                1.0
+            };
+            let weight = ((coherence / noise_floor - 1.0) / 3.0).clamp(0.0, 1.0);
+            SecsAdvanceProfileBand {
+                center_hz,
+                low_hz,
+                high_hz,
+                advance_ms,
+                coherence,
+                noise_floor,
+                weight,
+            }
+        })
+        .collect())
+}
+
+/// Measured low-band advance requirement of one impulse response, in ms: how
+/// far its 20-90 Hz energy trails its own minimum-phase part, judged by the
+/// same wide-band matched-filter estimate the extended design's bulk split
+/// rotates out - the requirement is exactly what the design will spend its
+/// budget on. Scanned to the hard ceiling on the design's own 0.5 ms grid;
+/// independent of any design configuration. (The per-band profile was tried
+/// as the requirement and produced junk on real captures - a 207 ms reading
+/// from a band whose coherence sat at the noise floor - so the requirement
+/// stays on the wide-band estimate, whose coherent content dominates.)
+pub fn secs_required_bulk_advance_ms(ir: &[f64], sample_rate_hz: u32) -> DspResult<f64> {
+    if ir.is_empty() {
+        return Err(DspError::EmptyInput("SECS impulse response"));
+    }
+    for (index, value) in ir.iter().enumerate() {
+        if !value.is_finite() {
+            return Err(DspError::NonFinite {
+                context: "SECS impulse response",
+                index,
+            });
+        }
+    }
+    let inverse = secs_excess_phase_inverse(ir, f64::from(sample_rate_hz));
+    let (advance_ms, _) = band_advance_scan_ms(
+        &inverse.freqs,
+        &inverse.excess_inv_h,
+        20.0,
+        90.0,
+        SECS_MAXIMUM_DELAY_CEILING_MS,
+    );
+    Ok(advance_ms)
+}
+
+/// Result of the automatic ceiling resolution: the ceiling the design should
+/// run with, and the measured requirement (worst channel) it covers.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SecsAutoDelayCeiling {
+    pub ceiling_ms: f64,
+    pub requirement_ms: f64,
+}
+
+/// Resolve the automatic extended-delay ceiling for a stereo pair: the
+/// larger channel's measured requirement plus the flat-window taper headroom
+/// ([`SECS_AUTO_CEILING_HEADROOM_MS`]), rounded up to the
+/// [`SECS_AUTO_CEILING_STEP_MS`] grid and capped at the hard ceiling. A pair
+/// whose bass needs no more than the original 10 ms budget resolves to
+/// exactly that budget, so the automatic choice never spends latency the
+/// room does not ask for - a ceiling well past the requirement buys nothing
+/// and only widens the filter's early-energy spread and the playback lag.
+pub fn secs_auto_delay_ceiling_ms(
+    left_ir: &[f64],
+    right_ir: &[f64],
+    sample_rate_hz: u32,
+) -> DspResult<SecsAutoDelayCeiling> {
+    let left = secs_required_bulk_advance_ms(left_ir, sample_rate_hz)?;
+    let right = secs_required_bulk_advance_ms(right_ir, sample_rate_hz)?;
+    let requirement_ms = left.max(right);
+    if requirement_ms <= SECS_AUTO_DELAY_MAX_MS {
+        return Ok(SecsAutoDelayCeiling {
+            ceiling_ms: SECS_AUTO_DELAY_MAX_MS,
+            requirement_ms,
+        });
+    }
+    let stepped = ((requirement_ms + SECS_AUTO_CEILING_HEADROOM_MS) / SECS_AUTO_CEILING_STEP_MS)
+        .ceil()
+        * SECS_AUTO_CEILING_STEP_MS;
+    Ok(SecsAutoDelayCeiling {
+        ceiling_ms: stepped.min(SECS_MAXIMUM_DELAY_CEILING_MS),
+        requirement_ms,
+    })
+}
+
 fn precompute_secs_channel(
     ir: &[f64],
     config: &SecsConfig,
@@ -660,20 +1000,59 @@ fn precompute_secs_channel(
 ) -> SecsChannelPrecompute {
     let n = ir.len();
     let sample_rate_hz = f64::from(config.sample_rate_hz);
-    let freqs = fft_frequencies(n, sample_rate_hz);
-    let f_abs = absolute_frequencies(&freqs);
-    let peak_index = argmax_abs(ir);
-    let h_raw = fft_real(ir, n);
-    let shift = sample_shift_phase(&freqs, sample_rate_hz, peak_index as f64);
-    let h_shifted: Vec<C64> = h_raw.iter().zip(shift.iter()).map(|(h, s)| h * s).collect();
     let weights = lr4_weights_5bands(n, sample_rate_hz);
-    let own_magnitude: Vec<f64> = h_raw.iter().map(|h| h.norm()).collect();
-    let min_h = minimum_phase_from_magnitude(&own_magnitude);
-    let mut excess_inv_h: Vec<C64> = h_shifted
-        .iter()
-        .zip(min_h.iter())
-        .map(|(h, m)| (h / (m + 1e-12)).conj())
+    let inverse = secs_excess_phase_inverse(ir, sample_rate_hz);
+    let freqs = inverse.freqs;
+    let f_abs = absolute_frequencies(&freqs);
+    let own_magnitude = inverse.own_magnitude;
+    let mut excess_inv_h = inverse.excess_inv_h;
+    // Extended-delay bulk split (improved path only): the complex band
+    // smoothing below was designed around the SECS.py <=10 ms budget. A room
+    // whose bass trails by 40-60 ms puts a phase ramp of several full turns
+    // per smoothing window into the corrector, and averaging unit vectors
+    // through full turns cancels them - the intended advance never survives
+    // into the smoothed corrector (measured on real captures: a 60 ms budget
+    // still produced a +26 to +41 ms *delaying* corrector). So the common
+    // low-band bulk advance is estimated first, divided out so the smoothing
+    // only sees the shallow residual structure it was built for, and
+    // restored afterwards. The guard and the group-delay gate still judge
+    // the outcome; this only changes what the smoothing is asked to survive.
+    // A band-wise rotation profile was tried here and measured worse on
+    // real captures in every variant (see `secs_low_band_advance_profile_ms`
+    // and docs/dsp.md): the 20-40 Hz excess of the 2026-08-03 room has no
+    // coherent arrival (coherence at the noise floor), so per-band deviations
+    // either inject junk delays or flip the guard's finely balanced L/R
+    // verdicts (a few ms of rotation change swung the L 20-40 Hz seat
+    // residual from +12.8 to +34.5 ms, and one divergent verdict made the
+    // 2.1 reconciliation strip both channels entirely). The scalar wide-band
+    // estimate is what the guard and the field results were verified with.
+    let bulk_advance_ms = if config.phase_guard && config.maximum_delay_ms > SECS_AUTO_DELAY_MAX_MS
+    {
+        let (best_ms, coherence) =
+            band_advance_scan_ms(&freqs, &excess_inv_h, 20.0, 90.0, config.maximum_delay_ms);
+        if std::env::var_os("SECS_GUARD_DEBUG").is_some() {
+            eprintln!("bulk advance estimate: {best_ms:.1} ms (coherence {coherence:.2})");
+        }
+        best_ms
+    } else {
+        0.0
+    };
+    // The bulk ramp is confined to the low split (the same complementary
+    // LR4 partition whose pre-ring window is pr_low), fading out with it:
+    // above the split the pre-ring caps are 10/5 ms and a large advance
+    // ramp would only be truncated into corruption there.
+    let bulk_weight: Vec<f64> = (0..n)
+        .map(|index| weights[0][index] + weights[1][index])
         .collect();
+    if bulk_advance_ms > 0.0 {
+        for index in 0..n {
+            excess_inv_h[index] *= C64::from_polar(
+                1.0,
+                -2.0 * std::f64::consts::PI * freqs[index] * bulk_advance_ms * bulk_weight[index]
+                    / 1000.0,
+            );
+        }
+    }
     let mag_orig: Vec<f64> = match magnitude_override {
         Some(magnitude) => magnitude.to_vec(),
         None => own_magnitude.clone(),
@@ -739,6 +1118,16 @@ fn precompute_secs_channel(
         apply_5band_smoothing_complex(&excess_inv_h, sample_rate_hz, &weights, config.resolution);
     for value in smoothed_excess.iter_mut() {
         *value /= value.norm() + 1e-12;
+    }
+    // Restore the bulk advance the smoothing never saw.
+    if bulk_advance_ms > 0.0 {
+        for index in 0..n {
+            smoothed_excess[index] *= C64::from_polar(
+                1.0,
+                2.0 * std::f64::consts::PI * freqs[index] * bulk_advance_ms * bulk_weight[index]
+                    / 1000.0,
+            );
+        }
     }
     let mut excess_time = smoothed_excess;
     ifft_in_place(&mut excess_time);
@@ -857,6 +1246,306 @@ fn precompute_secs_channel(
 struct SecsChannelFilter {
     taps: Vec<f64>,
     target_mag_ideal: Vec<f64>,
+    /// Whether the phase guard removed excess correction anywhere inside the
+    /// shared sub band. Below the bass-management crossover one subwoofer
+    /// reproduces both channels, so the two filters must agree in phase
+    /// there; the caller re-runs both with the removal forced when the
+    /// channels disagree.
+    shared_band_guard_removed: bool,
+}
+
+/// Phase guard (app extension; see `SecsConfig::phase_guard`): blend the
+/// windowed excess corrector back to unity wherever it fails its own job.
+///
+/// `windowed` is the pre-ring-windowed, unit-magnitude corrector about to be
+/// applied; `excess_inv_ir` is the unwindowed corrector it was cut from,
+/// whose conjugate spectrum is the room's measured excess phase. The
+/// corrected residual is `excess x windowed`; without correction it is
+/// `excess` alone. Comparing the two per-bin group delays asks the only
+/// question that matters - does applying the corrector here bring the timing
+/// closer to zero than leaving it alone? - and covers every failure mode of
+/// the causal truncation at once, without modeling the window itself. The
+/// keep/drop verdict is smoothed over frequency so the blend stays a smooth
+/// all-pass, and the result is renormalized to unit magnitude.
+///
+/// `shared_low_frequency_hz` marks the band where one subwoofer reproduces
+/// both channels. The verdict there must be identical for L and R - the two
+/// signals are summed into one driver, so a phase split cancels mono bass at
+/// the sub input, and a per-channel verification sweep cannot see it. The
+/// function reports whether it removed anything inside that band, and
+/// `force_shared_removal` lets the caller re-run the other channel with the
+/// same decision. (Without this the guard broke the 2.1 commonization: on a
+/// real 2026-08-04 filter L spent 27.3 ms of its 18 ms band budget and was
+/// stripped while R spent 7.9 ms and kept its correction, leaving 84 degrees
+/// of L/R phase split and -1.95 dB of mono bass at 20-30 Hz.)
+/// `advance_budget_ms` is the low-band pre-ring window actually applied: a
+/// corrector may legitimately *advance* a band by up to that much (that is
+/// the extended-delay feature), so the band budget bound is asymmetric -
+/// delay is capped by the gate share alone, advance by the budget plus it.
+fn guard_unrealizable_excess(
+    windowed: &mut [C64],
+    excess_inv_ir: &[f64],
+    sample_rate_hz: f64,
+    shared_low_frequency_hz: Option<f64>,
+    force_shared_removal: bool,
+    advance_budget_ms: f64,
+) -> bool {
+    let n = windowed.len();
+    let half = n / 2;
+    if half < 4 {
+        return false;
+    }
+    let mut shared_band_removed = false;
+    let ideal = fft_real(excess_inv_ir, n);
+    let bin_hz = sample_rate_hz / n as f64;
+    let normalized = |value: C64| -> C64 {
+        let norm = value.norm();
+        if norm > 1e-12 {
+            value / norm
+        } else {
+            C64::new(1.0, 0.0)
+        }
+    };
+    // The room's excess phase is the conjugate of the ideal inverse
+    // corrector; magnitudes are normalized out because only phase slopes
+    // matter here.
+    let residual_with: Vec<C64> = (0..=half)
+        .map(|index| normalized(ideal[index].conj() * windowed[index]))
+        .collect();
+    let residual_without: Vec<C64> = (0..=half)
+        .map(|index| normalized(ideal[index].conj()))
+        .collect();
+    let group_delay_ms = |curve: &[C64], index: usize| -> f64 {
+        let delta = (curve[index + 1] * curve[index].conj()).arg();
+        -1_000.0 * delta / (2.0 * std::f64::consts::PI * bin_hz)
+    };
+    let mut keep = vec![1.0_f64; n];
+    for (index, slot) in keep.iter_mut().enumerate().take(half) {
+        let with_correction = group_delay_ms(&residual_with, index).abs();
+        let without_correction = group_delay_ms(&residual_without, index).abs();
+        // Stage 1 is a smooth per-bin blend on both channels alike; its small
+        // divergence is bounded (the windowing alone already leaves a few
+        // degrees). The channel-splitting decision is the binary band kill
+        // in stage 2, so only that one is reconciled across channels.
+        if with_correction > without_correction + SECS_PHASE_GUARD_TOLERANCE_MS {
+            *slot = 0.0;
+        }
+    }
+    // Mirror the verdict onto the conjugate half so the blended spectrum
+    // remains the spectrum of a real impulse response.
+    for index in half + 1..n {
+        keep[index] = keep[n - index];
+    }
+    let smoothed = smooth_spectrum_real(&keep, sample_rate_hz, 3.0);
+    for (value, weight) in windowed.iter_mut().zip(smoothed.iter()) {
+        let blend = weight.clamp(0.0, 1.0);
+        *value = *value * blend + C64::new(1.0 - blend, 0.0);
+        *value = normalized(*value);
+    }
+
+    // Stage 2 (added after a real 2026-08-04 session tripped the design gate
+    // with stage 1 alone): on real modal excess the per-bin verdict
+    // degenerates. The baseline's own per-bin group delay is noise with
+    // swings far beyond any tolerance, so the comparison above turns into a
+    // variance contest, and a corrector that adds a consistent *bias* while
+    // slightly reducing variance wins most bins and survives - the field
+    // filter kept +37 to +55 ms of low-band bias that way. Band medians see
+    // the bias straight through the noise: for each gate band, if the
+    // corrector as blended still worsens the residual's median group delay,
+    // the correction is removed across the whole band (half-octave
+    // crossfades), which is exact where partial per-bin blends are not.
+    let residual_gd_ms = |windowed: &[C64], index: usize| -> f64 {
+        let here = normalized(ideal[index].conj() * windowed[index]);
+        let ahead = normalized(ideal[index + 1].conj() * windowed[index + 1]);
+        let delta = (ahead * here.conj()).arg();
+        -1_000.0 * delta / (2.0 * std::f64::consts::PI * bin_hz)
+    };
+    let median = |mut values: Vec<f64>| -> Option<f64> {
+        if values.is_empty() {
+            return None;
+        }
+        values.sort_by(f64::total_cmp);
+        Some(values[values.len() / 2])
+    };
+    let corrector_gd_ms = |windowed: &[C64], index: usize| -> f64 {
+        let delta = (windowed[index + 1] * windowed[index].conj()).arg();
+        -1_000.0 * delta / (2.0 * std::f64::consts::PI * bin_hz)
+    };
+    for (band_low_hz, band_high_hz, limit_ms) in SECS_GROUP_DELAY_GATE_BANDS {
+        let mut with_correction = Vec::new();
+        let mut without_correction = Vec::new();
+        let mut corrector_alone = Vec::new();
+        for index in 1..half.saturating_sub(1) {
+            let frequency = index as f64 * bin_hz;
+            if frequency < band_low_hz || frequency >= band_high_hz {
+                continue;
+            }
+            with_correction.push(residual_gd_ms(windowed, index));
+            without_correction.push(group_delay_ms(&residual_without, index));
+            corrector_alone.push(corrector_gd_ms(windowed, index));
+        }
+        let (Some(median_with), Some(median_without), Some(median_corrector)) = (
+            median(with_correction),
+            median(without_correction),
+            median(corrector_alone),
+        ) else {
+            continue;
+        };
+        if std::env::var_os("SECS_GUARD_DEBUG").is_some() {
+            eprintln!(
+                "guard band {band_low_hz:.0}-{band_high_hz:.0}: with {median_with:+.1} ms, \
+                 without {median_without:+.1} ms, corrector {median_corrector:+.1} ms"
+            );
+        }
+        // Two kill criteria. The comparative one catches a corrector that
+        // worsens the system; the budget one catches a corrector that
+        // "helps" some residual statistic while spending more of the gate
+        // band's group-delay budget than the whole filter is allowed to -
+        // the field failure mode: an unweighted residual median looked
+        // improved while the corrector alone carried +34 ms into the taps.
+        let band_touches_shared = shared_low_frequency_hz.is_some_and(|crossover_hz| {
+            band_low_hz < 2.0 * crossover_hz && band_high_hz > 0.5 * crossover_hz
+        });
+        if median_with.abs() > median_without.abs() + SECS_PHASE_GUARD_TOLERANCE_MS
+            || median_corrector > SECS_PHASE_GUARD_BAND_BUDGET_RATIO * limit_ms
+            || median_corrector
+                < -(advance_budget_ms + SECS_PHASE_GUARD_BAND_BUDGET_RATIO * limit_ms)
+            || (band_touches_shared && force_shared_removal)
+        {
+            if band_touches_shared {
+                shared_band_removed = true;
+            }
+            let fade_low_hz = band_low_hz * 2.0_f64.powf(-0.5);
+            let fade_high_hz = band_high_hz * 2.0_f64.powf(0.5);
+            for (index, value) in windowed.iter_mut().enumerate() {
+                // Symmetric in |f| so the spectrum stays that of a real IR.
+                let frequency = (index.min(n - index)) as f64 * bin_hz;
+                let blend = if frequency <= fade_low_hz || frequency >= fade_high_hz {
+                    1.0
+                } else if frequency < band_low_hz {
+                    let ratio =
+                        (frequency / fade_low_hz).log2() / (band_low_hz / fade_low_hz).log2();
+                    0.5 + 0.5 * (std::f64::consts::PI * ratio).cos()
+                } else if frequency >= band_high_hz {
+                    let ratio =
+                        (frequency / band_high_hz).log2() / (fade_high_hz / band_high_hz).log2();
+                    0.5 - 0.5 * (std::f64::consts::PI * ratio).cos()
+                } else {
+                    0.0
+                };
+                *value = *value * blend + C64::new(1.0 - blend, 0.0);
+                *value = normalized(*value);
+            }
+        }
+    }
+    shared_band_removed
+}
+
+/// One band of [`secs_filter_group_delay_report`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct SecsGroupDelayBand {
+    pub low_hz: f64,
+    pub high_hz: f64,
+    /// Magnitude-weighted median group delay relative to the filter's own
+    /// 1-16 kHz baseline, in ms. Positive = this band leaves the filter
+    /// later than the treble does.
+    pub group_delay_ms: f64,
+    pub limit_ms: f64,
+    pub exceeded: bool,
+}
+
+/// Band group delay of a designed FIR, measured from the taps alone (no
+/// measurement data involved), against [`SECS_GROUP_DELAY_GATE_BANDS`].
+///
+/// Per-bin group delay comes from wrapped finite phase differences; each
+/// band reports the magnitude-weighted median (weights `|H|`, so the deep
+/// notches a correction filter legitimately contains - where phase slope is
+/// numerically meaningless - cannot steer the estimate), relative to the
+/// same statistic over 1-16 kHz. This is the gate that was missing when a
+/// real session shipped 70-200 ms of low-band delay: every existing design
+/// and validation metric was magnitude-only, and an all-pass defect is
+/// invisible to all of them.
+/// `advance_budget_ms`: the design's low-band pre-ring window. A filter may
+/// legitimately lead its own treble by up to that much (the extended-delay
+/// option corrects late bass exactly this way), so `exceeded` is asymmetric:
+/// added delay is capped by the band limit alone, advance by the budget plus
+/// the limit. At the default 10 ms budget this matches the original
+/// symmetric behavior in practice, because no realizable corrector led by
+/// more than the budget.
+pub fn secs_filter_group_delay_report(
+    taps: &[f64],
+    sample_rate_hz: u32,
+    advance_budget_ms: f64,
+) -> DspResult<Vec<SecsGroupDelayBand>> {
+    if taps.is_empty() {
+        return Err(DspError::EmptyInput("SECS filter taps"));
+    }
+    if sample_rate_hz == 0 {
+        return Err(DspError::InvalidArgument(
+            "group-delay report needs a positive sample rate".to_string(),
+        ));
+    }
+    for (index, value) in taps.iter().enumerate() {
+        if !value.is_finite() {
+            return Err(DspError::NonFinite {
+                context: "SECS filter taps",
+                index,
+            });
+        }
+    }
+    let n = (4 * taps.len()).next_power_of_two();
+    let spectrum = fft_real(taps, n);
+    let bin_hz = f64::from(sample_rate_hz) / n as f64;
+    let half = n / 2;
+    let weighted_median_gd_ms = |low_hz: f64, high_hz: f64| -> Option<f64> {
+        let mut entries: Vec<(f64, f64)> = Vec::new();
+        for index in 1..half.saturating_sub(1) {
+            let frequency = index as f64 * bin_hz;
+            if frequency < low_hz || frequency >= high_hz {
+                continue;
+            }
+            let delta = (spectrum[index + 1] * spectrum[index].conj()).arg();
+            let delay = -1_000.0 * delta / (2.0 * std::f64::consts::PI * bin_hz);
+            entries.push((delay, spectrum[index].norm()));
+        }
+        if entries.is_empty() {
+            return None;
+        }
+        entries.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let total: f64 = entries.iter().map(|(_, weight)| weight).sum();
+        let mut cumulative = 0.0;
+        for (delay, weight) in &entries {
+            cumulative += weight;
+            if cumulative >= 0.5 * total {
+                return Some(*delay);
+            }
+        }
+        entries.last().map(|(delay, _)| *delay)
+    };
+    let nyquist = f64::from(sample_rate_hz) / 2.0;
+    let baseline =
+        weighted_median_gd_ms(1_000.0, 16_000.0_f64.min(0.9 * nyquist)).ok_or_else(|| {
+            DspError::InvalidArgument(
+                "group-delay report needs 1-16 kHz bins for its baseline".to_string(),
+            )
+        })?;
+    let mut report = Vec::with_capacity(SECS_GROUP_DELAY_GATE_BANDS.len());
+    for (low_hz, high_hz, limit_ms) in SECS_GROUP_DELAY_GATE_BANDS {
+        let group_delay_ms = weighted_median_gd_ms(low_hz, high_hz).ok_or_else(|| {
+            DspError::InvalidArgument(format!(
+                "group-delay report has no bins in {low_hz:.0}-{high_hz:.0} Hz"
+            ))
+        })? - baseline;
+        report.push(SecsGroupDelayBand {
+            low_hz,
+            high_hz,
+            group_delay_ms,
+            limit_ms,
+            exceeded: group_delay_ms > limit_ms
+                || group_delay_ms < -(advance_budget_ms.max(0.0) + limit_ms),
+        });
+    }
+    Ok(report)
 }
 
 /// `process_secs_filter`.
@@ -864,7 +1553,9 @@ fn process_secs_filter(
     precomputed: &SecsChannelPrecompute,
     config: &SecsConfig,
     apply_tilt: bool,
+    force_shared_removal: bool,
 ) -> SecsChannelFilter {
+    let mut shared_band_guard_removed = false;
     let n = precomputed.n;
     let sample_rate_hz = precomputed.sample_rate_hz;
     let freqs = &precomputed.freqs;
@@ -874,14 +1565,34 @@ fn process_secs_filter(
     let initial_filter_h: Vec<C64> = if config.low_latency || config.zero_latency {
         fft_real(&precomputed.min_inv_ir, n)
     } else {
-        let pr_low = config
-            .target_delay_ms
-            .clamp(SECS_PHASE_PRERING_LOW_MIN_MS, SECS_PHASE_PRERING_LOW_MAX_MS);
+        // The low-band pre-ring cap follows the extended-delay ceiling: for
+        // the SECS.py maximum (10 ms) `max(25, 10) = 25` reproduces the
+        // original clamp bit for bit, and an extended ceiling passes its
+        // full budget to the low band. Mid/high keep their own hard caps.
+        let pr_low = config.target_delay_ms.clamp(
+            SECS_PHASE_PRERING_LOW_MIN_MS,
+            SECS_PHASE_PRERING_LOW_MAX_MS.max(config.maximum_delay_ms),
+        );
         let pr_mid = SECS_PHASE_PRERING_MID_MAX_MS.min(pr_low * 0.5);
         let pr_high = SECS_PHASE_PRERING_HIGH_MAX_MS.min(pr_low * 0.25);
 
-        let windowed_fft = |left_ms: f64| -> Vec<C64> {
-            let window = asymmetric_window(n, sample_rate_hz, left_ms, f64::INFINITY);
+        let extended_budget =
+            config.phase_guard && config.maximum_delay_ms > SECS_AUTO_DELAY_MAX_MS;
+        let windowed_fft = |left_ms: f64, flat_left: bool| -> Vec<C64> {
+            let window = if flat_left && extended_budget {
+                // See `asymmetric_window_flat_left`: the restored bulk
+                // advance sits deep inside the left extent and must not be
+                // tapered away. Only the low band asks for this; mid/high
+                // keep the original full-extent taper.
+                asymmetric_window_flat_left(
+                    n,
+                    sample_rate_hz,
+                    left_ms,
+                    SECS_PHASE_PRERING_MID_MAX_MS,
+                )
+            } else {
+                asymmetric_window(n, sample_rate_hz, left_ms, f64::INFINITY)
+            };
             let windowed: Vec<f64> = precomputed
                 .excess_inv_ir
                 .iter()
@@ -890,9 +1601,9 @@ fn process_secs_filter(
                 .collect();
             fft_real(&windowed, n)
         };
-        let h_low = windowed_fft(pr_low);
-        let h_mid = windowed_fft(pr_mid);
-        let h_high = windowed_fft(pr_high);
+        let h_low = windowed_fft(pr_low, true);
+        let h_mid = windowed_fft(pr_mid, false);
+        let h_high = windowed_fft(pr_high, false);
         let mut h_ex_win: Vec<C64> = (0..n)
             .map(|index| {
                 (weights[0][index] + weights[1][index]) * h_low[index]
@@ -902,6 +1613,16 @@ fn process_secs_filter(
             .collect();
         for value in h_ex_win.iter_mut() {
             *value /= value.norm() + 1e-12;
+        }
+        if config.phase_guard {
+            shared_band_guard_removed = guard_unrealizable_excess(
+                &mut h_ex_win,
+                &precomputed.excess_inv_ir,
+                sample_rate_hz,
+                config.shared_low_frequency_hz,
+                force_shared_removal,
+                pr_low,
+            );
         }
 
         let window_long = asymmetric_window(n, sample_rate_hz, pr_low, 500.0);
@@ -1030,7 +1751,35 @@ fn process_secs_filter(
     SecsChannelFilter {
         taps,
         target_mag_ideal,
+        shared_band_guard_removed,
     }
+}
+
+/// Both channels' filters for one configuration, with the phase guard's
+/// shared-sub-band verdict reconciled: below the bass-management crossover
+/// one driver reproduces L+R, so if the guard stripped the excess correction
+/// for either channel there, both are re-run with it stripped. Leaving them
+/// to disagree splits the two filters' phase in exactly the band where the
+/// amplifier sums them, which cancels mono bass at the subwoofer input and
+/// is invisible to per-channel verification sweeps.
+fn process_secs_pair(
+    precomputed_left: &SecsChannelPrecompute,
+    precomputed_right: &SecsChannelPrecompute,
+    config: &SecsConfig,
+    apply_tilt: bool,
+) -> (SecsChannelFilter, SecsChannelFilter) {
+    let left = process_secs_filter(precomputed_left, config, apply_tilt, false);
+    let right = process_secs_filter(precomputed_right, config, apply_tilt, false);
+    if !config.phase_guard
+        || config.shared_low_frequency_hz.is_none()
+        || left.shared_band_guard_removed == right.shared_band_guard_removed
+    {
+        return (left, right);
+    }
+    (
+        process_secs_filter(precomputed_left, config, apply_tilt, true),
+        process_secs_filter(precomputed_right, config, apply_tilt, true),
+    )
 }
 
 /// `FilterGeneratorWorker._shift_right_zero`.
@@ -1186,6 +1935,14 @@ pub fn design_secs_stereo_filter(
         return Err(DspError::InvalidArgument(
             "SECS taps must be positive".to_string(),
         ));
+    }
+    if !config.maximum_delay_ms.is_finite()
+        || !(SECS_AUTO_DELAY_MIN_MS..=SECS_MAXIMUM_DELAY_CEILING_MS)
+            .contains(&config.maximum_delay_ms)
+    {
+        return Err(DspError::InvalidArgument(format!(
+            "SECS maximum delay must be between {SECS_AUTO_DELAY_MIN_MS} and {SECS_MAXIMUM_DELAY_CEILING_MS} ms"
+        )));
     }
     for (index, value) in left_ir.iter().chain(right_ir.iter()).enumerate() {
         if !value.is_finite() {
@@ -1359,7 +2116,7 @@ pub fn design_secs_stereo_filter(
         let filtered: Vec<f64> = candidates
             .iter()
             .filter(|delay| delay.is_finite())
-            .map(|delay| delay.clamp(SECS_AUTO_DELAY_MIN_MS, SECS_AUTO_DELAY_MAX_MS))
+            .map(|delay| delay.clamp(SECS_AUTO_DELAY_MIN_MS, config.maximum_delay_ms))
             .collect();
         if filtered.is_empty() {
             coarse_delay_grid()
@@ -1380,8 +2137,12 @@ pub fn design_secs_stereo_filter(
         let target_delay_samples =
             ((candidate_config.target_delay_ms / 1000.0) * sample_rate_hz) as usize;
 
-        let left_filter = process_secs_filter(&precomputed_left, &candidate_config, false);
-        let right_filter = process_secs_filter(&precomputed_right, &candidate_config, false);
+        let (left_filter, right_filter) = process_secs_pair(
+            &precomputed_left,
+            &precomputed_right,
+            &candidate_config,
+            false,
+        );
         let mut final_left = left_filter.taps;
         let mut final_right: Vec<f64> = right_filter
             .taps
@@ -1538,8 +2299,8 @@ pub fn design_secs_stereo_filter(
     if tilt_enabled {
         let mut final_config = config.clone();
         final_config.target_delay_ms = winner.delay_ms;
-        let left_filter = process_secs_filter(&precomputed_left, &final_config, true);
-        let right_filter = process_secs_filter(&precomputed_right, &final_config, true);
+        let (left_filter, right_filter) =
+            process_secs_pair(&precomputed_left, &precomputed_right, &final_config, true);
         winner.low_cutoff_hz =
             0.5 * (precomputed_left.low_cutoff_hz + precomputed_right.low_cutoff_hz);
         winner.high_cutoff_hz =
@@ -1886,6 +2647,8 @@ mod tests {
             zero_latency: false,
             target_overlay: None,
             shared_low_frequency_hz: None,
+            phase_guard: false,
+            maximum_delay_ms: SECS_AUTO_DELAY_MAX_MS,
         }
     }
 
@@ -1901,6 +2664,557 @@ mod tests {
                 gain * 9.0e-4 * (-t / 0.2).exp() * (2.0 * std::f64::consts::PI * 52.0 * t).sin();
         }
         ir
+    }
+
+    /// A real impulse response whose low band arrives `late_ms` later than
+    /// the rest: `base` convolved with an all-pass that is a pure delay below
+    /// `corner_hz` and fades to none one octave above it. This is the shape
+    /// of a room whose sub path (DSP latency + modal storage) trails the
+    /// mains - the situation the excess-phase corrector exists for.
+    fn late_bass_ir(base: &[f64], corner_hz: f64, late_ms: f64) -> Vec<f64> {
+        let n = base.len();
+        let sample_rate_hz = 48_000.0;
+        let freqs = fft_frequencies(n, sample_rate_hz);
+        let mut spectrum = fft_real(base, n);
+        for (value, frequency) in spectrum.iter_mut().zip(freqs.iter()) {
+            let magnitude_hz = frequency.abs();
+            let fade = if magnitude_hz <= corner_hz {
+                1.0
+            } else if magnitude_hz >= 2.0 * corner_hz {
+                0.0
+            } else {
+                0.5 + 0.5 * (std::f64::consts::PI * (magnitude_hz / corner_hz).log2()).cos()
+            };
+            let delay_ms = late_ms * fade;
+            let phase = -2.0 * std::f64::consts::PI * frequency * delay_ms / 1_000.0;
+            *value *= C64::from_polar(1.0, phase);
+        }
+        ifft_in_place(&mut spectrum);
+        spectrum.iter().map(|value| value.re).collect()
+    }
+
+    /// A room whose low-band lateness is not one number: 20-40 Hz trails
+    /// `low_late_ms`, 50-90 Hz trails `high_late_ms`, log-f blended between
+    /// and faded out above 90-180 Hz.
+    fn two_slope_late_bass_ir(base: &[f64], low_late_ms: f64, high_late_ms: f64) -> Vec<f64> {
+        let n = base.len();
+        let sample_rate_hz = 48_000.0;
+        let freqs = fft_frequencies(n, sample_rate_hz);
+        let mut spectrum = fft_real(base, n);
+        for (value, frequency) in spectrum.iter_mut().zip(freqs.iter()) {
+            let magnitude_hz = frequency.abs();
+            let delay_ms = if magnitude_hz <= 40.0 {
+                low_late_ms
+            } else if magnitude_hz < 50.0 {
+                low_late_ms
+                    + (high_late_ms - low_late_ms) * (magnitude_hz / 40.0).log2()
+                        / (50.0f64 / 40.0).log2()
+            } else if magnitude_hz <= 90.0 {
+                high_late_ms
+            } else if magnitude_hz < 180.0 {
+                high_late_ms
+                    * (0.5 + 0.5 * (std::f64::consts::PI * (magnitude_hz / 90.0).log2()).cos())
+            } else {
+                0.0
+            };
+            let phase = -2.0 * std::f64::consts::PI * frequency * delay_ms / 1_000.0;
+            *value *= C64::from_polar(1.0, phase);
+        }
+        ifft_in_place(&mut spectrum);
+        spectrum.iter().map(|value| value.re).collect()
+    }
+
+    #[test]
+    fn the_group_delay_report_measures_a_known_low_band_delay() {
+        let mut delta = vec![0.0; 16_384];
+        delta[480] = 1.0; // 10 ms plain latency: the baseline, not a defect.
+        let flat = secs_filter_group_delay_report(&delta, 48_000, SECS_AUTO_DELAY_MAX_MS).unwrap();
+        for band in &flat {
+            assert!(
+                band.group_delay_ms.abs() < 1.0 && !band.exceeded,
+                "{}-{} Hz on a pure delay: {} ms",
+                band.low_hz,
+                band.high_hz,
+                band.group_delay_ms
+            );
+        }
+
+        let smeared = late_bass_ir(&delta, 60.0, 50.0);
+        let report =
+            secs_filter_group_delay_report(&smeared, 48_000, SECS_AUTO_DELAY_MAX_MS).unwrap();
+        // The fade octave's own group-delay swing (gd = tau + f d(tau)/df)
+        // legitimately widens the band median past the plateau value, so the
+        // assertion brackets the planted magnitude rather than pinning it.
+        assert!(
+            report[0].exceeded && (30.0..=85.0).contains(&report[0].group_delay_ms),
+            "20-100 Hz must read the planted ~50 ms: {} ms",
+            report[0].group_delay_ms
+        );
+        assert!(
+            !report[2].exceeded && report[2].group_delay_ms.abs() < 8.0,
+            "300-1000 Hz stays clean: {} ms",
+            report[2].group_delay_ms
+        );
+    }
+
+    /// A real impulse response whose low-band lateness has *modal* structure:
+    /// the delay alternates between `late_a_ms` and `late_b_ms` every sixth
+    /// of an octave below `corner_hz`, fading out one octave above it. Real
+    /// rooms hand the corrector exactly this shape (each mode stores energy
+    /// for its own time), and it is what a smooth single-plateau fixture
+    /// cannot represent: the per-bin guard verdict alternates rapidly, and
+    /// verdict smoothing alone turns that into partial blends that keep
+    /// partial wrong phase everywhere - the failure a real 2026-08-04
+    /// session hit (+55 ms at 20-100 Hz with the guard on).
+    fn modal_late_bass_ir(
+        base: &[f64],
+        corner_hz: f64,
+        late_a_ms: f64,
+        late_b_ms: f64,
+    ) -> Vec<f64> {
+        let n = base.len();
+        let sample_rate_hz = 48_000.0;
+        let freqs = fft_frequencies(n, sample_rate_hz);
+        let mut spectrum = fft_real(base, n);
+        for (value, frequency) in spectrum.iter_mut().zip(freqs.iter()) {
+            let magnitude_hz = frequency.abs().max(1.0);
+            let fade = if magnitude_hz <= corner_hz {
+                1.0
+            } else if magnitude_hz >= 2.0 * corner_hz {
+                0.0
+            } else {
+                0.5 + 0.5 * (std::f64::consts::PI * (magnitude_hz / corner_hz).log2()).cos()
+            };
+            let step = ((magnitude_hz / 20.0).log2() * 6.0).floor() as i64;
+            let late_ms = if step.rem_euclid(2) == 0 {
+                late_a_ms
+            } else {
+                late_b_ms
+            };
+            let phase = -2.0 * std::f64::consts::PI * frequency * late_ms * fade / 1_000.0;
+            *value *= C64::from_polar(1.0, phase);
+        }
+        ifft_in_place(&mut spectrum);
+        spectrum.iter().map(|value| value.re).collect()
+    }
+
+    /// Lateness whose per-bin group delay is noise-dominated around a large
+    /// mean: mean `late_mean_ms` with deterministic jagged swings of
+    /// `late_swing_ms` per twelfth-octave cell. The per-bin baseline then
+    /// swings far beyond any tolerance, which is what defeats a per-bin
+    /// comparative verdict: a corrector that adds a consistent bias but
+    /// slightly less variance wins most bins and survives.
+    fn jagged_late_bass_ir(
+        base: &[f64],
+        corner_hz: f64,
+        late_mean_ms: f64,
+        late_swing_ms: f64,
+    ) -> Vec<f64> {
+        let n = base.len();
+        let sample_rate_hz = 48_000.0;
+        let freqs = fft_frequencies(n, sample_rate_hz);
+        let mut spectrum = fft_real(base, n);
+        for (value, frequency) in spectrum.iter_mut().zip(freqs.iter()) {
+            let magnitude_hz = frequency.abs().max(1.0);
+            let fade = if magnitude_hz <= corner_hz {
+                1.0
+            } else if magnitude_hz >= 2.0 * corner_hz {
+                0.0
+            } else {
+                0.5 + 0.5 * (std::f64::consts::PI * (magnitude_hz / corner_hz).log2()).cos()
+            };
+            let cell = ((magnitude_hz / 20.0).log2() * 12.0).floor();
+            // Deterministic pseudo-random per cell in [-1, 1].
+            let jag = (cell * 12.9898 + 78.233).sin() * 43_758.545;
+            let jag = jag - jag.floor();
+            let late_ms = late_mean_ms + late_swing_ms * (2.0 * jag - 1.0);
+            let phase = -2.0 * std::f64::consts::PI * frequency * late_ms * fade / 1_000.0;
+            *value *= C64::from_polar(1.0, phase);
+        }
+        ifft_in_place(&mut spectrum);
+        spectrum.iter().map(|value| value.re).collect()
+    }
+
+    #[test]
+    fn the_phase_guard_survives_modal_low_band_structure() {
+        let base_left = simple_room_ir(16_384, 90, 1.0);
+        let base_right = simple_room_ir(16_384, 96, 0.9);
+        let left = modal_late_bass_ir(&base_left, 110.0, 15.0, 75.0);
+        let right = modal_late_bass_ir(&base_right, 110.0, 15.0, 75.0);
+        let mut config = test_config();
+        config.taps = 8_192;
+        config.phase_guard = true;
+        let guarded =
+            design_secs_stereo_filter(&left, &right, &config, Some(&[10.0]), None).unwrap();
+        for (taps, label) in [(&guarded.left_taps, "L"), (&guarded.right_taps, "R")] {
+            let report =
+                secs_filter_group_delay_report(taps, 48_000, SECS_AUTO_DELAY_MAX_MS).unwrap();
+            for band in &report {
+                assert!(
+                    !band.exceeded,
+                    "{label} {}-{} Hz: {} ms (limit {})",
+                    band.low_hz, band.high_hz, band.group_delay_ms, band.limit_ms
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_extended_delay_budget_makes_late_bass_correctable() {
+        // The room's bass trails by 40 ms. Inside the 10 ms budget that is
+        // unrealizable and the guard steps aside; with a 60 ms budget the
+        // corrector can genuinely advance the low band, the guard keeps it,
+        // and the asymmetric gate accepts the resulting intentional lead.
+        let base_left = simple_room_ir(16_384, 90, 1.0);
+        let base_right = simple_room_ir(16_384, 96, 0.9);
+        let left = late_bass_ir(&base_left, 80.0, 40.0);
+        let right = late_bass_ir(&base_right, 80.0, 40.0);
+        let mut config = test_config();
+        config.taps = 8_192;
+        config.phase_guard = true;
+        config.maximum_delay_ms = 60.0;
+        let design =
+            design_secs_stereo_filter(&left, &right, &config, Some(&[55.0]), None).unwrap();
+        assert!((design.auto_delay_ms - 55.0).abs() < 1e-9);
+
+        let report =
+            secs_filter_group_delay_report(&design.left_taps, 48_000, design.auto_delay_ms)
+                .unwrap();
+        // The filter now leads its own treble in the low band - that is the
+        // correction - and the budget-aware gate accepts it.
+        assert!(
+            report[0].group_delay_ms < -10.0,
+            "the low band should genuinely advance: {} ms",
+            report[0].group_delay_ms
+        );
+        assert!(!report[0].exceeded, "{} ms", report[0].group_delay_ms);
+
+        // At the seat the correction must actually help: the corrected
+        // system's low band arrives closer to its treble than the raw room's.
+        let assess = |ir: &[f64], taps: &[f64]| -> f64 {
+            let spectrum_ir = fft_real(ir, 32_768);
+            let spectrum_taps = fft_real(taps, 32_768);
+            let mut corrected: Vec<C64> = spectrum_ir
+                .iter()
+                .zip(&spectrum_taps)
+                .map(|(a, b)| a * b)
+                .collect();
+            ifft_in_place(&mut corrected);
+            let corrected: Vec<f64> = corrected.iter().map(|value| value.re).collect();
+            // Band envelope-peak spacing via the report helper on the
+            // corrected system response (its own treble as reference).
+            let system_report =
+                secs_filter_group_delay_report(&corrected, 48_000, 1_000.0).unwrap();
+            system_report[0].group_delay_ms
+        };
+        let raw_low_band = assess(&left, &{
+            let mut delta = vec![0.0; 256];
+            delta[0] = 1.0;
+            delta
+        });
+        let corrected_low_band = assess(&left, &design.left_taps);
+        assert!(
+            corrected_low_band.abs() < raw_low_band.abs() - 10.0,
+            "seat timing must improve by >10 ms: raw {raw_low_band:.1} ms -> corrected {corrected_low_band:.1} ms"
+        );
+    }
+
+    #[test]
+    fn the_delay_requirement_probe_tracks_injected_lateness() {
+        // A room without late bass must not be charged any extended latency:
+        // the probe reads (near) zero and the automatic ceiling stays at the
+        // original 10 ms budget.
+        let base = simple_room_ir(65_536, 90, 1.0);
+        let prompt = secs_required_bulk_advance_ms(&base, 48_000).unwrap();
+        assert!(
+            prompt <= SECS_AUTO_DELAY_MAX_MS,
+            "prompt bass probed {prompt} ms"
+        );
+        assert_eq!(
+            secs_auto_delay_ceiling_ms(&base, &base, 48_000)
+                .unwrap()
+                .ceiling_ms,
+            SECS_AUTO_DELAY_MAX_MS
+        );
+
+        // Injected lateness must be read back. The fade octave above the
+        // corner drags the coherent optimum a few ms below the plateau
+        // value, so the tolerance is asymmetric.
+        let mut previous = 0.0;
+        for injected_ms in [30.0, 55.0, 80.0] {
+            let late = late_bass_ir(&base, 60.0, injected_ms);
+            let probed = secs_required_bulk_advance_ms(&late, 48_000).unwrap();
+            assert!(
+                probed >= injected_ms - 8.0 && probed <= injected_ms + 3.0,
+                "injected {injected_ms} ms, probed {probed} ms"
+            );
+            assert!(probed > previous, "probe must track increasing lateness");
+            previous = probed;
+        }
+
+        // The automatic ceiling covers the requirement plus the flat-window
+        // taper, on the 5 ms grid, so the advanced content never lands in
+        // the window taper.
+        let late = late_bass_ir(&base, 60.0, 55.0);
+        let need = secs_required_bulk_advance_ms(&late, 48_000).unwrap();
+        let resolved = secs_auto_delay_ceiling_ms(&late, &late, 48_000).unwrap();
+        assert_eq!(resolved.requirement_ms, need);
+        let ceiling = resolved.ceiling_ms;
+        assert!(
+            ceiling >= need + SECS_AUTO_CEILING_HEADROOM_MS
+                && ceiling < need + SECS_AUTO_CEILING_HEADROOM_MS + SECS_AUTO_CEILING_STEP_MS,
+            "need {need} ms resolved to {ceiling} ms"
+        );
+        assert_eq!(ceiling % SECS_AUTO_CEILING_STEP_MS, 0.0);
+    }
+
+    #[test]
+    fn the_advance_profile_diagnostic_reads_a_two_slope_lateness() {
+        // The measured 2026-08-03 shape in clean synthetic form: 20-40 Hz
+        // trails 30 ms while 50-90 Hz trails 55 ms. The diagnostic profile
+        // must read the slope back with high trust weights - and on a noisy
+        // band it must expose its own untrustworthiness instead (the real
+        // captures read "207 ms" at coherence 0.22 vs a 0.21 noise floor,
+        // which is why the design's rotation stays on the wide-band scalar).
+        let base_left = simple_room_ir(32_768, 90, 1.0);
+        let base_right = simple_room_ir(32_768, 96, 0.9);
+        let left = two_slope_late_bass_ir(&base_left, 30.0, 55.0);
+        let right = two_slope_late_bass_ir(&base_right, 30.0, 55.0);
+
+        let profile = secs_low_band_advance_profile_ms(&left, 48_000).unwrap();
+        assert!(
+            (profile[0].advance_ms - 30.0).abs() <= 8.0 && profile[0].weight >= 0.8,
+            "{:.0}-{:.0} Hz band read {:.1} ms (weight {:.2}) for 30 injected",
+            profile[0].low_hz,
+            profile[0].high_hz,
+            profile[0].advance_ms,
+            profile[0].weight
+        );
+        assert!(
+            (profile[3].advance_ms - 55.0).abs() <= 8.0 && profile[3].weight >= 0.8,
+            "{:.0}-{:.0} Hz band read {:.1} ms (weight {:.2}) for 55 injected",
+            profile[3].low_hz,
+            profile[3].high_hz,
+            profile[3].advance_ms,
+            profile[3].weight
+        );
+
+        // A phase-scrambled band must be flagged untrustworthy: replace the
+        // 18-35 Hz excess with random-phase content and the weight of that
+        // band's reading collapses toward the noise floor.
+        let mut scrambled_spectrum = fft_real(&left, left.len());
+        let freqs = fft_frequencies(left.len(), 48_000.0);
+        for (value, frequency) in scrambled_spectrum.iter_mut().zip(freqs.iter()) {
+            let magnitude_hz = frequency.abs();
+            if magnitude_hz > 16.0 && magnitude_hz < 36.0 {
+                // Deterministic hash phase keyed on |f| keeps the spectrum
+                // conjugate-symmetric (the signal stays real).
+                let phase = ((magnitude_hz * 12.9898).sin() * 43758.5453).fract().abs()
+                    * std::f64::consts::TAU;
+                let magnitude = value.norm();
+                *value = C64::from_polar(magnitude, if *frequency < 0.0 { -phase } else { phase });
+            }
+        }
+        ifft_in_place(&mut scrambled_spectrum);
+        let scrambled: Vec<f64> = scrambled_spectrum.iter().map(|value| value.re).collect();
+        let scrambled_profile = secs_low_band_advance_profile_ms(&scrambled, 48_000).unwrap();
+        assert!(
+            scrambled_profile[0].weight <= 0.4,
+            "scrambled 18-35 Hz still claims weight {:.2} (coherence {:.2}, floor {:.2})",
+            scrambled_profile[0].weight,
+            scrambled_profile[0].coherence,
+            scrambled_profile[0].noise_floor
+        );
+
+        // The automatic ceiling covers the dominant wide-band requirement,
+        // and the scalar design at that ceiling passes the gate.
+        let auto = secs_auto_delay_ceiling_ms(&left, &right, 48_000).unwrap();
+        assert!(
+            auto.ceiling_ms >= 55.0 && auto.ceiling_ms <= 80.0,
+            "auto ceiling {} ms",
+            auto.ceiling_ms
+        );
+        let mut config = test_config();
+        config.taps = 8_192;
+        config.phase_guard = true;
+        config.maximum_delay_ms = auto.ceiling_ms;
+        let design =
+            design_secs_stereo_filter(&left, &right, &config, Some(&[auto.ceiling_ms]), None)
+                .unwrap();
+        for taps in [&design.left_taps, &design.right_taps] {
+            let report =
+                secs_filter_group_delay_report(taps, 48_000, design.auto_delay_ms).unwrap();
+            assert!(!report.iter().any(|band| band.exceeded), "gate: {report:?}");
+        }
+    }
+
+    #[test]
+    fn the_phase_guard_keeps_the_shared_sub_band_phase_matched() {
+        // Below the bass-management crossover one subwoofer reproduces both
+        // channels, so the amplifier SUMS L and R there. If the guard strips
+        // the excess correction for one channel and not the other, mono bass
+        // partially cancels at the sub input - and a per-channel
+        // verification sweep cannot observe it, because only one channel
+        // plays at a time. The channels are given different low-band excess
+        // (asymmetric lateness) so their guard verdicts would diverge.
+        let base_left = simple_room_ir(16_384, 90, 1.0);
+        let base_right = simple_room_ir(16_384, 96, 0.9);
+        let left = jagged_late_bass_ir(&base_left, 100.0, 60.0, 40.0);
+        let right = modal_late_bass_ir(&base_right, 100.0, 5.0, 20.0);
+        let mut config = test_config();
+        config.taps = 8_192;
+        config.phase_guard = true;
+        config.shared_low_frequency_hz = Some(70.0);
+        let design =
+            design_secs_stereo_filter(&left, &right, &config, Some(&[10.0]), None).unwrap();
+
+        let n = 32_768;
+        let left_spectrum = fft_real(&design.left_taps, n);
+        let right_spectrum = fft_real(&design.right_taps, n);
+        let bin_hz = 48_000.0 / n as f64;
+        let mut summed_energy = 0.0;
+        let mut matched_energy = 0.0;
+        let mut worst_split_degrees = 0.0_f64;
+        for index in 1..n / 2 {
+            let frequency = index as f64 * bin_hz;
+            if !(20.0..=70.0).contains(&frequency) {
+                continue;
+            }
+            let a = left_spectrum[index];
+            let b = right_spectrum[index];
+            let split = (a * b.conj()).arg().to_degrees().abs();
+            worst_split_degrees = worst_split_degrees.max(split);
+            summed_energy += (a + b).norm().powi(2);
+            matched_energy += (a.norm() + b.norm()).powi(2);
+        }
+        let mono_loss_db = 10.0 * (summed_energy / matched_energy).log10();
+        assert!(
+            worst_split_degrees < 30.0,
+            "L/R phase split inside the shared sub band: {worst_split_degrees:.0} deg"
+        );
+        assert!(
+            mono_loss_db > -0.5,
+            "mono bass lost at the sub input: {mono_loss_db:.2} dB"
+        );
+    }
+
+    #[test]
+    fn the_phase_guard_survives_a_noise_dominated_baseline() {
+        // Reproduces the 2026-08-04 field failure shape: the room's own
+        // per-bin excess group delay swings +-150 ms around a +45 ms mean,
+        // so a per-bin comparative verdict degenerates into a variance
+        // comparison and a corrector with a consistent bias survives it.
+        // The guarded design must still pass the taps-level gate.
+        let base_left = simple_room_ir(32_768, 90, 1.0);
+        let base_right = simple_room_ir(32_768, 96, 0.9);
+        let left = jagged_late_bass_ir(&base_left, 100.0, 45.0, 150.0);
+        let right = jagged_late_bass_ir(&base_right, 100.0, 45.0, 150.0);
+        let mut config = test_config();
+        config.taps = 8_192;
+        config.phase_guard = true;
+        let guarded =
+            design_secs_stereo_filter(&left, &right, &config, Some(&[10.0]), None).unwrap();
+        for (taps, label) in [(&guarded.left_taps, "L"), (&guarded.right_taps, "R")] {
+            let report =
+                secs_filter_group_delay_report(taps, 48_000, SECS_AUTO_DELAY_MAX_MS).unwrap();
+            for band in &report {
+                assert!(
+                    !band.exceeded,
+                    "{label} {}-{} Hz: {} ms (limit {})",
+                    band.low_hz, band.high_hz, band.group_delay_ms, band.limit_ms
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_phase_guard_neutralizes_an_unrealizable_low_band_advance() {
+        // The room's bass trails by 40 ms, but the causal pre-ring window
+        // only allows 10 ms of advance. The original corrector truncates the
+        // rest and renormalizes, which turns the intended advance into extra
+        // delay (the mechanism behind a real filter that delayed 20-120 Hz
+        // by 70-200 ms); the guard must detect that the corrector worsens
+        // the residual there and step aside instead.
+        let base_left = simple_room_ir(16_384, 90, 1.0);
+        let base_right = simple_room_ir(16_384, 96, 0.9);
+        let left = late_bass_ir(&base_left, 80.0, 60.0);
+        let right = late_bass_ir(&base_right, 80.0, 60.0);
+        let mut config = test_config();
+        config.taps = 8_192;
+        let unguarded =
+            design_secs_stereo_filter(&left, &right, &config, Some(&[10.0]), None).unwrap();
+        config.phase_guard = true;
+        let guarded =
+            design_secs_stereo_filter(&left, &right, &config, Some(&[10.0]), None).unwrap();
+
+        let unguarded_report =
+            secs_filter_group_delay_report(&unguarded.left_taps, 48_000, SECS_AUTO_DELAY_MAX_MS)
+                .unwrap();
+        let guarded_report =
+            secs_filter_group_delay_report(&guarded.left_taps, 48_000, SECS_AUTO_DELAY_MAX_MS)
+                .unwrap();
+        // The defect, in its essential form: the room's bass is LATE, so a
+        // working corrector must advance it (negative filter group delay, up
+        // to the 10 ms budget) or leave it alone - yet the unguarded filter
+        // adds clearly audible-scale delay on top. (The full 70-200 ms of
+        // the real session needs its multi-modal excess structure; this
+        // clean single-corner fixture reproduces the inversion direction,
+        // and the gate-tripping magnitude is covered by the report test.)
+        assert!(
+            unguarded_report[0].group_delay_ms > SECS_PHASE_GUARD_TOLERANCE_MS,
+            "without the guard the corrector must worsen the late low band: {:?}",
+            unguarded_report
+                .iter()
+                .map(|band| band.group_delay_ms)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            guarded_report[0].group_delay_ms
+                < unguarded_report[0].group_delay_ms - SECS_PHASE_GUARD_TOLERANCE_MS,
+            "the guard must strictly improve the low band: {} vs {}",
+            guarded_report[0].group_delay_ms,
+            unguarded_report[0].group_delay_ms
+        );
+        for band in &guarded_report {
+            assert!(
+                !band.exceeded,
+                "guarded filter must stay inside the gate at {}-{} Hz: {} ms (limit {})",
+                band.low_hz, band.high_hz, band.group_delay_ms, band.limit_ms
+            );
+        }
+
+        // The guard changes phase only; the magnitude pipeline is shared.
+        // Below the 80 Hz corner the finite tap crop converts the phase
+        // difference into a magnitude one (the unguarded filter smears
+        // low-band energy far past the crop window and loses up to ~11 dB of
+        // it - itself part of the defect), so magnitude agreement is
+        // asserted above the corner, where both filters are cleanly
+        // captured: observed <= 0.35 dB there.
+        let n = 32_768;
+        let unguarded_mag: Vec<f64> = fft_real(&unguarded.left_taps, n)
+            .iter()
+            .map(|value| value.norm())
+            .collect();
+        let guarded_mag: Vec<f64> = fft_real(&guarded.left_taps, n)
+            .iter()
+            .map(|value| value.norm())
+            .collect();
+        let smooth_unguarded = smooth_spectrum_real(&unguarded_mag, 48_000.0, 3.0);
+        let smooth_guarded = smooth_spectrum_real(&guarded_mag, 48_000.0, 3.0);
+        for index in 0..n / 2 {
+            let frequency = index as f64 * 48_000.0 / n as f64;
+            if !(80.0..=20_000.0).contains(&frequency) {
+                continue;
+            }
+            let difference_db = 20.0
+                * (smooth_guarded[index] / smooth_unguarded[index].max(1e-12))
+                    .max(1e-12)
+                    .log10();
+            assert!(
+                difference_db.abs() < 1.0,
+                "guard must not move magnitude above the corner: {difference_db:.2} dB at {frequency:.0} Hz"
+            );
+        }
     }
 
     #[test]

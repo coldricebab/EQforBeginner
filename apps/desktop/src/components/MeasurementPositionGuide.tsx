@@ -73,19 +73,18 @@ export function MeasurementPositionGuide({ copy }: Props) {
             <text className="position-diagram__area-label" x="220" y="301" textAnchor="middle">
               {copy.positionGuide.listeningArea}
             </text>
+            {/* The box footprint: each corner is a column holding an upper
+                (P1-P4) and a lower (P5-P8) vertex. */}
+            <rect className="position-diagram__offset-rect" x="145" y="130" width="150" height="120" fill="none" />
+            <line className="position-diagram__offset" x1="200" y1="173" x2="163" y2="141" />
+            <line className="position-diagram__offset" x1="240" y1="173" x2="277" y2="141" />
+            <line className="position-diagram__offset" x1="200" y1="207" x2="163" y2="239" />
+            <line className="position-diagram__offset" x1="240" y1="207" x2="277" y2="239" />
             <PositionPoint id="P0" x={220} y={190} primary />
-            <PositionPoint id="P1" x={125} y={190} />
-            <PositionPoint id="P2" x={315} y={190} />
-            <PositionPoint id="P3" x={220} y={122} />
-            <PositionPoint id="P4" x={220} y={258} />
-            <PositionPoint id="P6" x={150} y={250} />
-            <PositionPoint id="P7" x={290} y={250} />
-            <line className="position-diagram__offset" x1="151" y1="190" x2="192" y2="190" />
-            <line className="position-diagram__offset" x1="248" y1="190" x2="289" y2="190" />
-            <line className="position-diagram__offset" x1="220" y1="148" x2="220" y2="162" />
-            <line className="position-diagram__offset" x1="220" y1="218" x2="220" y2="232" />
-            <line className="position-diagram__offset" x1="199" y1="208" x2="171" y2="232" />
-            <line className="position-diagram__offset" x1="241" y1="208" x2="269" y2="232" />
+            <PositionPoint id="P1" label="P1·P5" x={145} y={130} />
+            <PositionPoint id="P2" label="P2·P6" x={295} y={130} />
+            <PositionPoint id="P3" label="P3·P7" x={295} y={250} />
+            <PositionPoint id="P4" label="P4·P8" x={145} y={250} />
           </g>
 
           <line className="position-diagram__divider" x1="440" y1="24" x2="440" y2="306" />
@@ -106,8 +105,8 @@ export function MeasurementPositionGuide({ copy }: Props) {
             <line className="position-diagram__stand" x1="590" y1="185" x2="590" y2="264" />
             <line className="position-diagram__stand" x1="590" y1="145" x2="590" y2="185" />
             <PositionPoint id="P0" x={590} y={185} primary />
-            <PositionPoint id="P5" x={590} y={125} />
-            <PositionPoint id="P8" x={590} y={245} />
+            <PositionPoint id="P5" label="P1–P4" x={590} y={125} />
+            <PositionPoint id="P8" label="P5–P8" x={590} y={245} />
             <line
               className="position-diagram__height"
               x1="630"
@@ -147,11 +146,14 @@ export function MeasurementPositionGuide({ copy }: Props) {
 
 function PositionPoint({
   id,
+  label,
   x,
   y,
   primary = false,
 }: {
   id: string;
+  /** Display text; a corner column shows both of its vertices ("P1·P5"). */
+  label?: string;
   x: number;
   y: number;
   primary?: boolean;
@@ -162,10 +164,11 @@ function PositionPoint({
         primary ? "position-diagram__point--primary" : ""
       }`}
       transform={`translate(${x} ${y})`}
+      data-position={id}
     >
       <circle r="25" />
       <circle className="position-diagram__mic" cy="-9" r="5" />
-      <text y="9" textAnchor="middle">{id}</text>
+      <text y="9" textAnchor="middle">{label ?? id}</text>
     </g>
   );
 }

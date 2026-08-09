@@ -331,9 +331,15 @@ fn restore_live_accepted_measurements(
     input_device_id: String,
     input_channel_index: u16,
     scope: live_measurement::LiveRestoreScope,
+    debug_relax_evidence: bool,
     state: tauri::State<'_, Arc<live_measurement::LiveMeasurementState>>,
 ) -> Result<live_measurement::LiveMeasurementCacheRestoreSummary, String> {
-    state.restore_accepted_measurements(&input_device_id, input_channel_index, scope)
+    state.restore_accepted_measurements(
+        &input_device_id,
+        input_channel_index,
+        scope,
+        debug_relax_evidence,
+    )
 }
 
 #[tauri::command]

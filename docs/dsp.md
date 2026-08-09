@@ -6,10 +6,12 @@ Implemented algorithm identifiers:
   spatially gated boost capped at +3 dB.
 - `phase3-single-sub-ranking-v2`: deterministic ranking of measured manual
   single-subwoofer settings.
-- `phase3-separated-path-delay-polarity-search-v4`: bounded complex synthesis of
+- `phase3-separated-path-delay-polarity-search-v5`: bounded complex synthesis of
   main-delay and 0/180-degree polarity alternatives across physically measured
   crossover states, scored with each candidate's sub level-matched to the mains
-  (the reported deployment trim).
+  (the reported deployment trim). v5 makes every candidate's evaluation
+  independent of which other crossovers were listed (raw-capture arrival anchor,
+  fixed 20-500 Hz scoring band, per-window coarse grids).
 - `phase3-wide-band-crossover-synthesis-v1`: virtual crossover states synthesized
   from one wide-band sub capture and full-range main captures using declared
   LR4/LR2/BW2 slope models, with the measurement-state low-pass replaced rather
@@ -46,7 +48,9 @@ Implemented algorithm identifiers:
   explicitly assumed Sens-Factor SPL estimate.
 - `secs-port-v1`: port of 한플 (Hanpeul)'s SECS full-band single-point mixed-phase
   correction (MIT-licensed by the author); in 2.1 it corrects both channels in common
-  below the confirmed crossover.
+  below the confirmed crossover. With the default-on "improved SECS" option the label
+  gains `+phase-guard-v1`: unrealizable excess-phase corrections are neutralized and
+  the designed filter must pass a group-delay gate.
 - `live-closed-loop-validation-v4`: post-trial P0 magnitude-response and
   predicted-versus-verified admission gate.
 - `verified-trial-native48-response-binding-v1`: final native 48 kHz response binding
@@ -436,9 +440,46 @@ weighted median level over 200-500 Hz is computed across positions and channels;
 maximum-minus-minimum candidate spread triggers a warning above the default 1.5 dB.
 This anchor check never changes response values or the ranking inputs.
 
+### Candidate-set invariance (v5)
+
+A candidate's evaluation must not depend on which OTHER crossovers the user happened
+to list. v4 violated this in three places, and the field data that exposed it
+(2026-08-09, identical wide-band captures) flipped the winner from 70 Hz / 0.38 ms to
+80 Hz / 11.35 ms merely because the candidate list started at 50 Hz instead of 40 Hz:
+
+1. **Arrival anchor.** v4 estimated the shared sub-minus-main arrival from the
+   lowest LISTED crossover's filtered path, over a band up to twice that crossover.
+   Without the 40 Hz candidate the band widened to 20-100 Hz, a correlation alias one
+   bass cycle away (+11.15 ms vs the true -1.2 ms; spacing 12.4 ms = one period at
+   ~81 Hz) won the peak pick, and every candidate's delay window - including 70's own -
+   shifted a cycle. v5 anchors the arrival on the RAW wide-band captures as the MEDIAN
+   over a fixed band family (20-45 / 20-60 / 20-80 Hz, both channels) with
+   edge-degenerate members rejected: no single band is trustworthy in every room
+   (measured, the same captures read -20 ms pinned at 20-45 Hz on the left - the
+   room's low band is phase-incoherent there - and +20 ms pinned at 30-90 Hz on the
+   right), while the family median reads -0.4 ms with the channels agreeing to under
+   1 ms. Every family member's top edge stays at or below 80 Hz, keeping each
+   member's cycle ambiguity out of the median's reach, and the anchor cannot see the
+   candidate list. Measured mode has no
+   unfiltered capture, keeps the lowest-path fallback, and the report now warns when
+   the lowest crossover is 50 Hz or higher (ambiguity fits the scan there).
+2. **Scoring band.** v4 scored over 0.5x the minimum to 2x the maximum LISTED
+   crossover, so the same candidate was scored over 20-240 Hz in one run and
+   25-240 Hz in another. v5 fixes the band at the product's validated 20-500 Hz;
+   above twice any offered crossover both branches are main-dominated and identical
+   across candidates, so the widening adds the same contribution to every candidate
+   and preserves order while removing the list dependence.
+3. **Coarse-grid granularity.** v4 chose one stage-one multiplier from the widest
+   window in the SET; v5 chooses it per window, so a candidate's grid depends on its
+   own window alone.
+
+Pinned by `the_arrival_anchor_and_winner_are_candidate_set_invariant_in_wide_mode`
+(same captures, lists with and without 40 Hz: identical anchor and identical
+per-crossover best settings) and by the fallback-ambiguity warning test.
+
 ### Live separated-path delay and polarity search
 
-`phase3-separated-path-delay-polarity-search-v4` scores with its own level-neutral
+`phase3-separated-path-delay-polarity-search-v5` scores with its own level-neutral
 splice objective (below), not the measured-candidate envelope objective above.
 Its input is not one generic main/sub measurement plus an assumed crossover model.
 For every declared crossover `x`, the user physically configures the hardware and
@@ -457,14 +498,14 @@ C_x,c(f)       = M'_x,c(f; tau) + U'_x(f; p)
 ```
 
 The bounded delay range must lie within -20 to 50 ms with a 0.01–5 ms step. The grid
-is not the full range: each crossover searches one half-period window centred on its
-measured sub arrival, clipped to the range and snapped to absolute step multiples.
-Each window holds at most 1,001 values and the complete search at most 10,000
-candidates. When the requested step is too fine for those caps (a 0.01 ms step across
-a 40 Hz candidate's 25 ms window would need 2,501 values), the search runs in two stages
-instead of refusing: stage one scans every window at the smallest integer multiple of
-the step that fits the caps, and stage two re-ranks at the full requested resolution
-within one coarse step either side of each crossover's stage-one optimum. Both stages
+is not the full range: each crossover searches one half-period window centred on the
+shared sub-arrival anchor, clipped to the range and snapped to absolute step multiples.
+Each window holds at most 1,001 values. When the requested step is too fine for that
+cap (a 0.01 ms step across a 40 Hz candidate's 25 ms window would need 2,501 values),
+the search runs in two stages instead of refusing: stage one scans every window at the
+smallest integer multiple of the step that fits its own window's cap (per window, v5),
+and stage two re-ranks at the full requested resolution within one coarse step either
+side of each crossover's stage-one optimum. Both stages
 contain only hardware-step multiples, each fine window contains its own coarse
 winner, and the score's variation scale over delay (about one period of the highest
 scored frequency, >= ~2 ms) is hundreds of times any coarse step chosen here, so the
@@ -933,6 +974,106 @@ the LR4 weights, and renormalised to unity magnitude so the result stays all-pas
 **Phase-confidence guard.** Where the response falls into a deep null, the measured phase
 itself cannot be trusted. SECS fades the phase correction back toward unity there; the
 threshold is roughly 15 dB below the band average of that channel's own magnitude.
+
+**Realizability guard (`phase-guard-v1`, this project's addition — the "improved SECS"
+option, on by default).** The windowing above has a failure mode the original never
+checks: when the room's bass arrives *later* than the pre-ringing budget can advance
+(common — a sub path's DSP latency plus modal storage was 38-57 ms on a real system,
+against a 10 ms budget), the truncated-then-renormalised all-pass does not degrade into
+"less correction". Its group delay flips sign: the intended advance becomes extra delay
+(a real 2026-08-03 filter delayed 20-120 Hz by 70-200 ms — 7 to 16 cycles — while every
+magnitude metric stayed green, because an all-pass changes no magnitude anywhere). With
+the guard on, the windowed corrector is compared per frequency bin against applying no
+correction: the residual is `excess x corrector` versus `excess` alone, and wherever the
+corrector worsens the residual's group delay by more than 5 ms it is blended back to
+unity (the verdict is smoothed over 1/3 octave and the result renormalised to unit
+magnitude, so it stays a smooth all-pass). A second, band-level stage then verifies the
+result per gate band with medians and removes the correction across any band (half-octave
+crossfades) where it still either worsens the residual's median or spends more than 60%
+of that band's gate limit on its own group delay. In a 2.1 project the band-level verdict is
+reconciled across channels: below the bass-management crossover one subwoofer reproduces
+both channels, so if the guard strips the correction for either channel there, both are
+re-run with it stripped. Letting them disagree splits the two filters' phase in exactly
+the band where the amplifier sums them - a real 2026-08-04 filter left 84 degrees of L/R
+split and -1.95 dB of mono bass at 20-30 Hz that way, which per-channel verification
+sweeps cannot observe because only one channel plays at a time. Both stages exist because real modal
+excess defeats the per-bin verdict alone: the baseline's per-bin group delay is noise
+with swings far beyond any tolerance, so that comparison degenerates into a variance
+contest, and a corrector carrying a consistent +34 ms bias survived it on real captures
+while an unweighted residual statistic even looked "improved". Off reproduces the
+original algorithm bit for bit, which the SECS.py parity fixture pins.
+
+**Extended delay ceiling (this project's addition, music-only; the default setting is
+automatic).** Latency only costs lip-sync, which music playback does not have, so the
+ceiling (automatic or 10/30/60/100 ms in the UI) may be raised; when it is, the design
+uses the ceiling as its target delay outright (the 2-10 ms automatic search judges
+magnitude only and cannot see the phase benefit being opted into). Three mechanisms make the budget
+actually usable, all confined to the improved path with an extended ceiling: (1) the
+low-band bulk advance is estimated first (complex correlation over 20-90 Hz, 0.5 ms
+steps up to the ceiling) and divided out around the band smoothing - the smoothing was
+designed for shallow <=10 ms ramps, and averaging unit vectors through the several full
+turns a 50 ms ramp makes per window simply cancels them (measured: a 60 ms budget still
+produced a +26 to +41 ms *delaying* corrector until this split); (2) the low band's
+pre-ring window becomes flat-topped with a 10 ms taper, because the original
+full-extent cosine taper left a restored 51 ms advance at 5.6% gain; (3) the guard and
+the gate allow intentional advance asymmetrically, up to the budget plus the band
+limit, while added delay keeps the plain limit. Mid/high pre-ring windows keep their
+10/5 ms caps throughout. Measured on the real 2026-08-03 captures (60 ms ceiling,
+seat-referenced band arrivals re 1-4 kHz): L 20-40 Hz +37.8 -> +8.5 ms, L 40-70 Hz
++55.6 -> +4.3 ms, R 40-70 Hz +57.1 -> +1.4 ms, with the R 20-40 Hz band overshooting
+to -18.5 ms early (|error| still halved; the per-channel bulk estimate is one number
+per channel and that band's lateness differed from its neighbor's). The shared-sub-band
+L/R match holds (worst split 3 degrees, mono sum loss 0.00 dB).
+
+**Automatic ceiling resolution (the default).** The optimum ceiling is not "as large as
+possible" but "just past what the room needs": a 60 vs 100 ms controlled comparison on
+the same captures showed the extra 40 ms bought band-arrival differences of at most a
+few ms while deepening the filter's early-energy spread (40-70 Hz content starting 49
+-> 64 ms before the peak, 70-120 Hz 18 -> 31 ms) and adding 40 ms of playback lag. So
+by default the design measures the requirement itself: the same 20-90 Hz matched-filter
+bulk-advance scan is run per channel over the full 250 ms hard ceiling on the exact
+excess-phase inverse the design will correct, and the ceiling resolves to the worst
+channel's requirement plus the 10 ms flat-window taper (so the advanced content never
+lands in the taper), rounded up to a 5 ms grid. A pair needing no more than the
+original 10 ms budget resolves to exactly that budget and spends no extended latency at
+all. The resolved value and the measured requirement are recorded in the design
+summary, and the export path replays the recorded value rather than re-probing.
+Manual ceilings remain available; validation refuses an extended ceiling without the
+improved path (the original algorithm at an extended fixed delay reproduces the
+measured smoothing-cancellation failure). Measured on the 2026-08-03 captures the
+probe reads L 51.0 / R 56.0 ms and resolves 70 ms; the 70 ms design passes the gate
+and lands L 20-40 Hz +12.8, L 40-70 Hz +1.6, R 40-70 Hz +0.2 ms at the seat -
+equivalent to the best hand-picked ceiling without the user choosing anything.
+
+**Band-wise tau decomposition: investigated and rejected (2026-08-04).** The
+remaining 20-40 Hz residual invited an obvious refinement - rotate by a per-band
+advance profile instead of one scalar per channel, since the room's energy-median
+lateness is ~42 ms at 20-40 Hz vs ~57 ms at 40-70 Hz. Implemented and measured on the
+real captures, every variant lost to the scalar: taking each octave band's
+matched-filter reading raw let a junk band poison the design (the 18-35 Hz excess has
+coherence 0.17-0.22 against a 0.21 noise floor - no single arrival exists there - and
+its 207 ms "reading" drove the automatic ceiling to 220 ms, a +39 ms gate violation
+and a 74 degree mono split); blending each band toward the wide-band anchor by
+coherence regressed L 20-40 Hz from +12.8 to +34.5 ms because a few ms of rotation
+change flips the phase guard's finely balanced band verdicts; and blending toward
+zero collapsed one channel's profile, made the L/R verdicts diverge, and the 2.1
+reconciliation then stripped the shared band on both channels - no correction at all.
+The scalar rotation stays. What ships from the investigation is the diagnostic
+(`secs_low_band_advance_profile_ms`): per-band matched-filter readings with their
+coherence, noise floor, and a 0-1 trust weight, so a junk reading is recognizable as
+such. Context for the residual itself: the -18 ms peak reading at R 20-40 Hz is partly
+an envelope-lobe artifact - the robust energy-median residual is -8.3 ms (R) / +19.5 ms
+(L), against low-frequency audibility thresholds commonly cited at 20-40 ms.
+
+**Group-delay gate (this project's addition, judged at design time).** Because an
+all-pass defect is invisible to every magnitude metric, the designed 48 kHz taps
+themselves are measured: per-bin group delay from wrapped finite phase differences,
+magnitude-weighted band medians relative to the filter's own 1-16 kHz baseline, worst of
+L/R. Limits: 20-100 Hz 30 ms, 100-300 Hz 15 ms, 300-1000 Hz 8 ms — the shape of
+published audibility thresholds (a few ms midband, 20-40 ms cited at low frequencies)
+with margin. With the improved option the gate is hard (the design fails); with the
+original algorithm it only warns, so the preserved original stays usable for comparison.
+The report ships in the design summary either way.
 
 **Automatic target-delay search.** How far the whole filter is pushed back is searched from
 2 to 10 ms in 1 ms steps, choosing the value that minimises a low-frequency-weighted error

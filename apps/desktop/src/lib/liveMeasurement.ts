@@ -266,6 +266,10 @@ export type LiveMeasurementCacheRestoreSummary = {
   restoredCaptures: LiveCaptureSummary[];
   scannedSnapshotCount: number;
   compatibleSnapshotCount: number;
+  /** How many restored measurements were admitted only by the debug
+   * relaxation (mismatched subwoofer conditions or microphone). Nonzero
+   * means the session's evidence is mixed. */
+  debugRelaxedSnapshotCount: number;
 };
 
 export type LiveDesignSummary = {
@@ -305,6 +309,15 @@ export type LiveSecsDesignSettings = {
   fixedDelayMs: number | null;
   multiPosition: boolean;
   targetCurve: LiveSecsTargetCurve;
+  /** Improved SECS: phase guard for unrealizable excess-phase corrections
+   * plus a hard group-delay gate. Off = the original algorithm, bit for bit. */
+  improvedPhase: boolean;
+  /** Delay ceiling in ms. 10 = original SECS; larger values are a music-only
+   * trade (more latency) that make late bass genuinely correctable, and the
+   * design then uses the ceiling as its target delay. null = automatic: the
+   * design measures how late the room's bass arrives and resolves the
+   * smallest covering ceiling itself (original 10 when nothing needs more). */
+  maximumDelayMs: number | null;
 };
 
 /// SECS.py "Flat" preset — the backend rejects out-of-range values instead
@@ -320,6 +333,8 @@ export const SECS_DEFAULT_SETTINGS: LiveSecsDesignSettings = {
   fixedDelayMs: null,
   multiPosition: true,
   targetCurve: "flat",
+  improvedPhase: true,
+  maximumDelayMs: null,
 };
 
 export type LiveSecsDesignSummary = {
@@ -333,6 +348,12 @@ export type LiveSecsDesignSummary = {
   sampleRateHz: number;
   taps: number;
   autoDelayMs: number;
+  /** The delay ceiling the design actually ran with (the automatic setting
+   * resolves against the measured pair; export replays exactly this). */
+  maximumDelayResolvedMs: number;
+  /** Measured low-band advance requirement (worst channel) when the
+   * automatic ceiling probe ran; null when the ceiling was manual. */
+  delayRequirementMs: number | null;
   lowCutoffHz: number;
   highCutoffHz: number;
   preampDb: number;
@@ -344,9 +365,21 @@ export type LiveSecsDesignSummary = {
   rightPredictedRmseDb: number;
   trialWavPath: string;
   trialZipPath: string;
+  /** Group delay of the designed filter itself per gate band (worst of L/R,
+   * re its own 1–16 kHz baseline) — the timing defect no magnitude chart can
+   * show. Hard gate on the improved path, warning on the original. */
+  groupDelayReport: LiveSecsGroupDelayBand[];
   /** Predicted-only raw/target/predicted display curves (verified empty). */
   frequencyResponse: LiveFrequencyResponsePlot;
   warning: string;
+};
+
+export type LiveSecsGroupDelayBand = {
+  lowHz: number;
+  highHz: number;
+  groupDelayMs: number;
+  limitMs: number;
+  exceeded: boolean;
 };
 
 export type LiveFrequencyResponsePlot = {

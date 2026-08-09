@@ -131,6 +131,142 @@ pub fn fft_convolve(signal: &[f64], kernel: &[f64]) -> DspResult<Vec<f64>> {
     Ok(output)
 }
 
+/// Worst sample-peak growth of deterministic full-scale program-material
+/// proxies through an FIR, in dB. This is the dominant headroom term for a
+/// full-band mixed-phase filter: the mathematical bound is the L1 norm, a
+/// sweep or any single-frequency basis structurally under-measures, and real
+/// content lands several dB of growth even at a ~0 dB response peak.
+///
+/// Proxies (all deterministic - fixed grid, fixed xorshift seed, no clock):
+/// - a SWEPT square-wave scan: growth versus square frequency is a sharp
+///   continuum on a real room filter (measured 2026-08-04: 7.9 dB at
+///   70.0 Hz vs 6.5 dB at 71.3 Hz - high-Q correction structure), so no
+///   fixed tone grid can carry it; a fixed grid (40/60/90/150 Hz) read
+///   7.28 dB on a package whose 70.5 Hz square - an ordinary clipped bass
+///   note - measured 8.6 dB, past the whole recommendation. The scan walks
+///   20-320 Hz in 1/48-octave steps and locally refines around the top five
+///   readings at 1/192 octave; validated against a full 1/96-octave sweep
+///   it lands at or above it (the refinement resolves the peak between
+///   fixed samples). The output peak is onset-transient dominated (a
+///   starting note through a mixed-phase advance structure overshoots its
+///   own steady state by 3-6 dB measured), so each tone is convolved rather
+///   than evaluated as a steady state, and the tone need only slightly
+///   outlast the filter (peak growth measured invariant for 0.4-1.5 s
+///   tones).
+/// - decaying kick bursts (35/50/80/120 Hz) for transient content,
+/// - hard-clipped fixed-seed noise as a dense-master stand-in.
+pub fn program_material_peak_growth_db(sample_rate_hz: u32, taps: &[f64]) -> DspResult<f64> {
+    if taps.is_empty() {
+        return Err(DspError::EmptyInput("program-proxy filter taps"));
+    }
+    if let Some(index) = taps.iter().position(|value| !value.is_finite()) {
+        return Err(DspError::NonFinite {
+            context: "program-proxy filter taps",
+            index,
+        });
+    }
+    let rate = f64::from(sample_rate_hz);
+
+    // Every scan tone shares one length (filter duration plus margin, at
+    // least 0.4 s), so the taps spectrum is computed once and each tone
+    // costs one forward and one inverse FFT.
+    let tone_samples = ((taps.len() as f64 + 0.15 * rate) as usize).max((0.4 * rate) as usize);
+    let scan_output_len = tone_samples + taps.len() - 1;
+    let scan_fft_size = scan_output_len.next_power_of_two();
+    let mut scan_planner = FftPlanner::<f64>::new();
+    let scan_forward = scan_planner.plan_fft_forward(scan_fft_size);
+    let scan_inverse = scan_planner.plan_fft_inverse(scan_fft_size);
+    let mut taps_spectrum = vec![Complex::new(0.0, 0.0); scan_fft_size];
+    for (bin, &tap) in taps_spectrum.iter_mut().zip(taps) {
+        bin.re = tap;
+    }
+    scan_forward.process(&mut taps_spectrum);
+    let scan_scale = 1.0 / scan_fft_size as f64;
+    let mut scan_buffer = vec![Complex::new(0.0, 0.0); scan_fft_size];
+    let mut square_growth_db = |frequency_hz: f64| -> f64 {
+        scan_buffer.fill(Complex::new(0.0, 0.0));
+        for (index, bin) in scan_buffer.iter_mut().enumerate().take(tone_samples) {
+            let phase = (2.0 * std::f64::consts::PI * frequency_hz * index as f64 / rate).sin();
+            bin.re = 0.98 * if phase >= 0.0 { 1.0 } else { -1.0 };
+        }
+        scan_forward.process(&mut scan_buffer);
+        for (bin, taps_bin) in scan_buffer.iter_mut().zip(&taps_spectrum) {
+            *bin *= *taps_bin;
+        }
+        scan_inverse.process(&mut scan_buffer);
+        let output_peak = scan_buffer[..scan_output_len]
+            .iter()
+            .fold(0.0f64, |peak, value| peak.max(value.re.abs() * scan_scale));
+        // The hard square's own sample peak is exactly 0.98.
+        20.0 * (output_peak / 0.98).log10()
+    };
+
+    // Swept squares: 1/48-octave grid over the bass band, then 1/192-octave
+    // refinement around the five worst grid readings.
+    let mut grid_readings: Vec<(f64, f64)> = Vec::new();
+    let mut frequency_hz = 20.0f64;
+    while frequency_hz <= 320.0 {
+        grid_readings.push((frequency_hz, square_growth_db(frequency_hz)));
+        frequency_hz *= 2.0f64.powf(1.0 / 48.0);
+    }
+    grid_readings.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let mut worst_growth_db = grid_readings.first().map(|(_, g)| *g).unwrap_or(0.0);
+    for (center_hz, _) in grid_readings.iter().take(5) {
+        for step in [-1.0f64, 1.0] {
+            let refined_hz = center_hz * 2.0f64.powf(step / 192.0);
+            if !(20.0..=320.0).contains(&refined_hz) {
+                continue;
+            }
+            worst_growth_db = worst_growth_db.max(square_growth_db(refined_hz));
+        }
+    }
+    if !worst_growth_db.is_finite() {
+        return Err(DspError::InvalidArgument(
+            "program-proxy square scan produced a non-finite growth".into(),
+        ));
+    }
+
+    let mut signals: Vec<Vec<f64>> = Vec::new();
+
+    // Kick-drum-like decaying sine bursts.
+    let mut kicks = Vec::new();
+    for frequency_hz in [35.0f64, 50.0, 80.0, 120.0] {
+        let samples = (0.4 * rate) as usize;
+        for index in 0..samples {
+            let t = index as f64 / rate;
+            kicks.push((2.0 * std::f64::consts::PI * frequency_hz * t).sin() * (-t / 0.12).exp());
+        }
+        kicks.extend(std::iter::repeat_n(0.0, (0.05 * rate) as usize));
+    }
+    signals.push(kicks);
+
+    // Hard-clipped noise from a fixed-seed xorshift64* generator.
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut noise = Vec::with_capacity((1.5 * rate) as usize);
+    for _ in 0..(1.5 * rate) as usize {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let uniform =
+            (state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64 / (1u64 << 53) as f64;
+        noise.push(((uniform * 2.0 - 1.0) * 1.5).clamp(-1.0, 1.0));
+    }
+    signals.push(noise);
+
+    for signal in &signals {
+        let input_peak = signal.iter().fold(0.0f64, |peak, v| peak.max(v.abs()));
+        if input_peak <= 0.0 {
+            return Err(DspError::InvalidArgument(
+                "program-proxy signal has zero peak".into(),
+            ));
+        }
+        let filtered = fft_convolve(signal, taps)?;
+        let output_peak = filtered.iter().fold(0.0f64, |peak, v| peak.max(v.abs()));
+        worst_growth_db = worst_growth_db.max(20.0 * (output_peak / input_peak).log10());
+    }
+    Ok(worst_growth_db.max(0.0))
+}
+
 fn rmse(errors: impl Iterator<Item = f64>) -> Option<f64> {
     let values: Vec<f64> = errors.collect();
     if values.is_empty() {

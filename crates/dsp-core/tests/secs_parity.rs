@@ -240,10 +240,13 @@ fn config_from_fixture(config: &Value) -> SecsConfig {
         hf_min_phase_reference_hz: as_f64(&config["hf_min_phase_ref_hz"]),
         low_latency: config["low_latency"].as_bool().unwrap(),
         zero_latency: config["zero_latency"].as_bool().unwrap(),
-        // SECS.py has no house-curve overlay and no shared-sub-band
-        // commonization; parity pins the plain path.
+        // SECS.py has no house-curve overlay, no shared-sub-band
+        // commonization, and no phase guard; parity pins the plain path.
         target_overlay: None,
         shared_low_frequency_hz: None,
+        phase_guard: false,
+        // SECS.py has one fixed ceiling; parity pins it.
+        maximum_delay_ms: eqforbeginner_dsp_core::secs::SECS_AUTO_DELAY_MAX_MS,
     }
 }
 

@@ -170,11 +170,13 @@ Run this only in the native Tauri app; the browser preview cannot open the micro
    press **Cancel measurement** after successful
    playback; that action rejects the capture. If either marker is never confirmed,
    cancel and retry from the exact beginning of the WAV. Follow the diagram in the
-   wizard: P1 is 25-30 cm left of P0, P2 is
-   25-30 cm right, P3 is 20-25 cm toward the speakers, P4 is 20-25 cm behind P0,
-   P5 is 10-15 cm directly above P0, P6 is 25-30 cm diagonally behind-left of P0,
-   P7 is 25-30 cm diagonally behind-right of P0, and P8 is 10-15 cm directly below
-   P0. Measure P0 L/R first, then preferably P1-P8, then
+   wizard: P0 sits at the exact center of a small box and P1-P8 are its eight
+   corners. Each corner offsets 25-30 cm left or right, 20-25 cm toward the
+   speakers or behind, and 10-15 cm up or down. P1-P4 are the upper corners
+   (front-left, front-right, back-right, back-left in that order) and P5-P8 the
+   same corners on the lower level, so walking the upper four first and then the
+   lower four changes the stand height only once.
+   Measure P0 L/R first, then preferably P1-P8, then
    return approximately to the original listening-center area for P0_END L/R; jig-level
    replacement is not required. Stop immediately if the sweep is unexpectedly loud.
    With both central pairs present, design is blocked if either channel shifts by more

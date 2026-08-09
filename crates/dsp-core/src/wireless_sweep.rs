@@ -523,7 +523,7 @@ fn best_local_match(
             direct_normalized_correlation(&capture[lag..(lag + template.len())], template)?;
         if best
             .as_ref()
-            .map_or(true, |current| signed.abs() > current.signed.abs())
+            .is_none_or(|current| signed.abs() > current.signed.abs())
         {
             best = Some(CorrelationPeak { lag, signed });
         }

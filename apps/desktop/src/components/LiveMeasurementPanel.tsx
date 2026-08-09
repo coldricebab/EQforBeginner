@@ -64,6 +64,16 @@ import { MeasuredFrequencyResponseChart } from "./MeasuredFrequencyResponseChart
 
 export type LiveTargetKind = "bk" | "harman" | "custom";
 
+/**
+ * Developer-only tooling (currently the evidence-relaxing cache restore) is
+ * compiled but unreachable in a distributed build: `import.meta.env.DEV` is
+ * true under `tauri dev` / vite dev and false for `vite build`, which is what
+ * `tauri build` runs. The Rust side refuses the same relaxation in release
+ * builds independently, so a shipped app cannot mix evidence even if a
+ * command were invoked by hand.
+ */
+const DEBUG_TOOLS_AVAILABLE = import.meta.env.DEV;
+
 type Props = {
   copy: Messages["liveMeasurement"];
   chartCopy: Messages["chart"];
@@ -200,6 +210,9 @@ export function LiveMeasurementPanel({
   const [captures, setCaptures] = useState<
     Record<string, LiveCaptureSummary>
   >({});
+  // Never true in a distributed build: the state exists so the debug path
+  // stays compiled and testable, but nothing can turn it on there.
+  const [debugRelaxRestore, setDebugRelaxRestore] = useState(false);
   const [cacheRestore, setCacheRestore] =
     useState<LiveMeasurementCacheRestoreSummary | null>(null);
   const [design, setDesign] = useState<LiveDesignSummary | null>(null);
@@ -748,7 +761,12 @@ export function LiveMeasurementPanel({
     try {
       const result = await invoke<LiveMeasurementCacheRestoreSummary>(
         "restore_live_accepted_measurements",
-        { inputDeviceId, inputChannelIndex, scope: "general" },
+        {
+          inputDeviceId,
+          inputChannelIndex,
+          scope: "general",
+          debugRelaxEvidence: DEBUG_TOOLS_AVAILABLE && debugRelaxRestore,
+        },
       );
       setCaptures((current) => {
         const restored = { ...current };
@@ -1509,6 +1527,8 @@ export function LiveMeasurementPanel({
                 busy !== null
               }
               onRestore={() => void restoreAcceptedMeasurements()}
+              debugRelax={debugRelaxRestore}
+              onDebugRelaxChange={setDebugRelaxRestore}
             />
             <div className="live-sub-search-section">
               <div className="live-sub-search-section__heading">
@@ -1895,6 +1915,8 @@ export function LiveMeasurementPanel({
             busy !== null
           }
           onRestore={() => void restoreAcceptedMeasurements()}
+          debugRelax={debugRelaxRestore}
+          onDebugRelaxChange={setDebugRelaxRestore}
         />
         <ol className="live-roon-checklist">
           {copy.rawRoonChecklist.map((item) => <li key={item}>{item}</li>)}
@@ -2006,6 +2028,32 @@ export function LiveMeasurementPanel({
               <label className="live-secs-settings__toggle">
                 <input
                   type="checkbox"
+                  checked={secsSettings.improvedPhase}
+                  onChange={(event) => {
+                    const improvedPhase = event.target.checked;
+                    setSecsSettings((current) => ({
+                      ...current,
+                      improvedPhase,
+                      // The extended/automatic ceiling exists on the
+                      // improved path only: back to the original budget
+                      // (and drop an extended fixed delay) when it is off,
+                      // back to the automatic default when it returns.
+                      maximumDelayMs: improvedPhase ? null : 10,
+                      fixedDelayMs:
+                        !improvedPhase &&
+                        current.fixedDelayMs !== null &&
+                        current.fixedDelayMs > 10
+                          ? null
+                          : current.fixedDelayMs,
+                    }));
+                  }}
+                />
+                <span>{copy.secsImprovedPhase}</span>
+              </label>
+              <p className="live-hint">{copy.secsImprovedPhaseNote}</p>
+              <label className="live-secs-settings__toggle">
+                <input
+                  type="checkbox"
                   checked={secsSettings.multiPosition}
                   onChange={(event) =>
                     setSecsSettings((current) => ({
@@ -2106,6 +2154,53 @@ export function LiveMeasurementPanel({
                   <option value="zero">{copy.secsLatencyZero}</option>
                 </select>
               </label>
+              <label>
+                <span>{copy.secsMaxDelay}</span>
+                <select
+                  value={
+                    secsSettings.maximumDelayMs === null
+                      ? "auto"
+                      : String(secsSettings.maximumDelayMs)
+                  }
+                  disabled={
+                    secsSettings.latencyMode !== "normal" ||
+                    !secsSettings.improvedPhase
+                  }
+                  onChange={(event) => {
+                    const maximumDelayMs =
+                      event.target.value === "auto"
+                        ? null
+                        : Number(event.target.value);
+                    setSecsSettings((current) => ({
+                      ...current,
+                      maximumDelayMs,
+                      // A previously fixed delay above the new ceiling would
+                      // be rejected by the backend; fall back to automatic.
+                      fixedDelayMs:
+                        current.fixedDelayMs !== null &&
+                        maximumDelayMs !== null &&
+                        current.fixedDelayMs > maximumDelayMs
+                          ? null
+                          : current.fixedDelayMs,
+                    }));
+                  }}
+                >
+                  <option value="auto">{copy.secsMaxDelayAuto}</option>
+                  <option value="10">{copy.secsMaxDelayDefault}</option>
+                  <option value="30">{copy.secsMaxDelayOption.replace("{ms}", "30")}</option>
+                  <option value="60">{copy.secsMaxDelayOption.replace("{ms}", "60")}</option>
+                  <option value="100">{copy.secsMaxDelayOption.replace("{ms}", "100")}</option>
+                </select>
+              </label>
+              {secsSettings.maximumDelayMs === null &&
+                secsSettings.improvedPhase &&
+                secsSettings.latencyMode === "normal" && (
+                  <p className="live-hint">{copy.secsMaxDelayAutoNote}</p>
+                )}
+              {secsSettings.maximumDelayMs !== null &&
+                secsSettings.maximumDelayMs > 10 && (
+                  <p className="live-hint">{copy.secsMaxDelayNote}</p>
+                )}
               <label>
                 <span>{copy.secsDelayMode}</span>
                 <select
@@ -2238,7 +2333,7 @@ export function LiveMeasurementPanel({
               <div><dt>{copy.secsPreamp}</dt><dd>{formatMetric(secsDesign.preampDb, "dB")}</dd></div>
               <div><dt>{copy.secsBalanceTrim}</dt><dd>{formatMetric(secsDesign.channelBalanceTrimDb, "dB")}</dd></div>
               <div><dt>{copy.secsPhaseScore}</dt><dd>{formatMetric(secsDesign.inputPhaseScore, "")}</dd></div>
-              <div><dt>{copy.secsSettingsSummary}</dt><dd>{`+${secsDesign.settings.maxBoostDb} dB · ${secsDesign.settings.tiltDbPerOctave} dB/oct · +${secsDesign.settings.bassBoostDb} dB@${secsDesign.settings.bassFrequencyHz} Hz · ${secsDesign.settings.resolution} · ${secsDesign.settings.curtainHz} Hz · ${secsDesign.settings.latencyMode}${secsDesign.settings.fixedDelayMs != null ? ` · ${secsDesign.settings.fixedDelayMs} ms` : ""}`}</dd></div>
+              <div><dt>{copy.secsSettingsSummary}</dt><dd>{`+${secsDesign.settings.maxBoostDb} dB · ${secsDesign.settings.tiltDbPerOctave} dB/oct · +${secsDesign.settings.bassBoostDb} dB@${secsDesign.settings.bassFrequencyHz} Hz · ${secsDesign.settings.resolution} · ${secsDesign.settings.curtainHz} Hz · ${secsDesign.settings.latencyMode}${secsDesign.maximumDelayResolvedMs > 10 ? ` · max ${secsDesign.maximumDelayResolvedMs} ms${secsDesign.settings.maximumDelayMs === null ? " (auto)" : ""}` : ""}${secsDesign.settings.fixedDelayMs != null ? ` · ${secsDesign.settings.fixedDelayMs} ms` : ""}`}</dd></div>
             </dl>
             <div className="live-result__improvement">
               <span>{copy.predictedImprovement}</span>
@@ -2246,6 +2341,30 @@ export function LiveMeasurementPanel({
                 {`L ${formatMetric(secsDesign.leftRawRmseDb - secsDesign.leftPredictedRmseDb, "dB")} · R ${formatMetric(secsDesign.rightRawRmseDb - secsDesign.rightPredictedRmseDb, "dB")}`}
               </strong>
             </div>
+            <p className={secsDesign.groupDelayReport.some((band) => band.exceeded) ? "live-warning" : "live-hint"}>
+              {copy.secsGroupDelayReport.replace(
+                "{bands}",
+                secsDesign.groupDelayReport
+                  .map(
+                    (band) =>
+                      `${band.lowHz.toFixed(0)}–${band.highHz.toFixed(0)} Hz ${band.groupDelayMs >= 0 ? "+" : ""}${band.groupDelayMs.toFixed(1)} ms${band.exceeded ? ` ⚠ (${copy.secsGroupDelayLimit.replace("{limit}", band.limitMs.toFixed(0))})` : ""}`,
+                  )
+                  .join(" · "),
+              )}
+            </p>
+            {secsDesign.delayRequirementMs !== null && (
+              <p className="live-hint">
+                {copy.secsMaxDelayAutoResult
+                  .replace(
+                    "{need}",
+                    secsDesign.delayRequirementMs.toFixed(1),
+                  )
+                  .replace(
+                    "{ceiling}",
+                    secsDesign.maximumDelayResolvedMs.toFixed(0),
+                  )}
+              </p>
+            )}
             <dl className="live-paths">
               <div><dt>{copy.trialZip}</dt><dd>{secsDesign.trialZipPath}</dd></div>
               <div><dt>{copy.trialWav}</dt><dd>{secsDesign.trialWavPath}</dd></div>
@@ -2794,12 +2913,16 @@ function MeasurementCacheControls({
   busy,
   disabled,
   onRestore,
+  debugRelax,
+  onDebugRelaxChange,
 }: {
   copy: Messages["liveMeasurement"];
   result: LiveMeasurementCacheRestoreSummary | null;
   busy: boolean;
   disabled: boolean;
   onRestore: () => void;
+  debugRelax: boolean;
+  onDebugRelaxChange: (value: boolean) => void;
 }) {
   return (
     <div className="live-cache-controls">
@@ -2813,6 +2936,22 @@ function MeasurementCacheControls({
           ? copy.restoringAcceptedMeasurements
           : copy.restoreAcceptedMeasurements}
       </button>
+      {DEBUG_TOOLS_AVAILABLE && (
+        <>
+          <label className="live-cache-controls__debug">
+            <input
+              type="checkbox"
+              checked={debugRelax}
+              disabled={busy}
+              onChange={(event) => onDebugRelaxChange(event.target.checked)}
+            />
+            <span>{copy.debugRelaxRestore}</span>
+          </label>
+          {debugRelax && (
+            <p className="live-warning">{copy.debugRelaxRestoreNote}</p>
+          )}
+        </>
+      )}
       {result && (
         <div className="live-result" role="status">
           <strong>
@@ -2827,6 +2966,14 @@ function MeasurementCacheControls({
             <small>
               {copy.restoredMeasurementSources}:{" "}
               {result.sourceSessionIds.join(", ")}
+            </small>
+          )}
+          {result.debugRelaxedSnapshotCount > 0 && (
+            <small className="live-warning">
+              {copy.debugRelaxedRestoreCount.replace(
+                "{count}",
+                result.debugRelaxedSnapshotCount.toString(),
+              )}
             </small>
           )}
         </div>

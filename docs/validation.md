@@ -236,7 +236,7 @@ warning.
 
 ### Live separated-path search gates
 
-The live `phase3-separated-path-delay-polarity-search-v4` adapter additionally fails
+The live `phase3-separated-path-delay-polarity-search-v5` adapter additionally fails
 closed unless all of the following hold:
 
 - 2–12 unique, strictly increasing real crossover settings are declared in the
@@ -579,6 +579,15 @@ multi-seat guarantees.
 - Trial: predicted-only, designed from the accepted central P0 pair in 2.0
   projects only. Verification captures bind to the trial WAV SHA-256 and
   require the user's declared-active attestation, exactly like Phase 4.
+- Group-delay gate (design time, from the designed 48 kHz taps alone): band
+  medians of per-bin group delay (magnitude-weighted, re the filter's own
+  1-16 kHz baseline, worst of L/R) must stay within 30 ms at 20-100 Hz,
+  15 ms at 100-300 Hz, and 8 ms at 300-1000 Hz. Hard gate with the
+  default-on improved option (`+phase-guard-v1`); warning-only when the
+  original algorithm is selected, since the preserved original must remain
+  runnable for comparison. An all-pass timing defect changes no magnitude,
+  so no other gate in the pipeline can see it - a real 2026-08-03 filter
+  shipped 70-200 ms of low-band delay with every magnitude number green.
 - Closed loop (`secs-port-v1+live-closed-loop-validation-v4`): judged on
   1/12-octave gate-smoothed curves as the RMS of per-octave-cell RMSE against
   the SECS target over 20-500 Hz, with the v4 dual branch (verified beats raw,
@@ -620,15 +629,25 @@ multi-seat guarantees.
   synthetic fixture) and a simulated rate-wiring bug (1.42 dB) is too small
   for any spectral threshold to separate - that class is covered by the
   parity fixtures and structural assertions instead.
-- Headroom (`validation-signal-and-response-peak-v3+program-peak-v1`): the
+- Headroom (`validation-signal-and-response-peak-v3+program-peak-v2`): the
   v3 sweep/response basis structurally under-recommends for a full-band
   mixed-phase filter - a sweep is a single frequency at every instant and
   the peak-normalized filter has a ~0 dB response peak, yet the 2026-07-30
   live package grew real program peaks by +3..+6.4 dB and clipped at the
   v3-recommended 1.3 dB. SECS packages therefore also convolve every rate
-  member with deterministic full-scale program proxies (low-frequency
-  square waves, kick bursts, hard-clipped fixed-seed noise) and take the
-  worst peak growth as an additional basis term. The L1 absolute-safe bound
+  member with deterministic full-scale program proxies and take the worst
+  peak growth as an additional basis term. v2 (2026-08-04): the square-wave
+  proxy is a SWEPT scan (1/48-octave over 20-320 Hz with 1/192-octave
+  refinement around the top readings) instead of a fixed tone grid, because
+  the growth-versus-frequency continuum of a real room filter is sharp
+  (7.9 dB at 70.0 Hz vs 6.5 dB at 71.3 Hz, high-Q correction structure) and
+  the fixed v1 grid (40/60/90/150 Hz) read 7.28 dB on a package whose
+  70.5 Hz square measured 8.6 dB - an ordinary clipped bass note past the
+  whole recommendation. The scan was validated against a full 1/96-octave
+  sweep (it lands at or above it; the peak is onset-transient dominated,
+  overshooting steady state by 3-6 dB, so each tone is convolved rather
+  than evaluated analytically). Kick bursts and hard-clipped fixed-seed
+  noise stay as transient/dense-master proxies. The L1 absolute-safe bound
   is unchanged.
 - 2.1 shared sub band: with a confirmed crossover the design commonizes the
   L/R magnitude and excess-phase corrections below it (full weight up to the

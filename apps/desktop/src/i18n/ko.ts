@@ -491,6 +491,12 @@ export const ko: Messages = {
     subwooferSettingsPath: "설정 기록 파일",
     subwooferSetupLimits: "입력 범위: crossover 30–200 Hz · main 상대 delay -20–50 ms · polarity 0/180° · sub level -30–+12 dB",
     restoreAcceptedMeasurements: "승인 측정 캐시 불러오기",
+    debugRelaxRestore:
+      "디버깅 모드 — 서브우퍼 설정·마이크가 달라도 불러오기",
+    debugRelaxRestoreNote:
+      "주의: 서브우퍼 조건(크로스오버·지연·극성·레벨)과 마이크(장치·채널)가 지금 세션과 달라도 캐시를 불러옵니다. 다른 하드웨어 상태에서 잰 측정이 섞이므로 결과는 진단용이며, 실제 보정 판단에 쓰지 마세요. 이렇게 불러온 측정에는 debug_relaxed_evidence_restore 진단 코드가 남습니다. (캘리브레이션·스윕 파일, 샘플레이트, 시스템 모드는 그대로 검사합니다.)",
+    debugRelaxedRestoreCount:
+      "⚠ 이 중 {count}개는 디버깅 모드로만 승인된 측정입니다 — 증거가 섞였습니다.",
     restoringAcceptedMeasurements: "해시와 설정을 확인하는 중…",
     restoredAcceptedMeasurements: "동일한 마이크·캘리브레이션·스윕·하드웨어 설정으로 승인된 측정 {count}개를 복구했습니다.",
     noAcceptedMeasurementsToRestore: "현재 입력과 정확히 일치하는 이전 승인 측정이 없습니다.",
@@ -519,33 +525,33 @@ export const ko: Messages = {
     position: "위치",
     positionLabels: {
       P0: "P0 중앙",
-      P1: "P1 주변 1",
-      P2: "P2 주변 2",
-      P3: "P3 주변 3",
-      P4: "P4 주변 4",
-      P5: "P5 주변 5",
-      P6: "P6 주변 6",
-      P7: "P7 주변 7",
-      P8: "P8 주변 8",
+      P1: "P1 위 앞-왼쪽",
+      P2: "P2 위 앞-오른쪽",
+      P3: "P3 위 뒤-오른쪽",
+      P4: "P4 위 뒤-왼쪽",
+      P5: "P5 아래 앞-왼쪽",
+      P6: "P6 아래 앞-오른쪽",
+      P7: "P7 아래 뒤-오른쪽",
+      P8: "P8 아래 뒤-왼쪽",
       P0_END: "P0 종료 반복",
     },
     positionDetails: {
-      P0: "평소 머리 중심 · 귀 높이",
-      P1: "P0에서 왼쪽으로 약 25–30 cm",
-      P2: "P0에서 오른쪽으로 약 25–30 cm",
-      P3: "P0에서 스피커 쪽으로 약 20–25 cm",
-      P4: "P0에서 뒤쪽으로 약 20–25 cm",
-      P5: "P0 바로 위로 약 10–15 cm",
-      P6: "P0에서 뒤-왼쪽 대각선 방향으로 약 25–30 cm",
-      P7: "P0에서 뒤-오른쪽 대각선 방향으로 약 25–30 cm",
-      P8: "P0 바로 아래로 약 10–15 cm",
+      P0: "평소 머리 중심 · 귀 높이 (직육면체의 정중앙)",
+      P1: "위 앞-왼쪽 꼭짓점: 왼쪽 25–30 cm · 스피커 쪽 20–25 cm · 위 10–15 cm",
+      P2: "위 앞-오른쪽 꼭짓점: 오른쪽 25–30 cm · 스피커 쪽 20–25 cm · 위 10–15 cm",
+      P3: "위 뒤-오른쪽 꼭짓점: 오른쪽 25–30 cm · 뒤 20–25 cm · 위 10–15 cm",
+      P4: "위 뒤-왼쪽 꼭짓점: 왼쪽 25–30 cm · 뒤 20–25 cm · 위 10–15 cm",
+      P5: "아래 앞-왼쪽 꼭짓점: 왼쪽 25–30 cm · 스피커 쪽 20–25 cm · 아래 10–15 cm",
+      P6: "아래 앞-오른쪽 꼭짓점: 오른쪽 25–30 cm · 스피커 쪽 20–25 cm · 아래 10–15 cm",
+      P7: "아래 뒤-오른쪽 꼭짓점: 오른쪽 25–30 cm · 뒤 20–25 cm · 아래 10–15 cm",
+      P8: "아래 뒤-왼쪽 꼭짓점: 왼쪽 25–30 cm · 뒤 20–25 cm · 아래 10–15 cm",
       P0_END: "처음 P0의 중앙 영역으로 대략 돌아와 반복",
     },
     positionGuide: {
       title: "마이크를 어디에 놓나요?",
-      body: "P0를 중심으로 작은 청취 영역을 샘플링합니다. 소파 전체를 재려는 것이 아니며, 줄자로 정확히 맞출 필요도 없습니다.",
+      body: "P0(정중앙)를 중심으로 한 작은 직육면체의 꼭짓점 8곳을 샘플링합니다. P1–P4는 귀 높이보다 10–15 cm 위의 네 모서리, P5–P8은 같은 네 모서리의 10–15 cm 아래입니다. 높이를 한 번만 바꾸도록 위층 4곳 → 아래층 4곳 순서로 돌면 편하고, 줄자로 정확히 맞출 필요는 없습니다.",
       diagramLabel:
-        "위에서 본 P0–P4·P6·P7 위치와 옆에서 본 P5·P8 높이 위치 안내",
+        "위에서 본 직육면체 네 모서리 기둥(P1·P5, P2·P6, P3·P7, P4·P8)과 옆에서 본 위 P1–P4 / 아래 P5–P8 높이 안내",
       speakers: "스피커 방향",
       listeningArea: "청취 영역",
       topView: "위에서 본 모습",
@@ -553,7 +559,7 @@ export const ko: Messages = {
       floor: "바닥",
       earHeight: "귀 높이",
       microphone: "마이크",
-      note: "항상 마이크를 위로 세우고 90° 캘리브레이션 방향을 유지하세요. P0_END까지 스탠드 높이·앰프 음량·마이크 gain을 바꾸지 마세요.",
+      note: "항상 마이크를 위로 세우고 90° 캘리브레이션 방향을 유지하세요. 높이는 P1–P4에서 위로, P5–P8에서 아래로 10–15 cm만 바꾸고, P0_END까지 앰프 음량과 마이크 gain은 바꾸지 마세요.",
     },
     channelLabels: { left: "L 스윕", right: "R 스윕" },
     pairProgress: "승인된 L/R 위치 {complete}/{total} · P0 한 쌍만으로도 시험 설계는 가능하지만 모든 위치와 P0 반복을 권장합니다.",
@@ -661,6 +667,23 @@ export const ko: Messages = {
     secsDelayMode: "목표 지연",
     secsDelayAuto: "자동 탐색 (2-10 ms)",
     secsDelayFixed: "고정 (ms, 2-10)",
+    secsImprovedPhase:
+      "개량 SECS: 실현 불가능한 위상 보정 가드 + 군지연 게이트 (권장)",
+    secsImprovedPhaseNote:
+      "방의 저음이 프리링잉 허용치(2–10 ms)로 당길 수 있는 것보다 늦게 도착하면, 원본 혼합위상 보정기는 잘려 나간 앞당김이 오히려 추가 지연으로 뒤집힙니다(실제 필터에서 20–120 Hz가 70–200 ms 늦어졌지만 모든 크기 그래프는 정상으로 보였습니다). 개량 경로는 그런 대역을 보정하지 않고 그대로 두며, 설계된 필터는 군지연 게이트를 통과해야 합니다. 체크를 끄면 원본 SECS 알고리즘이 비트 단위 그대로 실행됩니다.",
+    secsGroupDelayReport:
+      "필터 자체의 군지연(고역 기준, 나쁜 채널): {bands}. 크기 그래프에는 보이지 않으며 설계된 필터만으로 판정합니다.",
+    secsGroupDelayLimit: "한계 {limit} ms",
+    secsMaxDelay: "지연 상한",
+    secsMaxDelayAuto: "자동 (권장) — 측정으로 최적 상한 결정",
+    secsMaxDelayAutoNote:
+      "설계가 먼저 이 방의 저음이 실제로 얼마나 늦게 도착하는지 측정한 뒤, 필요량 + 여유 10 ms(5 ms 단위, 최대 250 ms)로 지연 상한을 스스로 정합니다. 늦은 저음이 없으면 원본 10 ms에 머물러 불필요한 지연을 쓰지 않습니다. 상한을 필요량보다 훨씬 크게 잡으면 이득 없이 초기 에너지 번짐과 재생 지연만 늘어나므로 '딱 필요한 만큼'이 최적입니다. 확장 상한이 선택되면 음악 전용입니다(영상과 못 씀).",
+    secsMaxDelayAutoResult:
+      "지연 상한 자동 결정: 측정된 저역 필요 {need} ms → 상한 {ceiling} ms",
+    secsMaxDelayDefault: "10 ms (원본, 영상 안전)",
+    secsMaxDelayOption: "{ms} ms (음악 전용)",
+    secsMaxDelayNote:
+      "확장 상한은 그 값이 필터 지연으로 그대로 쓰여 재생이 그만큼 늦어집니다 — 음악에는 무해하지만 영상과는 못 씁니다. 대신 10 ms보다 늦게 도착하는 저음(서브 체인의 DSP 지연 + 룸 저장은 흔히 40–60 ms)이 가드에 의해 방치되는 대신 실제로 보정됩니다. 중·고역 프리링잉 상한은 그대로 유지됩니다. 측정과 청감으로 확인하세요.",
     secsMultiPosition:
       "음색 보정에 측정한 모든 지점 평균 사용 (권장, 위상은 P0 유지)",
     secsFollowTarget:

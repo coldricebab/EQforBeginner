@@ -25,7 +25,12 @@ An experimental **SECS advanced option** (`secs-port-v1`) - a port of SECS by
 used under the MIT License granted by the original author and credited per
 `THIRD-PARTY-NOTICES.md` - can design a
 full-band mixed-phase trial from the accepted central P0 pair, deliberately
-bypassing the multi-seat safety design. The SECS.py control set (boost
+bypassing the multi-seat safety design. By default the improved path (`+phase-guard-v1`)
+runs: excess-phase corrections the causal pre-ring budget cannot realize are
+blended back to no-correction instead of inverting into extra delay, and the
+designed filter must pass a group-delay gate (30/15/8 ms at 20-100/100-300/
+300-1000 Hz re its own treble); unchecking the option runs the original
+algorithm bit for bit, with the gate demoted to a warning. The SECS.py control set (boost
 ceiling, tilt, bass shelf, resolution, curtain, latency mode, fixed or
 automatic delay) is exposed in the advanced options, range-validated by the
 backend, and the exact settings are stored and reused by the final export.
@@ -64,7 +69,10 @@ the other rates to it (recorded per rate, charged to headroom), and records
 per-rate smoothed agreement diagnostics. The SECS headroom adds a
 program-material peak-growth basis to v3 (full-scale square/kick/clipped-noise
 proxies convolved through every rate member), because the sweep basis
-under-recommended by ~5 dB on the first real package and playback clipped. A
+under-recommended by ~5 dB on the first real package and playback clipped. The
+square proxy is a swept scan (`program-peak-v2`): a fixed tone grid missed a
+sharp growth peak between its points and under-recommended by 1.4 dB on a real
+package, where an ordinary clipped 70 Hz bass note exceeded the recommendation. A
 passing verification renders the same measured before/after chart as the
 Phase 4 path; before any verification the design already renders a
 predicted-only chart (raw/target/predicted, with the verified curve hidden

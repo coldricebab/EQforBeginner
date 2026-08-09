@@ -381,6 +381,9 @@ export type Messages = {
     subwooferSettingsPath: string;
     subwooferSetupLimits: string;
     restoreAcceptedMeasurements: string;
+    debugRelaxRestore: string;
+    debugRelaxRestoreNote: string;
+    debugRelaxedRestoreCount: string;
     restoringAcceptedMeasurements: string;
     restoredAcceptedMeasurements: string;
     noAcceptedMeasurementsToRestore: string;
@@ -534,6 +537,17 @@ export type Messages = {
     secsDelayFixed: string;
     secsMultiPosition: string;
     secsFollowTarget: string;
+    secsImprovedPhase: string;
+    secsImprovedPhaseNote: string;
+    secsMaxDelay: string;
+    secsMaxDelayAuto: string;
+    secsMaxDelayAutoNote: string;
+    secsMaxDelayAutoResult: string;
+    secsMaxDelayDefault: string;
+    secsMaxDelayOption: string;
+    secsMaxDelayNote: string;
+    secsGroupDelayReport: string;
+    secsGroupDelayLimit: string;
     secsTargetCurve: string;
     secsTargetFlat: string;
     secsSharedSubBand: string;

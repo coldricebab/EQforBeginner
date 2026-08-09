@@ -3009,10 +3009,15 @@ h3 {
 }
 
 .position-diagram__offset,
+.position-diagram__offset-rect,
 .position-diagram__ear-line {
   stroke: #5d7e88;
   stroke-width: 1.5;
   stroke-dasharray: 4 5;
+}
+
+.position-diagram__offset-rect {
+  fill: none;
 }
 
 .position-diagram__divider {
@@ -3515,6 +3520,17 @@ h3 {
   accent-color: var(--accent);
 }
 
+.live-hint {
+  font-size: 10px;
+  color: var(--ink-muted);
+}
+
+.live-secs-settings .live-hint {
+  grid-column: 1 / -1;
+  margin: -4px 0 0;
+  font-size: 9px;
+}
+
 .live-secs-settings input,
 .live-secs-settings select {
   padding: 5px 7px;
@@ -3985,4 +4001,17 @@ h3 {
   .metric-card {
     border-width: 2px;
   }
+}
+
+.live-cache-controls__debug {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  margin-top: 0.6rem;
+  font-size: 0.85rem;
+  color: #cfe6ee;
+}
+
+.live-cache-controls__debug input {
+  margin-top: 0.15rem;
 }
