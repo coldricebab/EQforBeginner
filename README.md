@@ -67,7 +67,7 @@ https://gall.dcinside.com/mgallery/board/view/?id=speakers&no=514096&s_type=sear
 ## Usage
 
 - [다운로드 링크 Windows](https://drive.google.com/file/d/1fHTNul-hNF_PIR7Mm5uJOAbF5CBKgZbU/view?usp=sharing)
-- [다운로드 링크 Mac](https://drive.google.com/file/d/1FDX1ztoL5BwTNrM_v8vBD-Fnb7vpFHU0/view?usp=sharing)
+- [다운로드 링크 Mac](https://drive.google.com/file/d/1N6hM6tB7zzqrIxT5u5JaNdIA4pEjzlIs/view?usp=sharing)
 
 측정용 L/R 스윕 파일은 **앱에 내장**되어 있어 따로 받을 필요가 없습니다. 아래 링크는
 스윕을 다른 플레이어(Roon 등)에서 직접 재생하고 싶을 때만 쓰세요. 앱에 내장된 파일과
