@@ -13,7 +13,7 @@ decisions; `STATUS.md` records which boundaries are implemented today.
 | DSP | Pure Rust workspace library | `eqforbeginner-dsp-core` 0.1.0 | Deterministic, offline, testable without UI or audio hardware |
 | Test harness | Rust CLI | `eqforbeginner-cli` 0.1.0 | Produces repeatable fixtures, reports, WAV, and export checks |
 | Audio I/O (Phase 2) | CPAL | 0.18.1, MSRV 1.85 | Host device IDs/configuration discovery plus bounded native-48-kHz PCM capture with explicit input-channel extraction, CoreAudio and WASAPI defaults; Apache-2.0 |
-| Advanced wireless measurement transport | User-started local WAV playback in Roon; microphone-side recognition/deconvolution | `wireless-sweep-recognition-v1` + `known-sweep-deconvolution-v5` | Avoids unsafe remote transport/volume changes; arbitrary network latency becomes a searched capture offset, while a fixed signed pre-zero window preserves paths arriving before the acoustic marker reference |
+| Advanced wireless measurement transport | User-started local WAV playback in Roon; microphone-side recognition/deconvolution | `wireless-sweep-recognition-v1` + `known-sweep-deconvolution-v6` | Avoids unsafe remote transport/volume changes; arbitrary network latency becomes a searched capture offset, while a fixed signed pre-zero window preserves paths arriving before the acoustic marker reference |
 | Microphone calibration | Strict local UMIK-style TXT | `umik-calibration-parser-v2` | Auditable log-frequency/linear-dB interpolation, including quoted miniDSP metadata, without network or filename assumptions |
 | Live session adapter | Tauri-owned immutable local evidence | `similarrew-live-project-v5` (historic on-disk format id, kept through the rename) | Keeps device/state/files outside the pure DSP core while binding every capture to the 2.0/2.1 declaration, separated-path crossover plan, predicted single-sub ranking, confirmed manual hardware setting, sweep/calibration hashes, and selected native input channel; records uploaded-WAV marker routing, automatic completion, and sweep-level evidence |
 | Existing REW-data bridge | Development-only conversion to versioned JSON | Source REW 5.31.3; preferred REW 5.40+ local API | Keeps private `.mdat` serialization and Python out of the product runtime |
@@ -99,7 +99,7 @@ so an older project only fills a key absent from newer compatible projects.
   maps remain unimplemented.
 - `measurement` (partial): an imported 48 kHz WAV is decoded and SHA-256 identified,
   then `wireless-sweep-recognition-v1` searches a real mono capture using block-FFT
-  zero-mean correlation and independent segment checks. `known-sweep-deconvolution-v5`
+  zero-mean correlation and independent segment checks. `known-sweep-deconvolution-v6`
   resamples a recognized segment only from qualifying repeated-marker evidence,
   performs regularized spectral division, applies microphone magnitude calibration,
   retains a 32,768-sample raw/calibrated IR pair with a 65,536-point (0.73 Hz)
@@ -109,6 +109,15 @@ so an older project only fills a key absent from newer compatible projects.
   right-speaker timing marker. When both markers supply independent extent and clock
   evidence, waveform reconstruction fit remains recorded but is not an admission gate;
   the markerless fallback keeps the 12 dB gate.
+  The sweep pair is embedded in the desktop binary with `include_bytes!` and imported
+  for both channels when a session starts, so a user who chooses no file still measures
+  with a validated sweep and a packaged app needs no repository beside it. It is the
+  same `assets/sweeps/*_refR.wav` pair the fixtures use, byte for byte, which a test
+  pins: the accepted-measurement cache keys on the sweep's SHA-256, so a default that
+  only resembled the pair would invalidate every session measured before it. The
+  built-in bytes never cross the IPC boundary, and the default and a chosen file share
+  one import path, so no validation, evidence copy or downstream stage can tell them
+  apart.
   Upload analysis separates the main region and two marker regions, measures L/R energy
   and correlation in each marker, reports their dominant playback channel and uses
   that channel's waveform as the recognition template. The live endpoint recognizes
@@ -198,7 +207,10 @@ origin; it does not claim to validate real acoustic timing.
 
 The live desktop command uses `scan_default_host_inputs`: it asks CPAL only for input
 devices and their configurations. It does not query the default output, enumerate
-output devices, inspect output configurations, or open an output stream. Input
+output devices, inspect output configurations, or open an output stream. Outputs are
+enumerated by a distinct command, `scan_default_host_outputs`, which runs only when the
+user asks for speakers for the optional in-app sweep playback; a session that plays its
+sweeps elsewhere never causes an output device to be queried or opened. Input
 discovery exposes the host-qualified ID, host API, device metadata, channel count,
 sample format, buffer range, and supported project rate explicitly.
 CPAL describes device IDs as persistable where the backend permits; saved IDs are
@@ -211,14 +223,24 @@ clocks for a playback device plus a USB microphone. Therefore, it is an explicit
 product inference that callback timestamps alone are insufficient: the measurement
 layer must retain its acoustic marker and estimate drift on the recorded timeline.
 
-The advanced wireless and full live paths deliberately emit no audio. The user imports
-the same WAV into EQforBeginner and Roon, explicitly arms the microphone, and starts
-playback in Roon.
+The advanced wireless and full live paths emit no audio of their own accord. The user
+imports the same WAV into EQforBeginner and Roon, explicitly arms the microphone, and
+starts playback in Roon.
 The app searches the capture, so Roon/RAAT buffering latency is part of the reported
 offset rather than mistaken for speaker arrival. Roon has an official Extension API,
 but this beta does not pair with it or control transport, Zone, queue, or volume:
-EQforBeginner cannot know the physical amplifier level, and automatic sweep playback would
-create an avoidable safety risk.
+EQforBeginner cannot know the physical amplifier level, and sweep playback the user did
+not ask for would create an avoidable safety risk.
+
+The one exception is explicit and opt-in twice over: the user must choose a speaker and
+leave the playback checkbox on, and only then does a capture also start the imported
+sweep on that device after a fixed three-second head start. Amplifier level is still the
+user's, and this changes nothing downstream - playback is a separate command with its
+own cancellation state, it reports nothing into recognition, and its failure neither
+fails nor alters the capture. Recognition analyses whatever actually reached the
+microphone, over the identical code path, whether the sweep came from this command or
+from Roon. The delay is a convenience for the listener to settle, never a
+synchronization signal: the marker search below is what establishes the timeline.
 
 One sweep's changing-frequency segments provide only an effective sample-rate slope.
 Room frequency-dependent delay can bias that fit, so the result is always stored as

@@ -17,7 +17,10 @@ const MAXIMUM_ABSOLUTE_PHASE_DEGREES: f64 = 3_600.0;
 #[derive(Debug, Clone, PartialEq)]
 pub struct MicrophoneCalibrationPoint {
     pub frequency_hz: f64,
-    /// Additive magnitude correction supplied by the calibration file.
+    /// The microphone's own magnitude deviation from flat, in dB, exactly as
+    /// the file records it. Compensation SUBTRACTS this from a measurement
+    /// (`measurement.rs` divides the spectrum by it); it is not an additive
+    /// correction, despite the field name the parser keeps for file parity.
     pub correction_db: f64,
     /// Retained for provenance. The v1 measurement path does not apply phase.
     pub phase_degrees: Option<f64>,
@@ -57,9 +60,9 @@ impl MicrophoneCalibration {
             && actual[1] >= frequency_range_hz[1]
     }
 
-    /// Interpolate the additive correction linearly in dB on a log-frequency
-    /// axis. Extrapolation is rejected so callers cannot silently use a
-    /// calibration outside its documented range.
+    /// Interpolate the recorded microphone deviation linearly in dB on a
+    /// log-frequency axis. Extrapolation is rejected so callers cannot
+    /// silently use a calibration outside its documented range.
     pub fn correction_db_at(&self, frequency_hz: f64) -> DspResult<f64> {
         if !frequency_hz.is_finite() || frequency_hz <= 0.0 {
             return Err(DspError::InvalidArgument(

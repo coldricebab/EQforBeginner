@@ -2,8 +2,9 @@
 
 This document separates the implemented real-hardware developer beta from the remaining
 production protocol. The desktop discovers only host-qualified CPAL input-device IDs
-and 48 kHz configurations; it does not enumerate, select, or open a computer output
-device. Saved input IDs are revalidation hints where the backend cannot guarantee
+and 48 kHz configurations; it enumerates, selects, and opens a computer output device
+only when the user explicitly chooses a speaker for the optional in-app sweep playback.
+Saved input IDs are revalidation hints where the backend cannot guarantee
 persistence. It can open the selected native-48-kHz PCM input and extract one chosen
 native channel to mono, import UMIK calibration and separate L/R sweep WAVs, recognize
 playback started manually in Roon, deconvolve and calibrate IR/FR, persist raw evidence,
@@ -22,9 +23,12 @@ remain incomplete.
 1. Disable every existing convolution/EQ filter and confirm one active signal path.
 2. In EQforBeginner, scan and select only UMIK-1 and the native input channel carrying
    its signal. CoreAudio may expose UMIK-1 as a two-channel device; start with channel
-   1. Roon and the physical audio system own playback routing; EQforBeginner must not
-   select or occupy an output.
-3. Load the serial-matched UMIK calibration file and require 48 kHz support.
+   1. Roon and the physical audio system own playback routing by default; EQforBeginner
+   scans or opens an output device only when the user explicitly selects a speaker for
+   in-app sweep playback.
+3. Load the serial-matched UMIK calibration file and require 48 kHz support. The file
+   is optional: a measurement microphone that already applies its correction internally
+   must be used without one, or the correction is applied twice.
 4. Keep amplifier volume and microphone gain fixed for the entire session.
 5. Begin with a conservative hardware volume and watch the live sweep meter. The
    preferred digital range is peak -30 to -6 dBFS. Quieter captures down to -48 dBFS
@@ -47,21 +51,67 @@ Run this only in the native Tauri app; the browser preview cannot open the micro
    actually opened become locked to that project; start a new project rather than
    changing either one mid-session. If channel 1 is completely silent, start a new
    project and try channel 2.
-3. Import the serial-matched UMIK TXT. The parser accepts
+3. Import the serial-matched UMIK TXT, or deliberately skip it. Skipping is supported
+   for microphones that self-correct: the session then measures through an identity
+   profile that is exactly 0 dB across 20 Hz-20 kHz, so the calibrated response equals
+   the raw one, the stage shows a standing warning, and every manifest records
+   `calibration.uncalibrated: true` with
+   `calibrationAlgorithm: "uncalibrated-microphone-v1"`. Uncalibrated evidence binds to
+   its own identity (`none:uncalibrated-microphone-v1`, deliberately not a hex digest),
+   so cached measurements never cross between a calibrated and an uncalibrated session.
+   When a file is supplied, the parser accepts
    `frequency_hz correction_db [phase_degrees]`, requires strictly increasing points
    and complete 20 Hz-20 kHz coverage, and shows the parsed serial/range. V2 accepts
    quoted miniDSP manufacturer metadata while still rejecting malformed numeric rows.
    It applies magnitude correction only to IR/FR; phase remains provenance, while Sens
    Factor feeds only the assumption-labeled SPL estimate.
-4. Import `assets/sweeps/Sweep_L_20-20k_refR.wav` as left and
-   `assets/sweeps/Sweep_R_20-20k_refR.wav` as right. These are 48 kHz reference files with
-   a dominant measurement sweep and lower-energy timing markers. The corrected Tauri
-   IPC accepts the file's raw `ArrayBuffer` and a bounded validated JSON byte-array
-   fallback; the former “raw WAV byte payload” error is not an expected result. After
-   upload, verify the displayed channel analysis for the main sweep, start signal, and
-   end signal. The bundled `*_refR.wav` fixtures carry both markers on R even though
-   their main measurement sweep is L or R respectively.
-5. Add both WAVs to Roon. Use one ungrouped Zone. Disable Crossfade, Volume Leveling,
+4. Nothing to do unless you need a different sweep. `Sweep_L_20-20k_refR.wav` and
+   `Sweep_R_20-20k_refR.wav` are embedded in the binary with `include_bytes!` and are
+   imported for both channels the moment a session starts, so the stage opens with the
+   sweep already loaded and checked. They are the same `assets/sweeps/*_refR.wav` files
+   the regression fixtures use, byte for byte - a test pins that equality, because the
+   accepted-measurement cache keys on the sweep's SHA-256 and a merely similar default
+   would invalidate every session measured before the default existed. To measure with
+   another file, use **Use a different sweep WAV** on either channel; **Back to the
+   built-in sweep** restores the default. Any file - built-in or chosen - goes through
+   the identical import path: 48 kHz, a dominant measurement sweep and lower-energy
+   timing markers, the IR tail-capacity check, and a copy stored under the session's
+   `inputs/`. The corrected Tauri IPC accepts a chosen file's raw `ArrayBuffer` and a
+   bounded validated JSON byte-array fallback (the built-in bytes never cross IPC at
+   all); the former “raw WAV byte payload” error is not an expected result. Verify the
+   displayed channel analysis for the main sweep, start signal, and end signal. The
+   bundled `*_refR.wav` files carry both markers on R even though their main measurement
+   sweep is L or R respectively.
+5. Optional: instead of an external player, let the app play the sweep. Pick a speaker
+   under **Output device (optional)** in the same stage - the output inventory is
+   scanned only when that button is pressed - and the "Play the sweep from this app"
+   checkbox turns on by default in the sub-integration and multipoint stages. The sweep
+   then starts on that device three seconds after the capture button. Those seconds are
+   only a head start for the user: playback is a separate command with its own state,
+   it reports nothing to the analysis, and a playback failure neither fails nor alters
+   the capture. Recognition finds the sweep by the timing markers in the recording, on
+   exactly the same code path as an externally played sweep, so the rest of this
+   protocol is unchanged. The app plays the imported file as it stands - a stereo file
+   with its marker channel intact, a mono file on the side it was imported as. Use the
+   output path the measurement actually runs through, and note that this bypasses
+   whatever Roon's own chain would have applied.
+
+   Playback opens the device at the rate it is already running and converts the
+   sweep to meet it, rather than moving the device to 48 kHz. The wizard says so
+   before the first capture when the two differ. This matters because opening a
+   device at any other rate makes CPAL's CoreAudio output path write the rate on
+   the device object, which is global: every other client of that device sees an
+   external format change. On a virtual loopback shared with a convolution host
+   that write has been measured to stop the host and to stall
+   `AudioComponentInstanceNew` indefinitely, so the sweep never plays at all.
+   Matching the device's rate avoids the write entirely, and the same device
+   opens in about 30 ms. The conversion is `secs_resample_poly`, the band-limited
+   polyphase resampler the per-rate export path already uses, so the sweep and
+   its timing markers survive intact and recognition is unchanged - it still
+   works only from what the microphone captured at 48 kHz. A device whose rate
+   cannot be read, or that reports something outside 8-192 kHz, falls back to
+   48 kHz playback, which moves the device and puts it back afterwards.
+6. Add both WAVs to Roon. Use one ungrouped Zone. Disable Crossfade, Volume Leveling,
    Radio/shuffle/repeat, and clear the queue. For baseline measurement disable MUSE
    Convolution, PEQ, and sample-rate conversion, and confirm 48 kHz in Signal Path.
    Volume Leveling is doubly dangerous for the 2.1 isolated captures: it can apply a
@@ -70,7 +120,7 @@ Run this only in the native Tauri app; the browser preview cannot open the micro
    markers' RMS across every isolated capture and refuses the search beyond a 0.3 dB
    spread (0.5 dB in wide-band mode, where the wide dial's high-pass attenuates the
    marker band by a bounded amount on one capture).
-6. Pipeline order and chain invariants (2.1): the crossover search (isolated
+7. Pipeline order and chain invariants (2.1): the crossover search (isolated
    captures) must be finished and its winner confirmed on the hardware **before**
    any multi-seat baseline capture, and every baseline/verification sweep is a
    full-chain measurement - playing the L sweep drives the L main plus the
@@ -81,7 +131,7 @@ Run this only in the native Tauri app; the browser preview cannot open the micro
    polarity, or sub level afterwards invalidates every baseline and
    verification measurement (the app enforces this by dropping them), so plan
    to lock the 2.1 settings first.
-7. For a 2.1 project, complete **2.1 sub integration settings** before Raw capture.
+8. For a 2.1 project, complete **2.1 sub integration settings** before Raw capture.
    Pick a search mode, then enter 2–12 ascending crossover values that the hardware
    can actually apply, plus the main-relative delay, 0/180-degree polarity, and sub
    level that are active during all isolated measurements. The app rejects a
@@ -158,7 +208,7 @@ Run this only in the native Tauri app; the browser preview cannot open the micro
    are mandatory combined-path evidence, not optional cleanup - in wide-band mode
    they are also the first measurement of the hardware's real filters at the chosen
    crossover. Stereo projects skip this stage.
-8. Keep crossover, delay, polarity/phase, sub level, amplifier volume, and microphone
+9. Keep crossover, delay, polarity/phase, sub level, amplifier volume, and microphone
    gain unchanged. Keep the microphone upright in the same 90-degree orientation.
    In 2.1, each L or R playback must keep the normal bass-managed sub path active, so
    the captures represent L+Sub and R+Sub rather than main-only responses.
@@ -182,12 +232,16 @@ Run this only in the native Tauri app; the browser preview cannot open the micro
    With both central pairs present, design is blocked if either channel shifts by more
    than 1.0 dB in median 200-500 Hz level or 6.0 dB in level-removed 20-500 Hz shape
    RMSE. The shape bound only catches a grossly different path or location.
-9. Retain only cells marked accepted. The app stores the raw mono WAV even when later
+10. Retain only cells marked accepted. The app stores the raw mono WAV even when later
    recognition/deconvolution fails; an accepted measurement also receives a JSON
    snapshot with sweep/calibration hashes, IR/FR, metrics, algorithm versions, and
    issue codes. Only complete accepted L/R position pairs enter design.
-10. Choose the B&K-style or Harman-style target, or import a custom TXT target with one
-   `frequency_hz level_db` pair per line, and create the 48 kHz trial. A custom file is
+11. Keep the built-in default target (Harman-6dB per Dirac's official target-curve
+   page, with an automatic high-frequency rolloff that follows the measured treble
+   trend of your speakers — the adaptive fit runs for the default selection only, and
+   its result or fallback reason is shown with the design), or import a custom TXT
+   target with one `frequency_hz level_db` pair per line, and create the 48 kHz trial.
+   A custom file is used exactly as imported: it is
    parsed with line-numbered errors, stored in the project, and aligned over 200-500 Hz.
    P0-only is allowed but shows a spatial-overfit warning and cannot authorize boost.
    With two or more positions, only a broad shallow deficit repeated across the
@@ -197,14 +251,14 @@ Run this only in the native Tauri app; the browser preview cannot open the micro
    The trial is predicted-only. Click **Download trial ZIP** and choose a local save
    location; this packages the generated 48 kHz stereo WAV for Roon but does not count
    as verification.
-11. Disable every old Roon convolution and load only the emitted trial ZIP. Confirm that
+12. Disable every old Roon convolution and load only the emitted trial ZIP. Confirm that
    it is active, keep every hardware/volume/gain setting fixed, check the declaration
    box, then capture new verification P0 L/R sweeps. This declaration and exact trial
    hash are persisted, but the app cannot independently inspect the Roon zone.
-12. Run closed-loop validation. Both channels must pass the existing target/peak gates
+13. Run closed-loop validation. Both channels must pass the existing target/peak gates
    and remain within 3.0 dB RMSE of their numerical prediction. Failure keeps export
    disabled; do not work around it by copying trial files.
-13. If validation passes, create the final export. The app redesigns six native rates,
+14. If validation passes, create the final export. The app redesigns six native rates,
     response-binds the final 48 kHz member to the verified trial at 0.05 dB/0.02 ms,
     validates the ZIP, records its SHA-256/project JSON, and reports recommended
     headroom from the larger of registered-sweep true-peak growth and the FIR L1
@@ -308,7 +362,11 @@ the right-speaker marker arrival; it is not an automatic timing correction.
 
 ## Per-capture quality gates
 
-- Calibration file present, parseable, and covering the analysis band.
+- The calibration profile in force covers the analysis band and is applied without
+  extrapolation. That profile is the imported TXT when there is one, and otherwise the
+  identity stand-in (exactly 0 dB, recorded as `uncalibrated`) for a microphone that
+  self-corrects. An imported file that is malformed or does not span 20 Hz-20 kHz is
+  still rejected at import.
 - No input clip, CPAL stream error, incomplete capture, or suspected sample drop.
 - Pre-sweep noise evidence and at least 20 dB capture SNR.
 - Reconstruction fit remains visible but is diagnostic when a complete repeated-marker

@@ -19,7 +19,11 @@ use crate::{DspError, DspResult};
 use rustfft::num_complex::Complex;
 use rustfft::FftPlanner;
 
-pub const KNOWN_SWEEP_DECONVOLUTION_VERSION: &str = "known-sweep-deconvolution-v5";
+/// v6: calibration now divides out the deviation the file records; v5
+/// multiplied it in, doubling the microphone error in every calibrated
+/// result. Bumping this also retires every cached v5 snapshot, because the
+/// accepted-measurement cache admits only the current version.
+pub const KNOWN_SWEEP_DECONVOLUTION_VERSION: &str = "known-sweep-deconvolution-v6";
 
 const ABSOLUTE_MAXIMUM_REFERENCE_SAMPLES: usize = 2_000_000;
 const ABSOLUTE_MAXIMUM_IR_SAMPLES: usize = 262_144;
@@ -668,8 +672,14 @@ pub fn deconvolve_recognized_sweep(
             if frequency_hz >= config.calibration_band_hz[0]
                 && frequency_hz <= config.calibration_band_hz[1]
             {
-                let correction_db = calibration.correction_db_at(frequency_hz)?;
-                *bin *= 10.0_f64.powf(correction_db / 20.0);
+                // The file records the microphone's own deviation from flat,
+                // so calibration divides that deviation back out. Multiplying
+                // it in instead - what v5 did - doubles the microphone error:
+                // a 90-degree UMIK file's grazing-incidence treble loss became
+                // a fictitious 18 dB 8-20 kHz cliff across 47 stored sessions
+                // (2026-08-14). Only a flat file cannot tell the two apart.
+                let deviation_db = calibration.correction_db_at(frequency_hz)?;
+                *bin *= 10.0_f64.powf(-deviation_db / 20.0);
             }
         }
     }
@@ -931,6 +941,72 @@ mod tests {
         assert!(measurement.quality.reconstruction_fit_db > 70.0);
     }
 
+    #[test]
+    fn calibration_divides_out_the_deviation_the_file_records() {
+        // A microphone that reads 6 dB hot above 1 kHz: the calibrated result
+        // must come out 6 dB BELOW what the same capture reads through a flat
+        // file. v5 applied the file with the opposite sign - 6 dB hotter
+        // still - and every earlier test used a flat 0 dB file, which is the
+        // one calibration that cannot distinguish the two directions.
+        //
+        // The impulse sits mid-window because the zero-phase calibration
+        // filter has an anti-causal tail; at index 0 that tail is clipped by
+        // the retention window and the realized correction lands well short
+        // of the file (-2 dB where the file says 0). The live path keeps such
+        // tails with its 4,800-sample marker pre-zero window instead.
+        let reference = logarithmic_sweep(32_768, 48_000.0);
+        let mut expected_ir = vec![0.0; 8_192];
+        expected_ir[2_048] = 0.8;
+        let detection = fixture_detection(&reference, &expected_ir, 2_048, 1.0e-7);
+        let config = SweepDeconvolutionConfig {
+            impulse_length_samples: 8_192,
+            analysis_fft_size: 16_384,
+            ..measurement_config()
+        };
+        let treble_hot = parse_umik_calibration("10 0\n100 0\n1000 6\n24000 6\n").unwrap();
+
+        let through_flat = deconvolve_recognized_sweep(
+            &reference,
+            &detection,
+            Some(&flat_calibration(0.0)),
+            &config,
+        )
+        .unwrap();
+        let through_hot =
+            deconvolve_recognized_sweep(&reference, &detection, Some(&treble_hot), &config)
+                .unwrap();
+
+        // The retained pre-calibration IR must not see the file at all.
+        assert_eq!(
+            through_hot.uncalibrated_impulse_samples,
+            through_flat.uncalibrated_impulse_samples
+        );
+
+        let response_delta_db =
+            |measurement: &SweepMeasurement, other: &SweepMeasurement, hz: f64| {
+                let grid = &measurement.calibrated_frequency_response.frequencies_hz;
+                let bin = (0..grid.len())
+                    .min_by(|a, b| (grid[*a] - hz).abs().total_cmp(&(grid[*b] - hz).abs()))
+                    .unwrap();
+                measurement.calibrated_frequency_response.magnitude_db[bin]
+                    - other.calibrated_frequency_response.magnitude_db[bin]
+            };
+        // Where the microphone is honest nothing changes; where it reads
+        // 6 dB hot the calibrated response drops by 6 dB.
+        // Where the microphone is honest nothing changes; where it reads
+        // 6 dB hot the calibrated response drops by 6 dB.
+        let honest_band_delta = response_delta_db(&through_hot, &through_flat, 47.0);
+        let hot_band_delta = response_delta_db(&through_hot, &through_flat, 4_000.0);
+        assert!(
+            honest_band_delta.abs() < 0.2,
+            "0 dB region moved by {honest_band_delta} dB"
+        );
+        assert!(
+            (hot_band_delta + 6.0).abs() < 0.3,
+            "+6 dB region realized {hot_band_delta} dB instead of -6"
+        );
+    }
+
     /// One decaying room-mode resonator placed exactly midway between the
     /// legacy 1.465 Hz grid bins (their worst case) and exactly on a v4 bin.
     fn low_frequency_mode_ir(bandwidth_hz: f64) -> Vec<f64> {
@@ -1124,11 +1200,14 @@ mod tests {
         let one_khz_bin = (1_000.0 / zero.calibrated_frequency_response.bin_hz()).round() as usize;
         let realized_db = plus_six.calibrated_frequency_response.magnitude_db[one_khz_bin]
             - zero.calibrated_frequency_response.magnitude_db[one_khz_bin];
+        // A file claiming the microphone reads 6.02 dB hot must LOWER the
+        // calibrated response by 6.02 dB (v5 raised it - the sign defect).
         // The calibration filter is band limited to 20-20 kHz and then the
-        // deliberately short 1024-sample test IR is truncated, so its analyzed
-        // realization is slightly below the exact spectral-domain 6.02 dB.
+        // deliberately short 1024-sample test IR clips its anti-causal tail,
+        // so the analyzed realization lands short of the exact
+        // spectral-domain value (measured -5.35 dB here).
         assert!(
-            (realized_db - 6.020_599_913_279_624).abs() < 0.5,
+            (realized_db + 6.020_599_913_279_624).abs() < 0.75,
             "realized calibration was {realized_db} dB"
         );
     }

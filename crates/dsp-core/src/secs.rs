@@ -212,6 +212,20 @@ pub struct SecsConfig {
     /// phase correction here" instead of "wrong phase correction here".
     /// `false` reproduces the original algorithm bit for bit.
     pub phase_guard: bool,
+    /// App extension (not in SECS.py): replace this design's own excess-phase
+    /// corrector with one exported by another design (interpolated onto this
+    /// grid). Exists for the native-rate rerun: below ~100 Hz a real room's
+    /// per-bin excess beyond the coherent bulk advance is modal noise
+    /// (coherence 0.26-0.6 on the 2026-08-03 captures), and fitting that
+    /// noise on two different FFT grids produced members of ONE package whose
+    /// 20-100 Hz group delay disagreed by 25 ms (44.1k-family -31 ms vs
+    /// 48k-family -5.7 ms) while every magnitude check passed. Carrying the
+    /// verified 48 kHz member's smoothed excess across rates makes the
+    /// package timing-consistent by construction. The magnitude side is
+    /// untouched: it was measured rate-stable (min-phase-only designs agree
+    /// across rates), so each rate still designs its own magnitude EQ.
+    /// `None` keeps the design fully self-contained (parity-pinned).
+    pub excess_phase_transplant: Option<SecsExcessPhaseExport>,
     /// App extension: ceiling for `target_delay_ms` and for the low-band
     /// pre-ring window that gives the excess corrector its advance
     /// capability. At the SECS.py value ([`SECS_AUTO_DELAY_MAX_MS`], 10 ms)
@@ -240,6 +254,22 @@ struct SecsChannelPrecompute {
     track_weight: Vec<f64>,
     low_cutoff_hz: f64,
     high_cutoff_hz: f64,
+}
+
+/// The excess-phase corrector of a finished mixed-phase design, as unwrapped
+/// phase on its positive-frequency grid (the corrector is unit-magnitude, so
+/// phase is its entire content). Post-commonization, pre-window: exactly the
+/// spectrum the windowing and the guard consume. Produced by
+/// [`design_secs_stereo_filter`] and accepted back through
+/// [`SecsConfig::excess_phase_transplant`] so a package's native-rate members
+/// can share one timing correction instead of re-fitting low-band modal
+/// noise per grid.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SecsExcessPhaseExport {
+    /// Positive-frequency bin centers of the exporting design, Hz, ascending.
+    pub frequencies_hz: Vec<f64>,
+    pub left_phase_rad: Vec<f64>,
+    pub right_phase_rad: Vec<f64>,
 }
 
 /// Per-channel summary surfaced on the finished design.
@@ -281,6 +311,11 @@ pub struct SecsStereoDesign {
     /// left channel's tilt-adjusted target magnitude (linear) on that grid.
     pub target_frequencies_hz: Vec<f64>,
     pub target_magnitude: Vec<f64>,
+    /// The excess-phase corrector this design applied (post-commonization,
+    /// pre-window), for transplanting into sibling-rate designs. `None` on
+    /// the minimum-phase-only (low/zero latency) paths, which carry no
+    /// excess correction.
+    pub excess_phase: Option<SecsExcessPhaseExport>,
 }
 
 fn fft_in_place(buffer: &mut [C64]) {
@@ -800,6 +835,102 @@ fn secs_excess_phase_inverse(ir: &[f64], sample_rate_hz: f64) -> SecsExcessInver
 /// coherent sum over the band's bins, on a 0.5 ms grid. Returns the best
 /// delay and its coherence (peak coherent sum over the incoherent sum, 1 =
 /// the whole band is one clean delay).
+/// Unwrapped phase of a spectrum's positive-frequency bins (indices
+/// `1..=n/2` for even `n`), radians. The smoothed excess corrector's
+/// adjacent-bin phase steps are well under pi, so simple unwrapping is exact.
+fn unwrap_positive_phase(spectrum: &[C64]) -> Vec<f64> {
+    let n = spectrum.len();
+    let half = n / 2;
+    let mut phases = Vec::with_capacity(half);
+    let mut previous = 0.0f64;
+    let mut offset = 0.0f64;
+    for value in spectrum.iter().take(half + 1).skip(1) {
+        let mut candidate = value.arg() + offset;
+        while candidate - previous > std::f64::consts::PI {
+            offset -= std::f64::consts::TAU;
+            candidate -= std::f64::consts::TAU;
+        }
+        while previous - candidate > std::f64::consts::PI {
+            offset += std::f64::consts::TAU;
+            candidate += std::f64::consts::TAU;
+        }
+        previous = candidate;
+        phases.push(candidate);
+    }
+    phases
+}
+
+/// Rebuild an excess-corrector IR on this design's grid from an exported
+/// phase curve: linear interpolation of unwrapped phase in frequency, unit
+/// magnitude, held at the last exported value above the source's top bin
+/// (constant phase = zero group delay there - the mid/high pre-ring windows
+/// flatten the excess in that region anyway).
+fn excess_ir_from_phase_export(
+    frequencies_hz: &[f64],
+    phase_rad: &[f64],
+    n: usize,
+    sample_rate_hz: f64,
+) -> Vec<f64> {
+    let interpolate = |frequency: f64| -> f64 {
+        match frequencies_hz.binary_search_by(|probe| probe.total_cmp(&frequency)) {
+            Ok(index) => phase_rad[index],
+            Err(0) => phase_rad[0],
+            Err(index) if index >= frequencies_hz.len() => phase_rad[phase_rad.len() - 1],
+            Err(index) => {
+                let f0 = frequencies_hz[index - 1];
+                let f1 = frequencies_hz[index];
+                let fraction = (frequency - f0) / (f1 - f0);
+                phase_rad[index - 1] + fraction * (phase_rad[index] - phase_rad[index - 1])
+            }
+        }
+    };
+    let half = n / 2;
+    let bin_hz = sample_rate_hz / n as f64;
+    let mut spectrum = vec![C64::new(1.0, 0.0); n];
+    for (index, slot) in spectrum.iter_mut().enumerate().take(half + 1).skip(1) {
+        *slot = C64::from_polar(1.0, interpolate(index as f64 * bin_hz));
+    }
+    // A real IR needs a real Nyquist bin and a conjugate-mirrored tail.
+    if n % 2 == 0 {
+        spectrum[half] = C64::new(1.0, 0.0);
+    }
+    mirror_conjugate(&mut spectrum);
+    ifft_in_place(&mut spectrum);
+    spectrum.iter().map(|value| value.re).collect()
+}
+
+/// `SECS_GUARD_DEBUG` diagnostic: median per-bin group delay of a spectrum
+/// over one band, the same statistic the guard's stage 2 uses. Lets the
+/// excess-corrector pipeline be watched stage by stage when the env var is
+/// set; compiled in but inert otherwise.
+fn debug_band_gd_ms(label: &str, spectrum: &[C64], sample_rate_hz: f64, low_hz: f64, high_hz: f64) {
+    if std::env::var_os("SECS_GUARD_DEBUG").is_none() {
+        return;
+    }
+    let n = spectrum.len();
+    let bin_hz = sample_rate_hz / n as f64;
+    let mut values = Vec::new();
+    for index in 1..n / 2 {
+        let frequency = index as f64 * bin_hz;
+        if frequency < low_hz || frequency >= high_hz {
+            continue;
+        }
+        let here = spectrum[index] / (spectrum[index].norm() + 1e-30);
+        let ahead = spectrum[index + 1] / (spectrum[index + 1].norm() + 1e-30);
+        let delta = (ahead * here.conj()).arg();
+        values.push(-1_000.0 * delta / (2.0 * std::f64::consts::PI * bin_hz));
+    }
+    if values.is_empty() {
+        return;
+    }
+    values.sort_by(f64::total_cmp);
+    eprintln!(
+        "stage {label}: {low_hz:.0}-{high_hz:.0} Hz median gd {:+.1} ms ({} bins)",
+        values[values.len() / 2],
+        values.len()
+    );
+}
+
 fn band_advance_scan_ms(
     freqs: &[f64],
     excess_inv_h: &[C64],
@@ -1114,11 +1245,19 @@ fn precompute_secs_channel(
             ((smoothed_mag_simple[index] / (simple_mean + 1e-12) - 0.177) / 0.5).clamp(0.0, 1.0);
         *value = *value * regularizer + C64::new(1.0 - regularizer, 0.0);
     }
+    debug_band_gd_ms(
+        "1 excess (bulk removed)",
+        &excess_inv_h,
+        sample_rate_hz,
+        20.0,
+        100.0,
+    );
     let mut smoothed_excess =
         apply_5band_smoothing_complex(&excess_inv_h, sample_rate_hz, &weights, config.resolution);
     for value in smoothed_excess.iter_mut() {
         *value /= value.norm() + 1e-12;
     }
+    debug_band_gd_ms("2 smoothed", &smoothed_excess, sample_rate_hz, 20.0, 100.0);
     // Restore the bulk advance the smoothing never saw.
     if bulk_advance_ms > 0.0 {
         for index in 0..n {
@@ -1129,6 +1268,7 @@ fn precompute_secs_channel(
             );
         }
     }
+    debug_band_gd_ms("3 restored", &smoothed_excess, sample_rate_hz, 20.0, 100.0);
     let mut excess_time = smoothed_excess;
     ifft_in_place(&mut excess_time);
     let excess_inv_ir: Vec<f64> = excess_time.iter().map(|value| value.re).collect();
@@ -1441,6 +1581,87 @@ fn guard_unrealizable_excess(
     shared_band_removed
 }
 
+/// Regression band group delay of a designed FIR: the least-squares slope of
+/// unwrapped phase over `low_hz..high_hz`, minus the same fit over the
+/// filter's own 1-16 kHz baseline, in ms (positive = the band leaves later
+/// than the treble).
+///
+/// This exists alongside [`secs_filter_group_delay_report`] because the
+/// report's magnitude-weighted per-bin median is bimodal on a band that
+/// contains both a delay-corrected plateau and its fade edges - on one real
+/// package the median read members of the same correction 22 ms apart while
+/// this fit read them within 2 ms. The fit is the right statistic for
+/// comparing members; the report stays the right shape for the per-band
+/// gate.
+pub fn secs_band_group_delay_fit_ms(
+    taps: &[f64],
+    sample_rate_hz: u32,
+    low_hz: f64,
+    high_hz: f64,
+) -> DspResult<f64> {
+    if taps.is_empty() {
+        return Err(DspError::EmptyInput("SECS filter taps"));
+    }
+    if !(low_hz.is_finite() && high_hz.is_finite()) || low_hz <= 0.0 || high_hz <= low_hz {
+        return Err(DspError::InvalidArgument(
+            "band bounds must be finite, positive, ascending".into(),
+        ));
+    }
+    for (index, value) in taps.iter().enumerate() {
+        if !value.is_finite() {
+            return Err(DspError::NonFinite {
+                context: "SECS filter taps",
+                index,
+            });
+        }
+    }
+    let n = (taps.len() * 4).next_power_of_two();
+    let spectrum = fft_real(taps, n);
+    let bin_hz = f64::from(sample_rate_hz) / n as f64;
+    let unwrap = |band_low_hz: f64, band_high_hz: f64| -> Vec<(f64, f64)> {
+        let from = (band_low_hz / bin_hz) as usize;
+        let to = ((band_high_hz / bin_hz) as usize).min(n / 2 - 1);
+        let mut points = Vec::new();
+        let mut previous = 0.0f64;
+        let mut offset = 0.0f64;
+        for (index, value) in spectrum.iter().enumerate().take(to + 1).skip(from) {
+            let mut phase = value.arg() + offset;
+            while phase - previous > std::f64::consts::PI {
+                offset -= std::f64::consts::TAU;
+                phase -= std::f64::consts::TAU;
+            }
+            while previous - phase > std::f64::consts::PI {
+                offset += std::f64::consts::TAU;
+                phase += std::f64::consts::TAU;
+            }
+            previous = phase;
+            points.push((index as f64 * bin_hz, phase));
+        }
+        points
+    };
+    let fit = |points: &[(f64, f64)]| -> DspResult<f64> {
+        if points.len() < 2 {
+            return Err(DspError::InvalidArgument(
+                "band group-delay fit needs at least two bins".into(),
+            ));
+        }
+        let count = points.len() as f64;
+        let mean_x = points.iter().map(|(x, _)| x).sum::<f64>() / count;
+        let mean_y = points.iter().map(|(_, y)| y).sum::<f64>() / count;
+        let numerator: f64 = points
+            .iter()
+            .map(|(x, y)| (x - mean_x) * (y - mean_y))
+            .sum();
+        let denominator: f64 = points
+            .iter()
+            .map(|(x, _)| (x - mean_x) * (x - mean_x))
+            .sum();
+        Ok(-(numerator / denominator) / std::f64::consts::TAU * 1000.0)
+    };
+    let baseline_high_hz = (f64::from(sample_rate_hz) * 0.5 - 1.0).min(16_000.0);
+    Ok(fit(&unwrap(low_hz, high_hz))? - fit(&unwrap(1_000.0, baseline_high_hz))?)
+}
+
 /// One band of [`secs_filter_group_delay_report`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct SecsGroupDelayBand {
@@ -1604,6 +1825,7 @@ fn process_secs_filter(
         let h_low = windowed_fft(pr_low, true);
         let h_mid = windowed_fft(pr_mid, false);
         let h_high = windowed_fft(pr_high, false);
+        debug_band_gd_ms("4 windowed low", &h_low, sample_rate_hz, 20.0, 100.0);
         let mut h_ex_win: Vec<C64> = (0..n)
             .map(|index| {
                 (weights[0][index] + weights[1][index]) * h_low[index]
@@ -1614,6 +1836,7 @@ fn process_secs_filter(
         for value in h_ex_win.iter_mut() {
             *value /= value.norm() + 1e-12;
         }
+        debug_band_gd_ms("5 mixed pre-guard", &h_ex_win, sample_rate_hz, 20.0, 100.0);
         if config.phase_guard {
             shared_band_guard_removed = guard_unrealizable_excess(
                 &mut h_ex_win,
@@ -2081,6 +2304,34 @@ pub fn design_secs_stereo_filter(
         target_overlay_linear.as_deref(),
     );
 
+    // Transplanted excess (see the config field): the reference design's
+    // corrector, interpolated onto this grid, replaces both channels' own
+    // excess analysis. It is post-commonization on the reference, so the
+    // commonization below is skipped - re-blending would double-apply the
+    // crossfade region.
+    if let Some(transplant) = config.excess_phase_transplant.as_ref() {
+        if !config.low_latency && !config.zero_latency {
+            precomputed_left.excess_inv_ir = excess_ir_from_phase_export(
+                &transplant.frequencies_hz,
+                &transplant.left_phase_rad,
+                n,
+                sample_rate_hz,
+            );
+            precomputed_right.excess_inv_ir = excess_ir_from_phase_export(
+                &transplant.frequencies_hz,
+                &transplant.right_phase_rad,
+                n,
+                sample_rate_hz,
+            );
+            debug_band_gd_ms(
+                "3T transplanted L",
+                &fft_real(&precomputed_left.excess_inv_ir, n),
+                sample_rate_hz,
+                20.0,
+                100.0,
+            );
+        }
+    }
     // 2.1 shared-sub-band commonization, phase half: below the crossover
     // both captures measured the same driver, so the excess-phase correctors
     // are blended toward their normalized complex mean (both are referenced
@@ -2088,7 +2339,10 @@ pub fn design_secs_stereo_filter(
     // This removes noise-chasing L/R phase divergence AND keeps the two
     // filters phase-matched where bass management sums the channels into
     // the subwoofer.
-    if let Some(crossover_hz) = config.shared_low_frequency_hz {
+    if let Some(crossover_hz) = config
+        .shared_low_frequency_hz
+        .filter(|_| config.excess_phase_transplant.is_none())
+    {
         let mut spectrum_left = fft_real(&precomputed_left.excess_inv_ir, n);
         let mut spectrum_right = fft_real(&precomputed_right.excess_inv_ir, n);
         for index in 0..n {
@@ -2441,6 +2695,17 @@ pub fn design_secs_stereo_filter(
         .map(|index| winner.target_mag_left[*index])
         .collect();
 
+    // Export the applied excess corrector for sibling-rate transplantation.
+    // On the minimum-phase-only paths there is none to export.
+    let excess_phase = (!config.low_latency && !config.zero_latency).then(|| {
+        let bin_hz = sample_rate_hz / n as f64;
+        SecsExcessPhaseExport {
+            frequencies_hz: (1..=n / 2).map(|index| index as f64 * bin_hz).collect(),
+            left_phase_rad: unwrap_positive_phase(&fft_real(&precomputed_left.excess_inv_ir, n)),
+            right_phase_rad: unwrap_positive_phase(&fft_real(&precomputed_right.excess_inv_ir, n)),
+        }
+    });
+
     Ok(SecsStereoDesign {
         sample_rate_hz: config.sample_rate_hz,
         left_taps: crop_left,
@@ -2470,6 +2735,7 @@ pub fn design_secs_stereo_filter(
         delay_metrics,
         target_frequencies_hz: f_orig,
         target_magnitude: target_linear,
+        excess_phase,
     })
 }
 
@@ -2646,6 +2912,7 @@ mod tests {
             low_latency: false,
             zero_latency: false,
             target_overlay: None,
+            excess_phase_transplant: None,
             shared_low_frequency_hz: None,
             phase_guard: false,
             maximum_delay_ms: SECS_AUTO_DELAY_MAX_MS,
@@ -2966,6 +3233,63 @@ mod tests {
             "need {need} ms resolved to {ceiling} ms"
         );
         assert_eq!(ceiling % SECS_AUTO_CEILING_STEP_MS, 0.0);
+    }
+
+    /// The reason `excess_phase_transplant` exists: two designs of the same
+    /// room on different grids must ship the same low-band timing. The
+    /// 44.1 kHz member re-analyzing its own resampled impulse is exactly the
+    /// v1 native-rerun path that shipped members 25 ms apart on a real room;
+    /// with the 48 kHz member's exported corrector transplanted, the members
+    /// must agree.
+    #[test]
+    fn a_transplanted_excess_keeps_sibling_rates_timing_consistent() {
+        let base = simple_room_ir(32_768, 4_800, 1.0);
+        let late_48k = late_bass_ir(&base, 60.0, 55.0);
+        let mut config_48k = test_config();
+        config_48k.phase_guard = true;
+        config_48k.maximum_delay_ms = 70.0;
+        config_48k.target_delay_ms = 70.0;
+        config_48k.taps = ((70.0 + 500.0) * 48_000.0 / 1000.0) as usize;
+        let reference =
+            design_secs_stereo_filter(&late_48k, &late_48k, &config_48k, Some(&[70.0]), None)
+                .expect("48k design");
+        let exported = reference
+            .excess_phase
+            .clone()
+            .expect("mixed-phase design exports");
+        let reference_band =
+            secs_band_group_delay_fit_ms(&reference.left_taps, 48_000, 20.0, 100.0).unwrap();
+
+        let late_441 = secs_resample_poly(&late_48k, 147, 160).expect("resample");
+        let padded = secs_next_fast_len(late_441.len());
+        let mut late_441 = late_441;
+        late_441.resize(padded, 0.0);
+        let mut config_441 = config_48k.clone();
+        config_441.sample_rate_hz = 44_100;
+        config_441.taps = ((70.0 + 500.0) * 44_100.0 / 1000.0) as usize;
+        config_441.excess_phase_transplant = Some(exported);
+        let member =
+            design_secs_stereo_filter(&late_441, &late_441, &config_441, Some(&[70.0]), None)
+                .expect("44.1k design");
+        let member_band =
+            secs_band_group_delay_fit_ms(&member.left_taps, 44_100, 20.0, 100.0).unwrap();
+
+        assert!(
+            (member_band - reference_band).abs() <= 3.0,
+            "44.1k member {member_band:.2} ms vs 48k reference {reference_band:.2} ms"
+        );
+
+        // And the transplanted member still carries the intended correction:
+        // its low band must not sit at the uncorrected +55 ms.
+        assert!(
+            member_band < 25.0,
+            "member left its late bass uncorrected: {member_band:.2} ms"
+        );
+
+        // The corrector must also round-trip its own export: the member's
+        // exported phase is what was injected (no re-analysis leaked in).
+        let member_export = member.excess_phase.expect("member exports too");
+        assert_eq!(member_export.frequencies_hz.len(), late_441.len() / 2);
     }
 
     #[test]

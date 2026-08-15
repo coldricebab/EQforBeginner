@@ -26,6 +26,23 @@ pub const PROJECT_SAMPLE_RATE_HZ: u32 = 48_000;
 pub const INPUT_CLIPPING_THRESHOLD_LINEAR: f32 = 32_767.0 / 32_768.0;
 
 const CAPTURE_COMPLETION_GRACE: Duration = Duration::from_secs(2);
+const PLAYBACK_COMPLETION_GRACE: Duration = Duration::from_secs(2);
+const PLAYBACK_POLL_INTERVAL: Duration = Duration::from_millis(25);
+/// Let the driver convert the frames already handed to it before the stream is
+/// dropped, so the sweep's end marker is not truncated.
+const PLAYBACK_DRAIN: Duration = Duration::from_millis(500);
+const PLAYBACK_DEADLINE_GRACE: Duration = Duration::from_secs(10);
+/// How long a device may take to publish a rate the host has already accepted.
+const OUTPUT_RATE_SETTLE: Duration = Duration::from_millis(500);
+/// Playback rate bounds. The floor keeps a typo from opening a stream that
+/// would take minutes to drain; the ceiling covers every rate a CoreAudio or
+/// WASAPI device realistically reports.
+const MINIMUM_PLAYBACK_RATE_HZ: u32 = 8_000;
+const MAXIMUM_PLAYBACK_RATE_HZ: u32 = 768_000;
+const MAXIMUM_PLAYBACK_CHANNELS: usize = 8;
+/// Ten minutes of 8-channel 48 kHz audio. A measurement sweep is far shorter;
+/// this only bounds what a caller can ask the process to hold.
+const MAXIMUM_PLAYBACK_SAMPLES: usize = 8 * 48_000 * 600;
 const AUTOMATIC_COMPLETION_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const MAX_RECORDED_STREAM_ERRORS: usize = 16;
 const TIMESTAMP_GAP_TOLERANCE_FRAMES: u64 = 2;
@@ -53,6 +70,12 @@ pub struct AudioDeviceDescriptor {
     pub device_type: String,
     pub interface_type: String,
     pub is_default: bool,
+    /// The rate the device is running at right now, as the host reports it -
+    /// on macOS the Audio MIDI Setup value, on Windows the shared mix format.
+    /// `None` when the host could not be asked. A device that is not already
+    /// at 48 kHz still measures correctly, but see
+    /// [`play_interleaved_output`] for what in-app playback does to it.
+    pub current_sample_rate_hz: Option<u32>,
     /// Only configurations that explicitly contain 48 kHz are retained.
     pub configurations: Vec<ProjectStreamConfig>,
 }
@@ -100,6 +123,94 @@ pub struct MonoInputCaptureRequest {
     pub input_channel_index: u16,
     pub duration_ms: u64,
     pub maximum_samples: usize,
+}
+
+/// One bounded playback of a decoded interleaved buffer.
+///
+/// This exists only for the optional in-app sweep playback. It carries no
+/// microphone state and is never consulted by sweep recognition.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InterleavedOutputPlaybackRequest {
+    /// Host-qualified CPAL device ID returned by
+    /// [`scan_default_host_outputs`].
+    pub device_id: String,
+    /// Interleaved PCM at `sample_rate_hz`, `channels` samples per frame.
+    pub frames: Vec<f32>,
+    pub channels: u16,
+    /// The rate `frames` is authored at, and the rate the device is opened at.
+    /// Callers should hand over the device's own rate - see
+    /// [`output_device_sample_rate`] and [`play_interleaved_output`].
+    pub sample_rate_hz: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutputPlaybackReport {
+    pub host: String,
+    pub device_id: String,
+    pub device_name: Option<String>,
+    pub sample_rate_hz: u32,
+    /// The device's own rate before the sweep, as the host reported it.
+    pub device_rate_before_hz: Option<u32>,
+    /// Whether the sweep had to move the device off that rate to reach 48 kHz.
+    pub device_rate_forced: bool,
+    /// Whether the device was put back on `device_rate_before_hz` afterwards.
+    /// `false` with `device_rate_forced` also false is the ordinary case: the
+    /// host never moved the device, so there was nothing to undo.
+    pub device_rate_restored: bool,
+    /// Why the restore could not be completed, when it could not.
+    pub device_rate_restore_error: Option<String>,
+    pub source_channels: u16,
+    pub device_channels: u16,
+    pub sample_format: String,
+    pub frame_count: usize,
+    pub frames_written: usize,
+    pub elapsed_ms: u64,
+    pub completed: bool,
+    pub cancelled: bool,
+    pub timed_out: bool,
+    pub callback_format_error: bool,
+    pub stream_error_count: u64,
+    pub first_stream_error: Option<String>,
+}
+
+/// Cloneable stop signal for a blocking output playback.
+///
+/// Playback polls this a few times per callback period, so a cancel stops the
+/// sweep within tens of milliseconds without touching the real-time callback.
+#[derive(Clone, Debug, Default)]
+pub struct OutputPlaybackCancellation {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl OutputPlaybackCancellation {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+}
+
+#[derive(Debug)]
+struct PlaybackShared {
+    frames: Vec<f32>,
+    source_channels: usize,
+    device_channels: usize,
+    frame_count: usize,
+    next_frame: AtomicU64,
+    source_exhausted: AtomicBool,
+    callback_format_error: AtomicBool,
+    stream_error_count: AtomicU64,
+    first_stream_error: Mutex<Option<String>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -628,6 +739,500 @@ fn capture_mono_input_internal(
     })
 }
 
+/// Play an already-decoded interleaved buffer on one output device and block
+/// until it has been handed to the driver.
+///
+/// This is a convenience for users who have no second player available; it is
+/// deliberately *not* part of the measurement path. Nothing here observes the
+/// microphone, and the sweep-recognition code never learns that this function
+/// exists: a capture analyses whatever actually reached the microphone, on the
+/// same code path whether the sweep came from this function, from Roon, or
+/// from a phone held in front of the speaker.
+///
+/// Source channel `i` is written to device channel `i`; any further device
+/// channels stay silent. No fallback device is selected and nothing is
+/// resampled here - a device without a native PCM configuration at
+/// `request.sample_rate_hz` wide enough for the buffer is an explicit error.
+///
+/// Pass the device's own rate ([`output_device_sample_rate`]) and the device
+/// format is never rewritten, which is what keeps other clients of a shared
+/// device undisturbed. Any other rate is still honoured: the device is moved
+/// for the length of the sweep and put back straight afterwards - see
+/// `restore_output_sample_rate` for what that costs and where it can fail.
+pub fn play_interleaved_output(
+    request: &InterleavedOutputPlaybackRequest,
+    cancellation: &OutputPlaybackCancellation,
+) -> Result<OutputPlaybackReport, AudioIoError> {
+    let source_channels = validate_playback_request(request)?;
+    if cancellation.is_cancelled() {
+        return Err(AudioIoError::new(
+            "sweep playback was cancelled before the stream started",
+        ));
+    }
+    let (host_id, device) = resolve_output_device(&request.device_id)?;
+
+    // Read the device's own rate before the 48 kHz stream rewrites it; asking
+    // afterwards would only ever report 48 kHz back.
+    let previous_config = device.default_output_config().ok();
+    let previous_rate_hz = previous_config
+        .as_ref()
+        .map(|configuration| configuration.sample_rate());
+
+    let played = play_sweep_on_device(&device, host_id, request, source_channels, cancellation);
+    // Deliberately before the `?`: a stream that failed part-way through has
+    // already moved the device, so the restore must not depend on the playback
+    // having succeeded.
+    let restored =
+        restore_output_sample_rate(&device, previous_config.as_ref(), request.sample_rate_hz);
+
+    let mut report = played?;
+    report.device_rate_before_hz = previous_rate_hz;
+    report.device_rate_forced = previous_rate_hz.is_some_and(|rate| rate != request.sample_rate_hz);
+    match restored {
+        Ok(restored) => report.device_rate_restored = restored,
+        Err(error) => report.device_rate_restore_error = Some(error.to_string()),
+    }
+    Ok(report)
+}
+
+/// The rate an output device is running at right now, without opening a stream.
+///
+/// Callers of [`play_interleaved_output`] should author the sweep at this rate.
+/// Opening a device at any other rate makes CPAL rewrite the device format,
+/// which is global state on macOS: every other client of that device moves with
+/// it, and on a virtual loopback shared with a convolution host the change has
+/// been observed to stall CoreAudio's `AudioComponentInstanceNew` indefinitely.
+/// Handing the device the rate it already has avoids the write entirely.
+pub fn output_device_sample_rate(device_id: &str) -> Result<u32, AudioIoError> {
+    let (_, device) = resolve_output_device(device_id)?;
+    device
+        .default_output_config()
+        .map(|configuration| configuration.sample_rate())
+        .map_err(|error| {
+            AudioIoError::new(format!(
+                "could not read the current sample rate of output device `{device_id}`: {error}"
+            ))
+        })
+}
+
+/// Look up a host-qualified CPAL output device ID without opening a stream.
+fn resolve_output_device(device_id: &str) -> Result<(cpal::HostId, cpal::Device), AudioIoError> {
+    let parsed_device_id = device_id.parse::<cpal::DeviceId>().map_err(|error| {
+        AudioIoError::new(format!(
+            "output device ID `{device_id}` is not a valid host-qualified CPAL ID: {error}"
+        ))
+    })?;
+    let host_id = parsed_device_id.host();
+    let host = cpal::host_from_id(host_id).map_err(|error| {
+        AudioIoError::new(format!(
+            "could not open audio host `{host_id}` for output device `{device_id}`: {error}"
+        ))
+    })?;
+    let device = host.device_by_id(&parsed_device_id).ok_or_else(|| {
+        AudioIoError::new(format!(
+            "output device `{device_id}` was not found on audio host `{host_id}`; reconnect it and rescan devices"
+        ))
+    })?;
+    Ok((host_id, device))
+}
+
+/// Put an output device back on the rate it was using before the sweep.
+///
+/// Forcing 48 kHz is intentional: the sweep has to leave the machine as it was
+/// authored, so recognition sees the same signal whether it was played here or
+/// by an external player. On macOS that force is *global* state - CPAL's
+/// CoreAudio output path writes `kAudioDevicePropertyStreamFormat`, falling
+/// back to `kAudioDevicePropertyNominalSampleRate`, on the device object, so
+/// every other client of that device moves with it. The case that hurts is a
+/// virtual loopback device shared with a convolution host: the host sees an
+/// external format change and stops. Restoring right away keeps that
+/// disturbance to the length of the sweep instead of leaving the machine on a
+/// rate the user never chose.
+///
+/// Windows arrives here with nothing to do. CPAL's WASAPI output path runs the
+/// shared-mode engine with `AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM`, which converts
+/// into the device's existing mix format rather than rewriting it, so the rate
+/// reads back unchanged and this returns `Ok(false)`.
+///
+/// The restore is a stream build that is dropped without ever being played:
+/// CPAL applies the device format before it touches the audio unit, so the rate
+/// is back without a sample being rendered.
+fn restore_output_sample_rate(
+    device: &cpal::Device,
+    previous: Option<&SupportedStreamConfig>,
+    played_rate_hz: u32,
+) -> Result<bool, AudioIoError> {
+    let Some(previous) = previous else {
+        return Ok(false);
+    };
+    if previous.sample_rate() == played_rate_hz {
+        // The device was handed the rate it already had, so nothing moved.
+        // This is the path every caller should be on.
+        return Ok(false);
+    }
+    // Ask the host rather than assuming: only a host that actually moved the
+    // device has anything to undo.
+    let current_rate_hz = device
+        .default_output_config()
+        .map(|configuration| configuration.sample_rate())
+        .map_err(|error| {
+            AudioIoError::new(format!(
+                "could not read the output device rate back after the sweep: {error}"
+            ))
+        })?;
+    if current_rate_hz == previous.sample_rate() {
+        return Ok(false);
+    }
+
+    // `err()` drops the built stream immediately; it is never played.
+    let build_error = device
+        .build_output_stream_raw(
+            previous.config(),
+            previous.sample_format(),
+            |_: &mut Data, _: &cpal::OutputCallbackInfo| {},
+            |_: cpal::Error| {},
+            Some(PLAYBACK_COMPLETION_GRACE),
+        )
+        .err();
+    if wait_for_output_rate(device, previous.sample_rate()) {
+        return Ok(true);
+    }
+    Err(AudioIoError::new(match build_error {
+        Some(error) => format!(
+            "could not restore the output device to {} Hz after the sweep: {error}",
+            previous.sample_rate()
+        ),
+        None => format!(
+            "the output device did not return to {} Hz after the sweep",
+            previous.sample_rate()
+        ),
+    }))
+}
+
+/// Wait for a device to report the rate it was just asked for.
+///
+/// CoreAudio publishes a device rate change asynchronously: the property write
+/// returns before the new value is readable, so a single read straight after
+/// the restore can still show the borrowed rate and report a false failure.
+/// The pre-restore check needs none of this - by then the playback stream has
+/// been open for the whole sweep and the value settled long ago.
+fn wait_for_output_rate(device: &cpal::Device, wanted_hz: u32) -> bool {
+    let deadline = Instant::now() + OUTPUT_RATE_SETTLE;
+    loop {
+        if device
+            .default_output_config()
+            .is_ok_and(|configuration| configuration.sample_rate() == wanted_hz)
+        {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(PLAYBACK_POLL_INTERVAL);
+    }
+}
+
+fn play_sweep_on_device(
+    device: &cpal::Device,
+    host_id: cpal::HostId,
+    request: &InterleavedOutputPlaybackRequest,
+    source_channels: usize,
+    cancellation: &OutputPlaybackCancellation,
+) -> Result<OutputPlaybackReport, AudioIoError> {
+    let selected_config = select_output_config(
+        device.supported_output_configs().map_err(|error| {
+            AudioIoError::new(format!(
+                "could not query output configurations for `{}`: {error}",
+                request.device_id
+            ))
+        })?,
+        request.channels,
+        request.sample_rate_hz,
+    )
+    .ok_or_else(|| {
+        AudioIoError::new(format!(
+            "output device `{}` has no native {} Hz PCM configuration with at least {} channels",
+            request.device_id, request.sample_rate_hz, request.channels
+        ))
+    })?;
+    let device_name = device
+        .description()
+        .ok()
+        .map(|description| description.name().to_string());
+    let sample_format = selected_config.sample_format();
+    let sample_format_name = sample_format.to_string();
+    let stream_config = selected_config.config();
+    let device_channels = stream_config.channels;
+    let frame_count = request.frames.len() / source_channels;
+
+    let shared = Arc::new(PlaybackShared {
+        frames: request.frames.clone(),
+        source_channels,
+        device_channels: usize::from(device_channels),
+        frame_count,
+        next_frame: AtomicU64::new(0),
+        source_exhausted: AtomicBool::new(false),
+        callback_format_error: AtomicBool::new(false),
+        stream_error_count: AtomicU64::new(0),
+        first_stream_error: Mutex::new(None),
+    });
+
+    let data_shared = Arc::clone(&shared);
+    let data_callback = move |data: &mut Data, _: &cpal::OutputCallbackInfo| {
+        write_playback_callback(data, sample_format, &data_shared);
+    };
+    let error_shared = Arc::clone(&shared);
+    let error_callback = move |error: cpal::Error| {
+        error_shared
+            .stream_error_count
+            .fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut first) = error_shared.first_stream_error.lock() {
+            if first.is_none() {
+                *first = Some(error.to_string());
+            }
+        }
+    };
+    let stream = device
+        .build_output_stream_raw(
+            stream_config,
+            sample_format,
+            data_callback,
+            error_callback,
+            Some(PLAYBACK_COMPLETION_GRACE),
+        )
+        .map_err(|error| {
+            AudioIoError::new(format!(
+                "could not build the {} Hz {device_channels}-channel output stream for `{}`: {error}",
+                request.sample_rate_hz, request.device_id,
+            ))
+        })?;
+
+    let started_at = Instant::now();
+    stream.play().map_err(|error| {
+        AudioIoError::new(format!(
+            "could not start the output stream for `{}`: {error}",
+            request.device_id
+        ))
+    })?;
+
+    // The source duration plus a generous grace; a device that stops calling
+    // back must not hang the command thread.
+    let deadline = started_at
+        .checked_add(
+            Duration::from_millis(playback_duration_ms(frame_count, request.sample_rate_hz))
+                .checked_add(PLAYBACK_DEADLINE_GRACE)
+                .ok_or_else(|| AudioIoError::new("playback deadline overflowed"))?,
+        )
+        .ok_or_else(|| AudioIoError::new("playback deadline overflowed"))?;
+    let mut deadline_reached = false;
+    loop {
+        if cancellation.is_cancelled() {
+            break;
+        }
+        if shared.source_exhausted.load(Ordering::Acquire)
+            || shared.callback_format_error.load(Ordering::Acquire)
+        {
+            // The last frames are written but not yet converted by the
+            // hardware. Let the driver drain them before the stream is
+            // dropped, or the sweep's tail (which carries the end marker)
+            // would be cut off.
+            std::thread::sleep(PLAYBACK_DRAIN);
+            break;
+        }
+        if Instant::now() >= deadline {
+            deadline_reached = true;
+            break;
+        }
+        std::thread::sleep(PLAYBACK_POLL_INTERVAL);
+    }
+    drop(stream);
+
+    let cancelled = cancellation.is_cancelled();
+    let frames_written = usize::try_from(shared.next_frame.load(Ordering::Acquire))
+        .unwrap_or(usize::MAX)
+        .min(frame_count);
+    let callback_format_error = shared.callback_format_error.load(Ordering::Acquire);
+    let first_stream_error = shared
+        .first_stream_error
+        .lock()
+        .map_err(|_| AudioIoError::new("playback stream error-report lock was poisoned"))?
+        .clone();
+
+    Ok(OutputPlaybackReport {
+        host: host_id.name().to_string(),
+        device_id: request.device_id.clone(),
+        device_name,
+        sample_rate_hz: request.sample_rate_hz,
+        // Owned by `play_interleaved_output`, which is the only caller that
+        // knows what the device was doing before this stream opened.
+        device_rate_before_hz: None,
+        device_rate_forced: false,
+        device_rate_restored: false,
+        device_rate_restore_error: None,
+        source_channels: request.channels,
+        device_channels,
+        sample_format: sample_format_name,
+        frame_count,
+        frames_written,
+        elapsed_ms: u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+        completed: frames_written == frame_count && !cancelled && !callback_format_error,
+        cancelled,
+        timed_out: deadline_reached && !cancelled,
+        callback_format_error,
+        stream_error_count: shared.stream_error_count.load(Ordering::Relaxed),
+        first_stream_error,
+    })
+}
+
+fn validate_playback_request(
+    request: &InterleavedOutputPlaybackRequest,
+) -> Result<usize, AudioIoError> {
+    if request.device_id.trim().is_empty() {
+        return Err(AudioIoError::new(
+            "sweep playback requires a non-empty host-qualified output device ID",
+        ));
+    }
+    let channels = usize::from(request.channels);
+    if channels == 0 || channels > MAXIMUM_PLAYBACK_CHANNELS {
+        return Err(AudioIoError::new(format!(
+            "sweep playback supports 1 to {MAXIMUM_PLAYBACK_CHANNELS} channels, not {}",
+            request.channels
+        )));
+    }
+    if !(MINIMUM_PLAYBACK_RATE_HZ..=MAXIMUM_PLAYBACK_RATE_HZ).contains(&request.sample_rate_hz) {
+        return Err(AudioIoError::new(format!(
+            "sweep playback supports {MINIMUM_PLAYBACK_RATE_HZ} to {MAXIMUM_PLAYBACK_RATE_HZ} Hz, not {}",
+            request.sample_rate_hz
+        )));
+    }
+    if request.frames.is_empty() || request.frames.len() % channels != 0 {
+        return Err(AudioIoError::new(
+            "sweep playback buffer must be a non-empty whole number of interleaved frames",
+        ));
+    }
+    if request.frames.len() > MAXIMUM_PLAYBACK_SAMPLES {
+        return Err(AudioIoError::new(format!(
+            "sweep playback buffer of {} samples exceeds the {MAXIMUM_PLAYBACK_SAMPLES}-sample safety limit",
+            request.frames.len()
+        )));
+    }
+    if let Some(index) = request.frames.iter().position(|sample| !sample.is_finite()) {
+        return Err(AudioIoError::new(format!(
+            "sweep playback buffer sample {index} is not a finite value"
+        )));
+    }
+    Ok(channels)
+}
+
+fn playback_duration_ms(frame_count: usize, sample_rate_hz: u32) -> u64 {
+    let numerator = (frame_count as u128)
+        .saturating_mul(1_000)
+        .saturating_add(u128::from(sample_rate_hz) - 1);
+    u64::try_from(numerator / u128::from(sample_rate_hz)).unwrap_or(u64::MAX)
+}
+
+fn select_output_config(
+    configurations: impl Iterator<Item = SupportedStreamConfigRange>,
+    minimum_channels: u16,
+    sample_rate_hz: u32,
+) -> Option<SupportedStreamConfig> {
+    configurations
+        .filter(|configuration| {
+            configuration.channels() >= minimum_channels
+                && configuration.contains_rate(sample_rate_hz)
+                && is_supported_pcm_format(configuration.sample_format())
+        })
+        .filter_map(|configuration| {
+            let priority = (
+                configuration.channels(),
+                sample_format_priority(configuration.sample_format()),
+            );
+            configuration
+                .try_with_sample_rate(sample_rate_hz)
+                .map(|selected| (priority, selected))
+        })
+        .min_by_key(|(priority, _)| *priority)
+        .map(|(_, configuration)| configuration)
+}
+
+fn write_playback_callback(
+    data: &mut Data,
+    negotiated_format: SampleFormat,
+    shared: &PlaybackShared,
+) {
+    if data.sample_format() != negotiated_format {
+        shared.callback_format_error.store(true, Ordering::Release);
+        return;
+    }
+
+    macro_rules! write_format {
+        ($sample_type:ty) => {
+            match data.as_slice_mut::<$sample_type>() {
+                Some(samples) => write_playback_samples(samples, shared),
+                None => shared.callback_format_error.store(true, Ordering::Release),
+            }
+        };
+    }
+
+    match negotiated_format {
+        SampleFormat::I8 => write_format!(i8),
+        SampleFormat::I16 => write_format!(i16),
+        SampleFormat::I24 => write_format!(cpal::I24),
+        SampleFormat::I32 => write_format!(i32),
+        SampleFormat::I64 => write_format!(i64),
+        SampleFormat::U8 => write_format!(u8),
+        SampleFormat::U16 => write_format!(u16),
+        SampleFormat::U24 => write_format!(cpal::U24),
+        SampleFormat::U32 => write_format!(u32),
+        SampleFormat::U64 => write_format!(u64),
+        SampleFormat::F32 => write_format!(f32),
+        SampleFormat::F64 => write_format!(f64),
+        _ => shared.callback_format_error.store(true, Ordering::Release),
+    }
+}
+
+fn write_playback_samples<T>(output: &mut [T], shared: &PlaybackShared)
+where
+    T: Sample + FromSample<f32>,
+{
+    let device_channels = shared.device_channels;
+    if device_channels == 0 || output.len() % device_channels != 0 {
+        shared.callback_format_error.store(true, Ordering::Release);
+        return;
+    }
+    let silence = T::from_sample(0.0_f32);
+    let copied_channels = shared.source_channels.min(device_channels);
+    let mut next_frame = usize::try_from(shared.next_frame.load(Ordering::Acquire))
+        .unwrap_or(usize::MAX)
+        .min(shared.frame_count);
+
+    for device_frame in output.chunks_exact_mut(device_channels) {
+        if next_frame >= shared.frame_count {
+            device_frame.fill(silence);
+            continue;
+        }
+        let base = next_frame * shared.source_channels;
+        for (channel, slot) in device_frame.iter_mut().enumerate() {
+            *slot = if channel < copied_channels {
+                // A malformed buffer must not be handed to an amplifier at
+                // more than full scale; the adapter rejects non-finite
+                // samples, and this bounds everything else.
+                T::from_sample(shared.frames[base + channel].clamp(-1.0, 1.0))
+            } else {
+                silence
+            };
+        }
+        next_frame += 1;
+    }
+
+    shared
+        .next_frame
+        .store(next_frame as u64, Ordering::Release);
+    if next_frame >= shared.frame_count {
+        shared.source_exhausted.store(true, Ordering::Release);
+    }
+}
+
 fn validate_capture_request(request: &MonoInputCaptureRequest) -> Result<usize, AudioIoError> {
     if request.device_id.trim().is_empty() {
         return Err(AudioIoError::new(
@@ -1036,6 +1641,7 @@ pub fn scan_default_host_inputs() -> Result<AudioDeviceInventory, AudioIoError> 
                         &id,
                         &metadata,
                         default_input_id.as_deref() == Some(id.as_str()),
+                        current_input_rate_hz(&device),
                         configurations,
                     ));
                 }
@@ -1056,6 +1662,95 @@ pub fn scan_default_host_inputs() -> Result<AudioDeviceInventory, AudioIoError> 
         sample_rate_hz: PROJECT_SAMPLE_RATE_HZ,
         inputs,
         outputs: Vec::new(),
+        warnings,
+    })
+}
+
+/// Enumerate only output devices on the platform default host.
+///
+/// This is the mirror of [`scan_default_host_inputs`] and exists for the
+/// optional in-app sweep playback: the measurement path itself never needs an
+/// output device, so a user who plays the sweep from Roon or another player
+/// never calls this and no output device is ever queried or opened.
+pub fn scan_default_host_outputs() -> Result<AudioDeviceInventory, AudioIoError> {
+    let host = cpal::default_host();
+    let host_name = host.id().name().to_string();
+    let default_output_id = host
+        .default_output_device()
+        .and_then(|device| device.id().ok())
+        .map(|id| id.to_string());
+    let devices = host.output_devices().map_err(|error| {
+        AudioIoError::new(format!(
+            "could not enumerate {host_name} output devices: {error}"
+        ))
+    })?;
+
+    let mut outputs = Vec::new();
+    let mut warnings = Vec::new();
+
+    for device in devices {
+        let id = match device.id() {
+            Ok(id) => id.to_string(),
+            Err(error) => {
+                warnings.push(AudioScanWarning {
+                    device_id: None,
+                    direction: Some(AudioDirection::Output),
+                    message: format!("ignored an output device without a usable host ID: {error}"),
+                });
+                continue;
+            }
+        };
+
+        let metadata = match device.description() {
+            Ok(description) => DeviceMetadata {
+                name: description.name().to_string(),
+                manufacturer: description.manufacturer().map(str::to_string),
+                device_type: description.device_type().to_string(),
+                interface_type: description.interface_type().to_string(),
+            },
+            Err(error) => {
+                warnings.push(AudioScanWarning {
+                    device_id: Some(id.clone()),
+                    direction: Some(AudioDirection::Output),
+                    message: format!("output device metadata was unavailable: {error}"),
+                });
+                DeviceMetadata {
+                    name: "Audio output (metadata unavailable)".to_string(),
+                    manufacturer: None,
+                    device_type: "unknown".to_string(),
+                    interface_type: "unknown".to_string(),
+                }
+            }
+        };
+
+        match device.supported_output_configs() {
+            Ok(configurations) => {
+                if let Some(configurations) = direction_project_configs(configurations) {
+                    outputs.push(descriptor(
+                        &id,
+                        &metadata,
+                        default_output_id.as_deref() == Some(id.as_str()),
+                        current_output_rate_hz(&device),
+                        configurations,
+                    ));
+                }
+            }
+            Err(error) if error.kind() == cpal::ErrorKind::UnsupportedOperation => {}
+            Err(error) => warnings.push(AudioScanWarning {
+                device_id: Some(id),
+                direction: Some(AudioDirection::Output),
+                message: format!("output configurations were unavailable: {error}"),
+            }),
+        }
+    }
+
+    sort_devices(&mut outputs);
+
+    Ok(AudioDeviceInventory {
+        host: host_name,
+        sample_rate_hz: PROJECT_SAMPLE_RATE_HZ,
+        inputs: Vec::new(),
+        outputs,
         warnings,
     })
 }
@@ -1130,6 +1825,7 @@ pub fn scan_default_host() -> Result<AudioDeviceInventory, AudioIoError> {
                         &id,
                         &metadata,
                         default_input_id.as_deref() == Some(id.as_str()),
+                        current_input_rate_hz(&device),
                         configurations,
                     ));
                 }
@@ -1149,6 +1845,7 @@ pub fn scan_default_host() -> Result<AudioDeviceInventory, AudioIoError> {
                         &id,
                         &metadata,
                         default_output_id.as_deref() == Some(id.as_str()),
+                        current_output_rate_hz(&device),
                         configurations,
                     ));
                 }
@@ -1186,6 +1883,7 @@ fn descriptor(
     id: &str,
     metadata: &DeviceMetadata,
     is_default: bool,
+    current_sample_rate_hz: Option<u32>,
     configurations: Vec<ProjectStreamConfig>,
 ) -> AudioDeviceDescriptor {
     AudioDeviceDescriptor {
@@ -1195,8 +1893,31 @@ fn descriptor(
         device_type: metadata.device_type.clone(),
         interface_type: metadata.interface_type.clone(),
         is_default,
+        current_sample_rate_hz,
         configurations,
     }
+}
+
+/// The rate a device is running at right now, or `None` if the host will not
+/// say.
+///
+/// CPAL reads this from the host's own view of the device - CoreAudio's current
+/// stream format, WASAPI's shared mix format - so it is the value the user sees
+/// in Audio MIDI Setup or the Windows sound control panel, not a project
+/// constant. Scanning reports it so the wizard can warn before in-app playback
+/// moves a shared device; see [`play_interleaved_output`].
+fn current_input_rate_hz(device: &cpal::Device) -> Option<u32> {
+    device
+        .default_input_config()
+        .ok()
+        .map(|configuration| configuration.sample_rate())
+}
+
+fn current_output_rate_hz(device: &cpal::Device) -> Option<u32> {
+    device
+        .default_output_config()
+        .ok()
+        .map(|configuration| configuration.sample_rate())
 }
 
 fn sort_devices(devices: &mut [AudioDeviceDescriptor]) {
@@ -1315,8 +2036,8 @@ mod tests {
             interface_type: "unknown".to_string(),
         };
         let mut devices = vec![
-            descriptor("coreaudio:z", &metadata("Alpha"), false, Vec::new()),
-            descriptor("coreaudio:a", &metadata("Zulu"), true, Vec::new()),
+            descriptor("coreaudio:z", &metadata("Alpha"), false, None, Vec::new()),
+            descriptor("coreaudio:a", &metadata("Zulu"), true, None, Vec::new()),
         ];
 
         sort_devices(&mut devices);
@@ -1331,7 +2052,16 @@ mod tests {
             host: "CoreAudio".to_string(),
             sample_rate_hz: 48_000,
             inputs: Vec::new(),
-            outputs: Vec::new(),
+            outputs: vec![AudioDeviceDescriptor {
+                id: "coreaudio:loopback".to_string(),
+                name: "Virtual loopback".to_string(),
+                manufacturer: None,
+                device_type: "unknown".to_string(),
+                interface_type: "virtual".to_string(),
+                is_default: true,
+                current_sample_rate_hz: Some(44_100),
+                configurations: Vec::new(),
+            }],
             warnings: vec![AudioScanWarning {
                 device_id: Some("coreaudio:input".to_string()),
                 direction: Some(AudioDirection::Input),
@@ -1345,6 +2075,45 @@ mod tests {
         assert!(value.get("sample_rate_hz").is_none());
         assert_eq!(value["warnings"][0]["deviceId"], "coreaudio:input");
         assert_eq!(value["warnings"][0]["direction"], "input");
+        // The wizard warns before playback when this is not the project rate,
+        // so it has to survive the crossing.
+        assert_eq!(value["outputs"][0]["currentSampleRateHz"], 44_100);
+        assert!(value["outputs"][0].get("current_sample_rate_hz").is_none());
+    }
+
+    #[test]
+    fn the_playback_report_names_the_rate_it_borrowed_and_gave_back() {
+        let report = OutputPlaybackReport {
+            host: "CoreAudio".to_string(),
+            device_id: "coreaudio:loopback".to_string(),
+            device_name: Some("Virtual loopback".to_string()),
+            sample_rate_hz: PROJECT_SAMPLE_RATE_HZ,
+            device_rate_before_hz: Some(44_100),
+            device_rate_forced: true,
+            device_rate_restored: true,
+            device_rate_restore_error: None,
+            source_channels: 2,
+            device_channels: 2,
+            sample_format: "f32".to_string(),
+            frame_count: 48_000,
+            frames_written: 48_000,
+            elapsed_ms: 1_000,
+            completed: true,
+            cancelled: false,
+            timed_out: false,
+            callback_format_error: false,
+            stream_error_count: 0,
+            first_stream_error: None,
+        };
+
+        let value = serde_json::to_value(report).expect("report should serialize");
+
+        assert_eq!(value["sampleRateHz"], 48_000);
+        assert_eq!(value["deviceRateBeforeHz"], 44_100);
+        assert_eq!(value["deviceRateForced"], true);
+        assert_eq!(value["deviceRateRestored"], true);
+        assert_eq!(value["deviceRateRestoreError"], serde_json::Value::Null);
+        assert!(value.get("device_rate_before_hz").is_none());
     }
 
     #[test]
@@ -1569,6 +2338,212 @@ mod tests {
         assert!(value.get("maximum_samples").is_none());
     }
 
+    fn playback_shared(
+        frames: Vec<f32>,
+        source_channels: usize,
+        device_channels: usize,
+    ) -> PlaybackShared {
+        let frame_count = frames.len() / source_channels;
+        PlaybackShared {
+            frames,
+            source_channels,
+            device_channels,
+            frame_count,
+            next_frame: AtomicU64::new(0),
+            source_exhausted: AtomicBool::new(false),
+            callback_format_error: AtomicBool::new(false),
+            stream_error_count: AtomicU64::new(0),
+            first_stream_error: Mutex::new(None),
+        }
+    }
+
+    #[test]
+    fn playback_writes_source_channels_in_order_and_silences_the_rest() {
+        // Two source channels onto a four-channel device: 3 and 4 stay silent.
+        let shared = playback_shared(vec![0.25, -0.5, 0.75, -1.0], 2, 4);
+        let mut output = [0.9_f32; 12];
+
+        write_playback_samples(&mut output, &shared);
+
+        assert_eq!(
+            output[..8],
+            [0.25, -0.5, 0.0, 0.0, 0.75, -1.0, 0.0, 0.0],
+            "source channel i must land on device channel i"
+        );
+        // The buffer outlives the source, so the tail is silence, not a repeat.
+        assert_eq!(output[8..], [0.0; 4]);
+        assert!(shared.source_exhausted.load(Ordering::Acquire));
+        assert_eq!(shared.next_frame.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn playback_resumes_where_the_previous_callback_stopped() {
+        let shared = playback_shared(vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6], 1, 1);
+        let mut first = [0.0_f32; 4];
+        let mut second = [0.0_f32; 4];
+
+        write_playback_samples(&mut first, &shared);
+        write_playback_samples(&mut second, &shared);
+
+        assert_eq!(first, [0.1, 0.2, 0.3, 0.4]);
+        assert_eq!(second[..2], [0.5, 0.6]);
+        assert_eq!(second[2..], [0.0, 0.0]);
+    }
+
+    #[test]
+    fn playback_bounds_an_out_of_range_sample_at_full_scale() {
+        // The adapter rejects non-finite samples; anything else must still be
+        // incapable of driving an amplifier past full scale.
+        let shared = playback_shared(vec![4.0, -4.0], 1, 1);
+        let mut output = [0.0_f32; 2];
+
+        write_playback_samples(&mut output, &shared);
+
+        assert_eq!(output, [1.0, -1.0]);
+    }
+
+    #[test]
+    fn playback_rejects_a_request_no_device_could_honour() {
+        let base = InterleavedOutputPlaybackRequest {
+            device_id: "coreaudio:speaker".to_string(),
+            frames: vec![0.0, 0.0],
+            channels: 2,
+            sample_rate_hz: PROJECT_SAMPLE_RATE_HZ,
+        };
+        assert_eq!(validate_playback_request(&base).unwrap(), 2);
+
+        for (request, expected) in [
+            (
+                InterleavedOutputPlaybackRequest {
+                    device_id: "   ".to_string(),
+                    ..base.clone()
+                },
+                "host-qualified output device ID",
+            ),
+            (
+                InterleavedOutputPlaybackRequest {
+                    channels: 0,
+                    ..base.clone()
+                },
+                "1 to 8 channels",
+            ),
+            (
+                InterleavedOutputPlaybackRequest {
+                    frames: vec![0.0, 0.0, 0.0],
+                    ..base.clone()
+                },
+                "whole number of interleaved frames",
+            ),
+            (
+                InterleavedOutputPlaybackRequest {
+                    frames: Vec::new(),
+                    ..base.clone()
+                },
+                "whole number of interleaved frames",
+            ),
+            (
+                InterleavedOutputPlaybackRequest {
+                    frames: vec![0.0, f32::NAN],
+                    ..base.clone()
+                },
+                "sample 1 is not a finite value",
+            ),
+        ] {
+            let error = validate_playback_request(&request).expect_err(expected);
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn the_output_config_search_takes_the_narrowest_48k_pcm_configuration() {
+        let configurations = vec![
+            SupportedStreamConfigRange::new(
+                1,
+                48_000,
+                48_000,
+                SupportedBufferSize::Range { min: 64, max: 512 },
+                SampleFormat::F32,
+            ),
+            SupportedStreamConfigRange::new(
+                2,
+                48_000,
+                48_000,
+                SupportedBufferSize::Range { min: 64, max: 512 },
+                SampleFormat::F32,
+            ),
+            SupportedStreamConfigRange::new(
+                4,
+                48_000,
+                48_000,
+                SupportedBufferSize::Range { min: 64, max: 512 },
+                SampleFormat::F32,
+            ),
+        ];
+
+        // A stereo sweep needs two channels; the two-channel configuration is
+        // the least invasive one that fits.
+        let selected = select_output_config(configurations.clone().into_iter(), 2, 48_000)
+            .expect("a 48 kHz stereo output configuration exists");
+        assert_eq!(selected.channels(), 2);
+        assert_eq!(selected.sample_rate(), 48_000);
+
+        // Nothing wide enough is an explicit absence, never a narrower fallback.
+        assert!(select_output_config(configurations.into_iter(), 6, 48_000).is_none());
+    }
+
+    /// The search opens the rate it was asked for or nothing at all. Silently
+    /// substituting a neighbouring rate would let CPAL rewrite the device
+    /// format behind the caller's back, which is the whole thing the caller is
+    /// trying to avoid by asking for the device's own rate.
+    #[test]
+    fn the_output_config_search_never_substitutes_a_different_rate() {
+        let configurations = vec![SupportedStreamConfigRange::new(
+            2,
+            44_100,
+            44_100,
+            SupportedBufferSize::Range { min: 64, max: 512 },
+            SampleFormat::F32,
+        )];
+
+        assert!(select_output_config(configurations.clone().into_iter(), 2, 48_000).is_none());
+        let selected = select_output_config(configurations.into_iter(), 2, 44_100)
+            .expect("the device's own rate is selectable");
+        assert_eq!(selected.sample_rate(), 44_100);
+    }
+
+    #[test]
+    fn playback_rejects_an_implausible_rate() {
+        let base = InterleavedOutputPlaybackRequest {
+            device_id: "coreaudio:speaker".to_string(),
+            frames: vec![0.0, 0.0],
+            channels: 2,
+            sample_rate_hz: 44_100,
+        };
+        assert_eq!(validate_playback_request(&base).unwrap(), 2);
+
+        for rate in [
+            0,
+            MINIMUM_PLAYBACK_RATE_HZ - 1,
+            MAXIMUM_PLAYBACK_RATE_HZ + 1,
+        ] {
+            let request = InterleavedOutputPlaybackRequest {
+                sample_rate_hz: rate,
+                ..base.clone()
+            };
+            let error = validate_playback_request(&request)
+                .expect_err("an out-of-range rate must be rejected");
+            assert!(error.to_string().contains("Hz"), "{error}");
+        }
+    }
+
+    #[test]
+    fn playback_duration_follows_the_requested_rate() {
+        assert_eq!(playback_duration_ms(48_000, 48_000), 1_000);
+        assert_eq!(playback_duration_ms(44_100, 44_100), 1_000);
+        // A buffer authored at 44.1 kHz lasts longer than 48 kHz would suggest.
+        assert_eq!(playback_duration_ms(48_000, 44_100), 1_089);
+    }
+
     #[test]
     #[ignore = "requires a local CoreAudio or WASAPI host"]
     fn local_input_only_scan_does_not_open_streams_or_enumerate_outputs() {
@@ -1582,6 +2557,64 @@ mod tests {
             .warnings
             .iter()
             .all(|warning| warning.direction != Some(AudioDirection::Output)));
+    }
+
+    /// The regression this guards: in-app playback used to open every device at
+    /// 48 kHz, which makes CPAL's CoreAudio path write the rate on the device
+    /// object. On a virtual loopback shared with a convolution host that write
+    /// stopped the host outright, and worse, stalled
+    /// `AudioComponentInstanceNew` forever, so playback never returned and the
+    /// device was left on a rate the user never chose. Playing at the device's
+    /// own rate rewrites nothing.
+    #[test]
+    #[ignore = "opens a real output stream on the default device"]
+    fn local_hardware_playback_leaves_the_device_rate_alone() {
+        let inventory =
+            scan_default_host_outputs().expect("default audio output host should enumerate");
+        let device = inventory
+            .outputs
+            .iter()
+            .find(|device| {
+                device.is_default
+                    && device.configurations.iter().any(|configuration| {
+                        configuration.channels >= 2
+                            && !configuration.sample_format.starts_with("dsd")
+                    })
+            })
+            .expect("requires a default PCM output");
+        let before =
+            output_device_sample_rate(&device.id).expect("the device should report a rate");
+
+        // Silence: this exercises the device format, not the speakers.
+        let request = InterleavedOutputPlaybackRequest {
+            device_id: device.id.clone(),
+            frames: vec![0.0; 2 * (before as usize / 10)],
+            channels: 2,
+            sample_rate_hz: before,
+        };
+        let started = Instant::now();
+        let report = play_interleaved_output(&request, &OutputPlaybackCancellation::new())
+            .expect("real output playback should open and complete");
+
+        assert_eq!(report.sample_rate_hz, before);
+        assert_eq!(report.device_rate_before_hz, Some(before));
+        assert!(
+            !report.device_rate_forced,
+            "playing at the device's own rate must not move it"
+        );
+        assert!(!report.device_rate_restored);
+        assert_eq!(report.device_rate_restore_error, None);
+        // The stall this guards against never returns at all; a wall-clock
+        // bound turns that into a failure instead of a hung test run.
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "playback took {:?}, which suggests a CoreAudio stall",
+            started.elapsed()
+        );
+
+        let after =
+            output_device_sample_rate(&device.id).expect("the device should still report a rate");
+        assert_eq!(after, before, "the sweep must not change the device rate");
     }
 
     #[test]

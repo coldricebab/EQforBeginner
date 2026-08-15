@@ -2663,6 +2663,11 @@ h3 {
 .live-inputs article > strong { display: block; margin-bottom: 5px; font-size: 10px; }
 .live-inputs article > p { min-height: 40px; margin-bottom: 10px; color: var(--ink-muted); font-size: 8px; line-height: 1.5; }
 .live-inputs article .button { width: 100%; min-height: 34px; padding: 7px 9px; font-size: 8px; }
+/* The sweep cards can show two stacked full-width buttons ("use a different
+   sweep" and "back to the built-in sweep"), and the built-in notice sits above
+   them. Keep all three from touching. */
+.live-inputs article .button + .button { margin-top: 6px; }
+.live-inputs article .live-inputs__accepted + input + .button { margin-top: 8px; }
 .live-inputs article .live-inputs__accepted {
   min-height: 0;
   margin: 8px 0 0;
@@ -4014,4 +4019,42 @@ h3 {
 
 .live-cache-controls__debug input {
   margin-top: 0.15rem;
+}
+
+.live-sweep-playback {
+  display: grid;
+  gap: 6px;
+  margin: 0 0 13px;
+  padding: 9px 11px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #0a1a22;
+}
+
+.live-sweep-playback label {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 9px;
+  font-weight: 700;
+}
+
+.live-sweep-playback input {
+  margin-top: 1px;
+}
+
+.live-sweep-playback small {
+  color: var(--ink-muted);
+  font-size: 7px;
+  line-height: 1.45;
+}
+
+.live-sweep-playback small.live-sweep-playback__rate {
+  padding: 6px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+}
+
+.live-sweep-playback:has(input:disabled) label {
+  color: var(--ink-muted);
 }

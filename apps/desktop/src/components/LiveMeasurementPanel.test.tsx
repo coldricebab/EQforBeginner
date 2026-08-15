@@ -6,6 +6,7 @@ import {
   LiveMeasurementPanel,
   SUBWOOFER_DELAY_DEFAULTS,
   SweepChannelAnalysis,
+  SweepPlaybackToggle,
   TargetCurveSelector,
   WIDE_BAND_SEARCH_DEFAULTS,
   ZipDownloadControl,
@@ -86,6 +87,7 @@ describe("LiveMeasurementPanel", () => {
         minimumBufferSizeFrames: 64,
         maximumBufferSizeFrames: 512,
       },
+      currentSampleRateHz: 48_000,
     };
     const html = renderToStaticMarkup(
       <LiveMeasurementPanel
@@ -98,7 +100,13 @@ describe("LiveMeasurementPanel", () => {
         audioScanError={null}
         onScanInputDevices={() => undefined}
         onSelectedInputChange={() => undefined}
-        target="bk"
+        outputChoices={[]}
+        selectedOutput=""
+        outputScanState="idle"
+        outputScanError={null}
+        onScanOutputDevices={() => undefined}
+        onSelectedOutputChange={() => undefined}
+        target="harman_6db"
         onTargetChange={() => undefined}
       />,
     );
@@ -112,7 +120,11 @@ describe("LiveMeasurementPanel", () => {
     expect(html).toContain("Raw multipoint measurement");
     expect(html).toContain("Final Roon convolution");
     expect(html).toContain("Start new live project");
-    expect(html).toContain("neither scans nor opens a computer output device");
+    // In-app sweep playback is strictly opt-in: with no speaker chosen, the
+    // app still never scans or opens an output device.
+    expect(html).toContain(
+      "leave that empty and no output device is ever scanned or opened",
+    );
     expect(html).not.toContain("P0 center");
     expect(html).not.toContain("Manual hardware-setting stage");
     expect(html).not.toContain("UMIK-1");
@@ -240,6 +252,107 @@ describe("LiveMeasurementPanel", () => {
     expect(html).toContain("26개 점");
     expect(html).toContain("200–500 Hz");
     expect(html).toContain('accept=".txt,text/plain"');
+    // The only built-in option is the Dirac-sourced default; the removed
+    // B&K/Harman style presets must not resurface, and the source link must
+    // point at Dirac's official page.
+    expect(html).toContain("Harman-6dB (Dirac)");
+    expect(html).toContain("https://www.dirac.com/resources/target-curve");
+    expect(html).not.toContain("B&amp;K");
+    expect(html).not.toContain("Harman 스타일");
+  });
+
+  it("offers in-app sweep playback only once a speaker has been chosen", () => {
+    const withoutSpeaker = renderToStaticMarkup(
+      <SweepPlaybackToggle
+        copy={messages.ko.liveMeasurement}
+        checked
+        speakerSelected={false}
+        deviceSampleRateHz={48_000}
+        disabled={false}
+        onChange={() => undefined}
+      />,
+    );
+
+    // No speaker means no playback, whatever the remembered checkbox says.
+    expect(withoutSpeaker).toContain("disabled");
+    expect(withoutSpeaker).not.toContain("checked");
+    expect(withoutSpeaker).toContain("2단계에서 출력 장치를 선택하면");
+
+    const withSpeaker = renderToStaticMarkup(
+      <SweepPlaybackToggle
+        copy={messages.ko.liveMeasurement}
+        checked
+        speakerSelected
+        deviceSampleRateHz={48_000}
+        disabled={false}
+        onChange={() => undefined}
+      />,
+    );
+
+    expect(withSpeaker).toContain("checked");
+    expect(withSpeaker).not.toContain("disabled");
+    expect(withSpeaker).toContain("앱에서 스윕 재생");
+    // The note must keep the head start separate from recognition.
+    expect(withSpeaker).toContain("3초");
+    expect(withSpeaker).toContain("타이밍 마커");
+  });
+
+  it("says the sweep meets a device that is not on the project rate", () => {
+    const converted = renderToStaticMarkup(
+      <SweepPlaybackToggle
+        copy={messages.ko.liveMeasurement}
+        checked
+        speakerSelected
+        deviceSampleRateHz={44_100}
+        disabled={false}
+        onChange={() => undefined}
+      />,
+    );
+
+    // Naming the rate is what lets the user tie the note to their device.
+    expect(converted).toContain("44100 Hz");
+    expect(converted).toContain("변환해");
+    // The promise that matters: nothing else on that device is disturbed.
+    expect(converted).toContain("장치 설정은 바뀌지 않고");
+    expect(
+      renderToStaticMarkup(
+        <SweepPlaybackToggle
+          copy={messages.en.liveMeasurement}
+          checked
+          speakerSelected
+          deviceSampleRateHz={44_100}
+          disabled={false}
+          onChange={() => undefined}
+        />,
+      ),
+    ).toContain("44100 Hz");
+
+    // A device already on the project rate needs no conversion, so nothing is
+    // announced.
+    const native = renderToStaticMarkup(
+      <SweepPlaybackToggle
+        copy={messages.ko.liveMeasurement}
+        checked
+        speakerSelected
+        deviceSampleRateHz={48_000}
+        disabled={false}
+        onChange={() => undefined}
+      />,
+    );
+    expect(native).not.toContain("변환해");
+
+    // Neither is one the user plays externally.
+    const external = renderToStaticMarkup(
+      <SweepPlaybackToggle
+        copy={messages.ko.liveMeasurement}
+        checked={false}
+        speakerSelected
+        deviceSampleRateHz={44_100}
+        disabled={false}
+        onChange={() => undefined}
+      />,
+    );
+    expect(external).not.toContain("변환해");
   });
 
   it("renders a clickable ZIP save control and its completed destination", () => {

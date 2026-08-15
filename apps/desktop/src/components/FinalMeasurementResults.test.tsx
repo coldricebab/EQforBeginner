@@ -47,6 +47,7 @@ const design: LiveDesignSummary = {
   maximumAttenuationDb: 8.42,
   maximumBoostDb: 2.31,
   protectedDipsPassed: true,
+  adaptiveHf: null,
   warning: "predicted only",
 };
 

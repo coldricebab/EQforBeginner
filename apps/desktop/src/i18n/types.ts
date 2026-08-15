@@ -116,10 +116,8 @@ export type Messages = {
   target: {
     heading: string;
     body: string;
-    bk: string;
-    bkBody: string;
-    harman: string;
-    harmanBody: string;
+    defaultName: string;
+    defaultBody: string;
     custom: string;
     customBody: string;
     import: string;
@@ -283,9 +281,13 @@ export type Messages = {
     importingCalibration: string;
     calibrationReady: string;
     calibrationSerial: string;
+    calibrationOptionalWarning: string;
     sweepTitles: Record<"left" | "right", string>;
     sweepBody: string;
+    sweepBuiltInInUse: string;
     chooseSweep: string;
+    replaceSweep: string;
+    useBuiltInSweep: string;
     importingSweep: string;
     sweepReady: string;
     sweepMarkerWarning: string;
@@ -398,6 +400,20 @@ export type Messages = {
     noMicrophone: string;
     scanMicrophones: string;
     scanningMicrophones: string;
+    outputTitle: string;
+    outputBody: string;
+    outputOptionalNotice: string;
+    scanSpeakers: string;
+    scanningSpeakers: string;
+    selectSpeaker: string;
+    noSpeaker: string;
+    speakerNotUsed: string;
+    defaultSpeaker: string;
+    playSweepInApp: string;
+    playSweepInAppNote: string;
+    playSweepInAppNoSpeaker: string;
+    playSweepInAppRateNote: string;
+    playSweepInAppRateNotRestored: string;
     rawRoonChecklist: string[];
     rawRoonChecklist21: string[];
     position: string;
@@ -493,7 +509,20 @@ export type Messages = {
     designTitle: string;
     designBody: string;
     selectedTarget: string;
-    targetLabels: Record<"bk" | "harman" | "custom", string>;
+    targetLabels: Record<"harman_6db" | "custom", string>;
+    defaultTargetNote: string;
+    defaultTargetSourceLink: string;
+    adaptiveHfTitle: string;
+    adaptiveHfPreferred: string;
+    adaptiveHfRolloff: string;
+    adaptiveHfFallback: string;
+    adaptiveHfFallbackReasons: Record<
+      | "insufficient_coverage"
+      | "too_few_fit_points"
+      | "non_finite_measurement"
+      | "ill_conditioned_fit",
+      string
+    >;
     importCustomTarget: string;
     importingTarget: string;
     customTargetReady: string;
@@ -629,6 +658,7 @@ export type Messages = {
       targetTooLarge: string;
       wavOnly: string;
       sweepTooLarge: string;
+      builtInSweepFailed: string;
     };
   };
   developer: {

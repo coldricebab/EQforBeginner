@@ -1,3 +1,6 @@
+/** The only rate the measurement path admits, and the rate sweeps play at. */
+export const PROJECT_SAMPLE_RATE_HZ = 48_000;
+
 export type ProjectStreamConfig = {
   sampleRateHz: number;
   channels: number;
@@ -13,6 +16,12 @@ export type AudioDeviceDescriptor = {
   deviceType: string;
   interfaceType: string;
   isDefault: boolean;
+  /**
+   * The rate the device is running at right now, as the host reports it: the
+   * Audio MIDI Setup value on macOS, the shared mix format on Windows. `null`
+   * when the host would not say.
+   */
+  currentSampleRateHz: number | null;
   configurations: ProjectStreamConfig[];
 };
 
@@ -35,6 +44,8 @@ export type AudioDeviceChoice = {
   deviceId: string;
   name: string;
   isDefault: boolean;
+  /** Carried through from the device so playback can warn before it borrows. */
+  currentSampleRateHz: number | null;
   configuration: ProjectStreamConfig;
   inputChannelIndex: number;
 };
@@ -58,7 +69,7 @@ export function buildDeviceChoices(
     device.configurations
       .filter(
         (configuration) =>
-          configuration.sampleRateHz === 48_000 &&
+          configuration.sampleRateHz === PROJECT_SAMPLE_RATE_HZ &&
           configuration.channels >= minimumChannels &&
           !configuration.sampleFormat.toLowerCase().startsWith("dsd"),
       )
@@ -73,6 +84,7 @@ export function buildDeviceChoices(
         deviceId: device.id,
         name: device.name,
         isDefault: device.isDefault,
+        currentSampleRateHz: device.currentSampleRateHz,
         configuration,
         inputChannelIndex: 0,
       })),
@@ -134,6 +146,21 @@ export function buildInputDeviceChoices(
   }
 
   return [...byDeviceAndChannel.values()];
+}
+
+/**
+ * Build selectable speakers for the optional in-app sweep playback.
+ *
+ * Playback always emits an interleaved stereo buffer - a mono sweep is placed
+ * on the side it measures and the other side stays silent - so a device must
+ * offer at least two channels at 48 kHz to be selectable. Choosing a speaker
+ * here is never required: the measurement path is identical when the sweep is
+ * played from Roon or any other player.
+ */
+export function buildOutputDeviceChoices(
+  devices: AudioDeviceDescriptor[],
+): AudioDeviceChoice[] {
+  return buildDeviceChoices(devices, 2);
 }
 
 function sampleFormatRank(sampleFormat: string): number {

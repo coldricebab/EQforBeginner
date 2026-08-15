@@ -11,6 +11,49 @@ fn scan_input_devices() -> Result<eqforbeginner_audio_io::AudioDeviceInventory, 
     eqforbeginner_audio_io::scan_default_host_inputs().map_err(|error| error.to_string())
 }
 
+/// Enumerate output devices for the optional in-app sweep playback.
+///
+/// Kept separate from `scan_input_devices` so a user who plays the sweep from
+/// Roon or another player never causes an output device to be queried.
+#[tauri::command]
+fn scan_output_devices() -> Result<eqforbeginner_audio_io::AudioDeviceInventory, String> {
+    eqforbeginner_audio_io::scan_default_host_outputs().map_err(|error| error.to_string())
+}
+
+/// Play one imported sweep on the selected output device.
+///
+/// This is a convenience for users with no second player and is deliberately
+/// independent of measurement: it takes no capture handle, reports nothing to
+/// the recognizer, and the capture command analyses whatever actually reached
+/// the microphone either way. The frontend, not this command, decides when to
+/// start it relative to a capture.
+#[tauri::command]
+async fn play_live_sweep(
+    channel: live_measurement::LiveChannel,
+    output_device_id: String,
+    state: tauri::State<'_, Arc<live_measurement::LiveMeasurementState>>,
+) -> Result<eqforbeginner_audio_io::OutputPlaybackReport, String> {
+    let state = Arc::clone(&state);
+    let (request, cancellation) = state.begin_sweep_playback(channel, &output_device_id)?;
+    // A worker panic must not early-return before `finish_sweep_playback`, or
+    // `active_playback` stays set and every later playback fails as "already
+    // playing" - the same reason the capture paths await without `?`.
+    let played = tauri::async_runtime::spawn_blocking(move || {
+        eqforbeginner_audio_io::play_interleaved_output(&request, &cancellation)
+            .map_err(|error| error.to_string())
+    })
+    .await;
+    state.finish_sweep_playback();
+    played.map_err(|error| format!("sweep playback worker failed: {error}"))?
+}
+
+#[tauri::command]
+fn stop_live_sweep_playback(
+    state: tauri::State<'_, Arc<live_measurement::LiveMeasurementState>>,
+) -> Result<bool, String> {
+    state.cancel_sweep_playback()
+}
+
 #[tauri::command]
 fn import_wireless_sweep(
     request: tauri::ipc::Request<'_>,
@@ -253,6 +296,15 @@ fn import_live_right_sweep(
     import_live_sweep_body(request.body(), live_measurement::LiveChannel::Right, &state)
 }
 
+/// Load the sweep pair embedded in the binary, so a session that picks no file
+/// still has a measurable sweep. The bytes never cross the IPC boundary.
+#[tauri::command]
+fn import_live_built_in_sweeps(
+    state: tauri::State<'_, Arc<live_measurement::LiveMeasurementState>>,
+) -> Result<live_measurement::BuiltInSweepImportSummary, String> {
+    state.import_built_in_sweeps()
+}
+
 #[tauri::command]
 #[allow(clippy::too_many_arguments)] // Tauri keeps each audited IPC field explicit at the boundary.
 async fn capture_live_measurement(
@@ -327,19 +379,29 @@ fn cancel_live_measurement_capture(
 }
 
 #[tauri::command]
-fn restore_live_accepted_measurements(
+async fn restore_live_accepted_measurements(
     input_device_id: String,
     input_channel_index: u16,
     scope: live_measurement::LiveRestoreScope,
     debug_relax_evidence: bool,
     state: tauri::State<'_, Arc<live_measurement::LiveMeasurementState>>,
 ) -> Result<live_measurement::LiveMeasurementCacheRestoreSummary, String> {
-    state.restore_accepted_measurements(
-        &input_device_id,
-        input_channel_index,
-        scope,
-        debug_relax_evidence,
-    )
+    // Since superseded-version snapshots restore by re-analysing their raw
+    // captures, this is seconds of DSP, not a JSON read - a synchronous
+    // command would hold the main thread and freeze the whole UI for the
+    // duration (the 2026-08-14 "infinite loading": ~59 s of recompute behind
+    // a frozen spinner).
+    let state = Arc::clone(&state);
+    tauri::async_runtime::spawn_blocking(move || {
+        state.restore_accepted_measurements(
+            &input_device_id,
+            input_channel_index,
+            scope,
+            debug_relax_evidence,
+        )
+    })
+    .await
+    .map_err(|error| format!("live measurement cache restore worker failed: {error}"))?
 }
 
 #[tauri::command]
@@ -460,6 +522,9 @@ pub fn run() {
         .manage(Arc::new(live_measurement::LiveMeasurementState::default()))
         .invoke_handler(tauri::generate_handler![
             scan_input_devices,
+            scan_output_devices,
+            play_live_sweep,
+            stop_live_sweep_playback,
             import_wireless_sweep,
             capture_wireless_sweep,
             cancel_wireless_sweep_capture,
@@ -471,6 +536,7 @@ pub fn run() {
             import_live_target_curve,
             import_live_left_sweep,
             import_live_right_sweep,
+            import_live_built_in_sweeps,
             capture_live_measurement,
             cancel_live_measurement_capture,
             restore_live_accepted_measurements,

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   buildDeviceChoices,
   buildInputDeviceChoices,
+  buildOutputDeviceChoices,
   type AudioDeviceDescriptor,
 } from "./audio";
 
@@ -17,6 +18,7 @@ const device = (
   deviceType: "unknown",
   interfaceType: "unknown",
   isDefault,
+  currentSampleRateHz: 48_000,
   configurations,
 });
 
@@ -101,5 +103,44 @@ describe("audio device choices", () => {
     expect(choices).toHaveLength(2);
     expect(choices.map((choice) => choice.inputChannelIndex)).toEqual([0, 1]);
     expect(JSON.parse(choices[1].value)[5]).toBe(1);
+  });
+
+  it("offers only stereo-capable 48 kHz speakers for in-app sweep playback", () => {
+    const choices = buildOutputDeviceChoices([
+      // Playback always emits an interleaved stereo buffer, so a mono-only
+      // output cannot carry a left or right sweep to the right speaker.
+      device("coreaudio:mono", "Mono jack", false, [
+        {
+          sampleRateHz: 48_000,
+          channels: 1,
+          sampleFormat: "f32",
+          minimumBufferSizeFrames: null,
+          maximumBufferSizeFrames: null,
+        },
+      ]),
+      device("coreaudio:optical", "Optical out", true, [
+        {
+          sampleRateHz: 48_000,
+          channels: 2,
+          sampleFormat: "f32",
+          minimumBufferSizeFrames: 64,
+          maximumBufferSizeFrames: 512,
+        },
+      ]),
+      // 48 kHz is the project rate and is never resampled into.
+      device("coreaudio:44k", "44.1k only", false, [
+        {
+          sampleRateHz: 44_100,
+          channels: 2,
+          sampleFormat: "f32",
+          minimumBufferSizeFrames: null,
+          maximumBufferSizeFrames: null,
+        },
+      ]),
+    ]);
+
+    expect(choices.map((choice) => choice.deviceId)).toEqual([
+      "coreaudio:optical",
+    ]);
   });
 });

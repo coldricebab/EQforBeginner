@@ -93,6 +93,22 @@ describe("localized wizard copy", () => {
     }
   });
 
+  it("calls the calibration file optional and warns about skipping it", () => {
+    for (const locale of Object.values(messages)) {
+      const copy = locale.liveMeasurement;
+      // The TXT is optional for microphones that self-correct, and the body
+      // must say why supplying one anyway is wrong.
+      expect(copy.calibrationTitle).toMatch(/선택|optional/i);
+      expect(copy.calibrationBody).toMatch(/이중 보정|apply it twice/i);
+      // Skipping it is a real loss of accuracy: the warning must say the
+      // microphone's own error stays in the measurement and reaches the
+      // filter, and that the package records the session as uncalibrated.
+      expect(copy.calibrationOptionalWarning).toMatch(/경고|warning/i);
+      expect(copy.calibrationOptionalWarning).toMatch(/필터|filter/i);
+      expect(copy.calibrationOptionalWarning).toMatch(/uncalibrated/i);
+    }
+  });
+
   it("keeps the SECS advanced option honest in both locales", () => {
     for (const locale of Object.values(messages)) {
       const copy = locale.liveMeasurement;
@@ -150,5 +166,56 @@ describe("localized wizard copy", () => {
         expect(copy[key].trim()).not.toBe("");
       }
     }
+  });
+
+  it("keeps the default target attributed to Dirac and its HF rolloff honest", () => {
+    for (const locale of Object.values(messages)) {
+      const copy = locale.liveMeasurement;
+      // The only built-in target is the Dirac-published Harman +6 dB curve;
+      // the label and note must name it and its source.
+      expect(copy.targetLabels.harman_6db).toContain("Harman-6dB");
+      expect(copy.targetLabels.harman_6db).toContain("Dirac");
+      expect(copy.defaultTargetNote).toContain("Dirac");
+      expect(copy.defaultTargetNote).toContain("+6 dB");
+      // The adaptive HF rolloff is default-target-only, and the copy says so.
+      expect(copy.defaultTargetNote).toMatch(/기본 타겟을 선택했을 때만|only when the default target/i);
+      expect(copy.defaultTargetSourceLink.trim()).not.toBe("");
+      // Provenance strings: templates carry their placeholders, and every
+      // fallback guard code has a human-readable explanation.
+      expect(copy.adaptiveHfTitle.trim()).not.toBe("");
+      expect(copy.adaptiveHfPreferred).toContain("{slope}");
+      expect(copy.adaptiveHfRolloff).toContain("{slope}");
+      expect(copy.adaptiveHfRolloff).toContain("{break}");
+      expect(copy.adaptiveHfFallback).toContain("{reason}");
+      for (const reason of Object.values(copy.adaptiveHfFallbackReasons)) {
+        expect(reason.trim()).not.toBe("");
+      }
+      // The provenance is measurement-derived prediction context; it must
+      // never use completion/verification language.
+      expect(copy.adaptiveHfTitle).not.toMatch(/보정 완료|verified|검증됨/i);
+    }
+  });
+
+  it("tells both locales the sweep is already loaded and can be replaced", () => {
+    for (const locale of Object.values(messages)) {
+      const copy = locale.liveMeasurement;
+      // The built-in notice names the file it loaded, so the user can tell it
+      // apart from a sweep they picked themselves.
+      expect(copy.sweepBuiltInInUse).toContain("{file}");
+      for (const key of [
+        "replaceSweep",
+        "useBuiltInSweep",
+        "chooseSweep",
+      ] as const) {
+        expect(copy[key].trim()).not.toBe("");
+      }
+      // A failed built-in load must point at the manual path rather than
+      // leaving the stage with no way forward.
+      expect(copy.errors.builtInSweepFailed.trim()).not.toBe("");
+    }
+    expect(messages.ko.liveMeasurement.sweepBody).toContain("기본 스윕");
+    expect(messages.en.liveMeasurement.sweepBody.toLowerCase()).toContain(
+      "built-in sweep",
+    );
   });
 });

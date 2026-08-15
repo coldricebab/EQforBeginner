@@ -24,9 +24,15 @@ Implemented algorithm identifiers:
   microphone capture; this is file/offset evidence, not absolute channel timing.
 - `umik-calibration-parser-v2`: strict UMIK-style TXT parsing, quoted miniDSP metadata
   compatibility, and log-frequency/linear-dB magnitude-correction interpolation.
-- `known-sweep-deconvolution-v5`: recognized-capture resampling, fixed signed
+- `known-sweep-deconvolution-v6`: recognized-capture resampling, fixed signed
   pre-zero retention for marker-referenced paths, regularized known-sweep
-  deconvolution, magnitude calibration, and measurement-quality gates. It retains
+  deconvolution, magnitude calibration, and measurement-quality gates. v6 divides
+  the microphone deviation recorded in the calibration file out of the measurement;
+  v5 multiplied it in, doubling the microphone error, so a v5 snapshot's stored
+  arrays are never trusted - it restores only by re-analysing its retained raw
+  WAV through the current pipeline, and only when that result passes the same
+  gates a fresh capture does. The re-analysis is cached beside its source as a
+  current-version sidecar snapshot, so it runs once per capture. It retains
   32,768 samples (0.68 s) on a 65,536-point/0.73 Hz analysis grid so narrow
   low-frequency modes keep their measured peak level, and the signed pre-zero
   window is 4,800 samples (100 ms) so a path arriving before the acoustic marker
@@ -198,12 +204,16 @@ H_raw[k] = Y[k] conj(R[k]) / (|R[k]|^2 + lambda)
 ```
 
 The default regularization is -100 dB. If the imported calibration covers the complete
-20 Hz-20 kHz required band, its log-frequency-interpolated additive correction `C(f)`
-is applied as
+20 Hz-20 kHz required band, the microphone deviation `C(f)` it records is
+log-frequency-interpolated and divided out of the measurement:
 
 ```text
-H_cal[k] = H_raw[k] 10^(C(f_k) / 20)
+H_cal[k] = H_raw[k] 10^(-C(f_k) / 20)
 ```
+
+The file states how the microphone itself deviates from flat, so compensation
+subtracts it; v5 added it instead, doubling the microphone error in every
+calibrated result.
 
 The optional phase column is retained but not applied. Sensitivity does not alter the
 IR/FR; it is used only for the explicitly assumed SPL display above. The raw and
@@ -244,29 +254,74 @@ averaging for the energy mean.
 
 ## Targets
 
-Bundled targets are independent `-style` product curves, not official B&K or Harman
-datasets. Version 1 uses linear interpolation in dB on `ln(f)` between knots and
-holds the nearest endpoint outside the knot range.
+All curves use linear interpolation in dB on `ln(f)` between knots and hold the
+nearest endpoint outside the knot range.
 
-| Hz | B&K-style dB | Harman-style hi-fi dB |
-| ---: | ---: | ---: |
-| 20 | 6.0 | 7.0 |
-| 30 | 5.3 | 6.6 |
-| 50 | 4.2 | 5.6 |
-| 80 | 3.2 | 4.4 |
-| 120 | 2.4 | 3.3 |
-| 200 | 1.4 | 2.0 |
-| 500 | 0.0 | 0.0 |
-| 1,000 | -0.5 | -0.4 |
-| 2,000 | -1.0 | -0.9 |
-| 5,000 | -2.2 | -2.0 |
-| 10,000 | -4.0 | -3.8 |
-| 20,000 | -6.0 | -6.5 |
+The app's target selector offers exactly two choices: the built-in default and a
+user-imported TXT. (The older `-style` B&K/Harman presets remain in `dsp-core`
+solely as the basis of the fixture/pipeline regression path; the app no longer
+offers them.)
 
-Design rationale: both curves provide a modest low-frequency shelf and gentle
-downward full-band diagnostic trend. Harman-style v1 has the larger bass shelf.
-Only 20-500 Hz is fully corrected by default, so high-frequency knots are context
-and future-proofing rather than permission for full-band EQ.
+### Built-in default: Harman-6dB (Dirac) — `dirac-harman-6db-v1-log-f-linear-db`
+
+Below 500 Hz the default is, knot for knot, the Harman +6 dB bass shelf that
+Dirac publishes on its official target-curve resource page
+(<https://www.dirac.com/resources/target-curve>; the page offers +4/+6/+8 dB
+variants and states the Harman curves deliberately carry no HF rolloff of their
+own, because that part should be set per room and speaker). A test pins the
+preset's sub-500 Hz knots to the repository copy
+`assets/targets/Harman-6dB_REW.txt` so the attribution cannot silently drift.
+The shelf is ~+6 dB at 20 Hz decaying to 0 dB at the 500 Hz anchor.
+
+From 500 Hz upward the static form is a single preferred in-room slope line,
+`t(f) = -1.0 · log2(f / 500)` dB out to 24 kHz. The -1 dB/octave constant is the
+gently declining steady-state in-room response preferred in the Toole/Olive
+listening research — a literature constant, never a value derived from any
+particular system measured with this app.
+
+### Measurement-adaptive HF rolloff — `harman-6db-adaptive-hf-v1`
+
+A fixed -1 dB/oct line to 20 kHz is right for a speaker with extended treble,
+but for a speaker that genuinely rolls off it demands boost the driver cannot
+deliver, costing headroom against the cut-only design policy. When (and only
+when) the built-in default target is selected, the design therefore adapts the
+HF section to the measurement; a custom TXT is always used verbatim and the
+SECS flat target is unaffected.
+
+Input: the weighted spatial energy average the correction stage consumes
+(all accepted positions, both channels, P0 at weight 2). Then:
+
+1. Smooth at 1/3 octave (Gaussian on the log-f axis, the existing `smoothing`
+   module).
+2. Anchor: subtract the mean smoothed level over 400-630 Hz so
+   `measured(500 Hz) ≈ 0 dB` (a single bin is too noisy).
+3. Preferred line: `pref(f) = -1.0 · log2(f / 500)`.
+4. Measured trend: least-squares fit `meas(f) = a + b · log2(f / 500)` over the
+   third-octave centres in 2-20 kHz (≥ 6 points; 2 kHz keeps the fit clear of
+   the anchor region and midrange modes, so only the broad treble trend enters —
+   local peaks/dips deliberately stay ordinary correction targets).
+5. Target above 500 Hz: `t(f) = max(min(pref(f), meas(f)), -12 dB)` on the
+   third-octave grid, then enforced monotone non-increasing. The -12 dB droop
+   clamp equals the corrector's own `MAXIMUM_SUPPORTED_ATTENUATION_DB`: a trend
+   deeper than anything the corrector could implement indicates a broken
+   measurement.
+
+A well-extended speaker (`meas ≥ pref`) receives the full preferred slope; a
+rolled-off speaker receives a target that bends at the measured break frequency
+onto its own decline, so no futile top-octave boost is demanded. Every
+speaker-specific number (break frequency, droop) emerges from the run-time fit.
+
+Guards — no measured coverage to ≥ 10 kHz or past the 400 Hz anchor band, too
+few fit points, non-finite values, an ill-conditioned fit — fall back to the
+static curve, and `b ≥ 0` (rising treble) keeps the preferred line. Every
+outcome (fitted slope in dB/oct, break frequency or its absence, or the named
+fallback reason) is recorded in the design summary, shown in the UI, and
+written into the trial README. This provenance is derived from the baseline
+measurement: it is prediction context, never verification evidence.
+
+In the bounded Phase 4 design only 20-500 Hz is corrected, so there the
+adaptive HF section shapes display/diagnostics; in the full-band SECS path
+(overlay re-anchored at 500 Hz) it directly shapes the correction.
 
 A user target accepts exactly two numeric columns (`frequency_hz level_db`) separated
 by spaces, tabs, or commas. Blank lines and `#`/`;` comments are ignored. Frequencies
@@ -1144,7 +1199,7 @@ inactive and the design follows the original path exactly.
 | Target-curve overlay | Multiplies the adaptive target by the house curve chosen in the app, re-anchored to 0 dB at 500 Hz |
 | 2.1 shared-sub-band commonization | Stage 5 above |
 | Closed-loop verification | Plays the filter, remeasures, and compares against the prediction (judged 20–650 Hz) |
-| Per-rate redesign | Resamples and redesigns for each of the six Roon native rates; the 48 kHz member is byte-identical to the verified trial |
+| Per-rate members | The 48 kHz member is byte-identical to the verified trial; every other member is that FIR resampled with the scipy-parity resampler, so all six rates carry one transfer function by construction (v3; v2 transplanted the excess corrector but re-ran windowing, the phase guard, and the min-phase EQ per grid, and near a razor-sharp modal cut the realized phase's winding count proved grid-dependent - a real 44.1 kHz family shipped 33.6 ms of 20-100 Hz group delay away from the verified member) |
 | Headroom calculation | Measures program-material time-domain peak growth to produce the recommendation |
 
 Defects in these belong to this project, not to the original author.

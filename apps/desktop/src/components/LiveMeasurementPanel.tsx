@@ -1,6 +1,7 @@
 import { Channel, invoke, isTauri } from "@tauri-apps/api/core";
 import { useEffect, useRef, useState } from "react";
 import type { Messages } from "../i18n/types";
+import { PROJECT_SAMPLE_RATE_HZ } from "../lib/audio";
 import type {
   AudioDeviceChoice,
   AudioScanError,
@@ -27,9 +28,13 @@ import {
   type LiveCaptureProgress,
   type LiveCaptureKind,
   type LiveCaptureSummary,
+  type LiveSweepPlaybackReport,
   type LiveChannel,
   SECS_DEFAULT_SETTINGS,
   SECS_ORIGINAL_URL,
+  DIRAC_TARGET_SOURCE_URL,
+  type LiveAdaptiveHfFallbackReason,
+  type LiveAdaptiveHfSummary,
   type LiveDesignSummary,
   type LiveExportSummary,
   type LiveSecsDesignSettings,
@@ -47,6 +52,8 @@ import {
   type LiveSubwooferSearchSummary,
   type LiveSubwooferOptimizationSummary,
   type LiveSweepImportSummary,
+  type BuiltInSweepImportSummary,
+  type LiveSweepOrigin,
   type LiveSystemMode,
   type LiveVerificationSummary,
   type LiveWizardStage,
@@ -62,7 +69,7 @@ import { MeasurementPositionGuide } from "./MeasurementPositionGuide";
 import { FinalMeasurementResults } from "./FinalMeasurementResults";
 import { MeasuredFrequencyResponseChart } from "./MeasuredFrequencyResponseChart";
 
-export type LiveTargetKind = "bk" | "harman" | "custom";
+export type LiveTargetKind = "harman_6db" | "custom";
 
 /**
  * Developer-only tooling (currently the evidence-relaxing cache restore) is
@@ -84,9 +91,26 @@ type Props = {
   audioScanError: AudioScanError;
   onScanInputDevices: () => void;
   onSelectedInputChange: (value: string) => void;
+  /** Optional speakers for the in-app sweep playback. Empty until scanned. */
+  outputChoices: AudioDeviceChoice[];
+  selectedOutput: string;
+  outputScanState: AudioScanState;
+  outputScanError: AudioScanError;
+  onScanOutputDevices: () => void;
+  onSelectedOutputChange: (value: string) => void;
   target: LiveTargetKind;
   onTargetChange: (target: LiveTargetKind) => void;
 };
+
+/**
+ * How long after "start capture" the in-app sweep begins.
+ *
+ * It is a fixed head start for the user, not a synchronization signal: the
+ * recognizer finds the sweep in the recording by its timing markers wherever
+ * it lands, exactly as it does for a sweep played from Roon. Nothing downstream
+ * knows or assumes this value.
+ */
+const IN_APP_SWEEP_PLAYBACK_DELAY_MS = 3_000;
 
 type BusyOperation =
   | "session"
@@ -94,6 +118,7 @@ type BusyOperation =
   | "target"
   | "left_sweep"
   | "right_sweep"
+  | "built_in_sweeps"
   | "subwoofer"
   | "sub_search"
   | "sub_optimize"
@@ -150,6 +175,12 @@ export function LiveMeasurementPanel({
   audioScanError,
   onScanInputDevices,
   onSelectedInputChange,
+  outputChoices,
+  selectedOutput,
+  outputScanState,
+  outputScanError,
+  onScanOutputDevices,
+  onSelectedOutputChange,
   target,
   onTargetChange,
 }: Props) {
@@ -157,6 +188,9 @@ export function LiveMeasurementPanel({
   const leftSweepInputRef = useRef<HTMLInputElement>(null);
   const rightSweepInputRef = useRef<HTMLInputElement>(null);
   const cancelRequestedRef = useRef(false);
+  const sweepPlaybackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
   const stageHeadingRef = useRef<HTMLHeadingElement>(null);
   const [currentStage, setCurrentStage] = useState(0);
   const [systemMode, setSystemMode] = useState<LiveSystemMode | null>(null);
@@ -207,6 +241,15 @@ export function LiveMeasurementPanel({
   const [sweeps, setSweeps] = useState<
     Partial<Record<LiveChannel, LiveSweepImportSummary>>
   >({});
+  // Which file each loaded channel came from, and what the built-in pair is
+  // called. The backend does not track this - the summaries are identical
+  // either way - so the caller that made the choice remembers it.
+  const [sweepOrigins, setSweepOrigins] = useState<
+    Partial<Record<LiveChannel, LiveSweepOrigin>>
+  >({});
+  const [builtInSweepNames, setBuiltInSweepNames] = useState<
+    Record<LiveChannel, string> | null
+  >(null);
   const [captures, setCaptures] = useState<
     Record<string, LiveCaptureSummary>
   >({});
@@ -241,14 +284,30 @@ export function LiveMeasurementPanel({
   const [busy, setBusy] = useState<BusyOperation>(null);
   const [captureProgress, setCaptureProgress] =
     useState<LiveCaptureProgress | null>(null);
+  const [playSweepInApp, setPlaySweepInApp] = useState(false);
   const [error, setError] = useState("");
 
   const inputDeviceId = inputDeviceIdFromChoice(selectedInput);
   const inputChannelIndex = inputChannelIndexFromChoice(selectedInput);
+  const selectedOutputChoice =
+    outputChoices.find((choice) => choice.value === selectedOutput) ?? null;
+  const outputDeviceId = selectedOutputChoice?.deviceId ?? null;
+  const outputDeviceRateHz = selectedOutputChoice?.currentSampleRateHz ?? null;
+  // Picking a speaker is the whole opt-in: it turns the playback checkbox on,
+  // and clearing the speaker turns it back off. The checkbox stays the user's
+  // to override afterwards.
+  useEffect(() => {
+    setPlaySweepInApp(outputDeviceId !== null);
+  }, [outputDeviceId]);
+  const sweepPlaybackReady = playSweepInApp && outputDeviceId !== null;
   const baselinePairs = acceptedPairCount(captures);
   const baselineP0Ready = hasAcceptedP0(captures, "baseline");
   const verificationP0Ready = hasAcceptedP0(captures, "verification");
-  const filesReady = calibration !== null && Boolean(sweeps.left && sweeps.right);
+  // The calibration TXT is deliberately not part of this gate: a measurement
+  // microphone that already applies its correction internally needs none, and
+  // importing one for such a microphone would apply it twice. The stage warns
+  // instead of blocking, and the exported manifest records `uncalibrated`.
+  const filesReady = Boolean(sweeps.left && sweeps.right);
   const parsedCrossovers = parseCrossoverCandidates(
     searchMode === "wide_band" ? wideCrossoverCandidates : crossoverCandidates,
   );
@@ -425,8 +484,9 @@ export function LiveMeasurementPanel({
       setHardwareConfirmed(false);
       setCalibration(null);
       setCustomTarget(null);
-      onTargetChange("bk");
+      onTargetChange("harman_6db");
       setSweeps({});
+      setSweepOrigins({});
       setCaptures({});
       setCacheRestore(null);
       setDesign(null);
@@ -435,10 +495,61 @@ export function LiveMeasurementPanel({
       setExported(null);
       setTrialDownload(null);
       setFinalDownload(null);
+      // The built-in sweep pair is the session's starting point, so a user who
+      // chooses no file can measure immediately. A failure here is not fatal -
+      // the file pickers stay available - so it warns instead of unwinding the
+      // session that was already created.
+      await loadBuiltInSweeps();
       setBusy(null);
     } catch (caught) {
       fail(caught);
     }
+  };
+
+  /**
+   * Load the sweep pair embedded in the binary.
+   *
+   * Called once when a session starts, and again when the user reverts a
+   * hand-picked file. Importing the same bytes twice is a no-op in the
+   * backend, so reverting a channel that already holds the default keeps every
+   * accepted measurement.
+   */
+  const loadBuiltInSweeps = async (): Promise<boolean> => {
+    try {
+      const loaded = await invoke<BuiltInSweepImportSummary>(
+        "import_live_built_in_sweeps",
+      );
+      setSweeps({ left: loaded.left, right: loaded.right });
+      setSweepOrigins({ left: "built_in", right: "built_in" });
+      setBuiltInSweepNames({
+        left: loaded.leftFileName,
+        right: loaded.rightFileName,
+      });
+      return true;
+    } catch {
+      setSweeps({});
+      setSweepOrigins({});
+      setError(copy.errors.builtInSweepFailed);
+      return false;
+    }
+  };
+
+  const revertToBuiltInSweeps = async () => {
+    if (!session || busy !== null) return;
+    setBusy("built_in_sweeps");
+    setError("");
+    const loaded = await loadBuiltInSweeps();
+    if (loaded) {
+      setCaptures({});
+      setCacheRestore(null);
+      setSubwooferSearch(null);
+      setSubwooferOptimization(null);
+      setSubwooferSetup(null);
+      setDesign(null);
+      setVerification(null);
+      setExported(null);
+    }
+    setBusy(null);
   };
 
   const recordSubwooferSetup = async () => {
@@ -647,6 +758,7 @@ export function LiveMeasurementPanel({
         await file.arrayBuffer(),
       );
       setSweeps((current) => ({ ...current, [channel]: summary }));
+      setSweepOrigins((current) => ({ ...current, [channel]: "chosen_file" }));
       setCaptures({});
       setCacheRestore(null);
       setSubwooferSearch(null);
@@ -659,6 +771,21 @@ export function LiveMeasurementPanel({
     } catch (caught) {
       fail(caught);
     }
+  };
+
+  /**
+   * Stop any pending or running in-app sweep.
+   *
+   * Playback is a separate command with its own state, so ending it never
+   * touches the capture: a capture that is already running keeps recording
+   * whatever reaches the microphone.
+   */
+  const stopSweepPlayback = () => {
+    if (sweepPlaybackTimerRef.current !== null) {
+      clearTimeout(sweepPlaybackTimerRef.current);
+      sweepPlaybackTimerRef.current = null;
+    }
+    void invoke<boolean>("stop_live_sweep_playback").catch(() => undefined);
   };
 
   const capture = async (
@@ -678,6 +805,34 @@ export function LiveMeasurementPanel({
     setBusy(`capture:${key}`);
     setCaptureProgress(null);
     setError("");
+    // Fire-and-forget, deliberately outside the capture's await chain: the
+    // sweep is emitted on a timer the recognizer knows nothing about, and a
+    // playback failure (unplugged speaker, device in use) must not fail or
+    // alter the capture - the user can still play the sweep by hand.
+    if (sweepPlaybackReady) {
+      const playbackDeviceId = outputDeviceId;
+      sweepPlaybackTimerRef.current = setTimeout(() => {
+        sweepPlaybackTimerRef.current = null;
+        void invoke<LiveSweepPlaybackReport>("play_live_sweep", {
+          channel,
+          outputDeviceId: playbackDeviceId,
+        })
+          .then((report) => {
+            // A failed playback stays ignored - the user can play the sweep by
+            // hand. A device left on 48 kHz cannot: it keeps disturbing
+            // everything else sharing that device until someone puts it back.
+            if (report.deviceRateRestoreError !== null) {
+              setError(
+                copy.playSweepInAppRateNotRestored.replace(
+                  "{rate}",
+                  String(report.deviceRateBeforeHz ?? PROJECT_SAMPLE_RATE_HZ),
+                ),
+              );
+            }
+          })
+          .catch(() => undefined);
+      }, IN_APP_SWEEP_PLAYBACK_DELAY_MS);
+    }
     try {
       const onProgress = new Channel<LiveCaptureProgress>();
       onProgress.onmessage = (progress) => {
@@ -695,6 +850,12 @@ export function LiveMeasurementPanel({
           onProgress,
         },
       );
+      // The capture is over. Drop a still-pending playback timer so a sweep
+      // never starts into a room nobody is recording.
+      if (sweepPlaybackTimerRef.current !== null) {
+        clearTimeout(sweepPlaybackTimerRef.current);
+        sweepPlaybackTimerRef.current = null;
+      }
       if (cancelRequestedRef.current) {
         setCaptureProgress(null);
         setBusy(null);
@@ -738,6 +899,7 @@ export function LiveMeasurementPanel({
       setCaptureProgress(null);
       setBusy(null);
     } catch (caught) {
+      stopSweepPlayback();
       if (cancelRequestedRef.current) {
         setCaptureProgress(null);
         setBusy(null);
@@ -790,6 +952,7 @@ export function LiveMeasurementPanel({
 
   const cancelCapture = async () => {
     cancelRequestedRef.current = true;
+    stopSweepPlayback();
     setCaptureProgress(null);
     try {
       await invoke<boolean>("cancel_live_measurement_capture");
@@ -1113,6 +1276,56 @@ export function LiveMeasurementPanel({
               </small>
             )}
           </article>
+          <article className="live-inputs__speaker">
+            <strong>{copy.outputTitle}</strong>
+            <p>{copy.outputBody}</p>
+            <button
+              className="button button--secondary"
+              type="button"
+              disabled={outputScanState === "scanning" || busy !== null}
+              onClick={onScanOutputDevices}
+            >
+              {outputScanState === "scanning"
+                ? copy.scanningSpeakers
+                : copy.scanSpeakers}
+            </button>
+            <label className="live-input-select">
+              <span>{copy.selectSpeaker}</span>
+              <select
+                value={selectedOutput}
+                disabled={outputChoices.length === 0 || busy !== null}
+                onChange={(event) =>
+                  onSelectedOutputChange(event.currentTarget.value)
+                }
+              >
+                <option value="">
+                  {outputChoices.length === 0
+                    ? copy.noSpeaker
+                    : copy.speakerNotUsed}
+                </option>
+                {outputChoices.map((choice) => (
+                  <option value={choice.value} key={choice.value}>
+                    {choice.name}
+                    {choice.isDefault ? ` · ${copy.defaultSpeaker}` : ""}
+                    {` · ${choice.configuration.channels}ch ${choice.configuration.sampleFormat}`}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <small className="live-input-only-notice">
+              {copy.outputOptionalNotice}
+            </small>
+            {outputScanError && (
+              <small className="live-input-scan-error" role="alert">
+                {outputScanError.kind === "native_shell_required"
+                  ? copy.nativeScanOnly
+                  : copy.scanFailed.replace(
+                      "{detail}",
+                      outputScanError.detail,
+                    )}
+              </small>
+            )}
+          </article>
           <article>
             <strong>{copy.calibrationTitle}</strong>
             <p>{copy.calibrationBody}</p>
@@ -1140,7 +1353,7 @@ export function LiveMeasurementPanel({
                 ? copy.importingCalibration
                 : copy.chooseCalibration}
             </button>
-            {calibration && (
+            {calibration ? (
               <p className="live-inputs__accepted">
                 {copy.calibrationReady
                   .replace("{file}", calibration.fileName)
@@ -1149,16 +1362,25 @@ export function LiveMeasurementPanel({
                   ? ` · ${copy.calibrationSerial} ${calibration.serialNumber}`
                   : ""}
               </p>
+            ) : (
+              <p className="live-warning">{copy.calibrationOptionalWarning}</p>
             )}
           </article>
           {LIVE_CHANNELS.map((channel) => {
             const imported = sweeps[channel];
+            const origin = sweepOrigins[channel];
+            const builtInName = builtInSweepNames?.[channel];
             const ref =
               channel === "left" ? leftSweepInputRef : rightSweepInputRef;
             return (
               <article key={channel}>
                 <strong>{copy.sweepTitles[channel]}</strong>
                 <p>{copy.sweepBody}</p>
+                {origin === "built_in" && builtInName && (
+                  <p className="live-inputs__accepted">
+                    {copy.sweepBuiltInInUse.replace("{file}", builtInName)}
+                  </p>
+                )}
                 <input
                   ref={ref}
                   className="visually-hidden"
@@ -1181,8 +1403,22 @@ export function LiveMeasurementPanel({
                 >
                   {busy === `${channel}_sweep`
                     ? copy.importingSweep
-                    : copy.chooseSweep}
+                    : origin === "built_in"
+                      ? copy.replaceSweep
+                      : copy.chooseSweep}
                 </button>
+                {origin === "chosen_file" && (
+                  <button
+                    className="button button--secondary"
+                    type="button"
+                    disabled={!session || busy !== null}
+                    onClick={() => void revertToBuiltInSweeps()}
+                  >
+                    {busy === "built_in_sweeps"
+                      ? copy.importingSweep
+                      : copy.useBuiltInSweep}
+                  </button>
+                )}
                 {imported && (
                   <>
                     <p className="live-inputs__accepted">
@@ -1551,6 +1787,14 @@ export function LiveMeasurementPanel({
                   <li key={item}>{item}</li>
                 ))}
               </ul>
+              <SweepPlaybackToggle
+                copy={copy}
+                checked={playSweepInApp}
+                speakerSelected={outputDeviceId !== null}
+                deviceSampleRateHz={outputDeviceRateHz}
+                disabled={busy !== null}
+                onChange={setPlaySweepInApp}
+              />
               <p className="live-warning">
                 {copy.subwooferSearch.subOnlyRoute
                   .replace(
@@ -1927,6 +2171,14 @@ export function LiveMeasurementPanel({
           <span aria-hidden="true">✓</span>
           {copy.automaticSaveNotice}
         </p>
+        <SweepPlaybackToggle
+          copy={copy}
+          checked={playSweepInApp}
+          speakerSelected={outputDeviceId !== null}
+          deviceSampleRateHz={outputDeviceRateHz}
+          disabled={busy !== null}
+          onChange={setPlaySweepInApp}
+        />
         <MeasurementPositionGuide copy={copy} />
         <div className="live-capture-table" role="table" aria-label={copy.baselineTitle}>
           <div className="live-capture-table__head" role="row">
@@ -2270,6 +2522,9 @@ export function LiveMeasurementPanel({
               <div><dt>{copy.rightRmse}</dt><dd>{formatMetric(design.rightPredictedRmseDb, "dB")}</dd></div>
               <div><dt>{copy.maximumCut}</dt><dd>{formatMetric(design.maximumAttenuationDb, "dB")}</dd></div>
               <div><dt>{copy.maximumBoost}</dt><dd>{formatMetric(design.maximumBoostDb, "dB")}</dd></div>
+              {design.adaptiveHf && (
+                <div><dt>{copy.adaptiveHfTitle}</dt><dd>{adaptiveHfDescription(copy, design.adaptiveHf)}</dd></div>
+              )}
               <div>
                 <dt>{copy.predictedImprovement}</dt>
                 <dd>
@@ -2322,6 +2577,9 @@ export function LiveMeasurementPanel({
             <dl className="live-metrics">
               <div><dt>{copy.positionsUsed}</dt><dd>{secsDesign.multiPositionApplied ? `${secsDesign.positionId} +${secsDesign.positionCount - 1}` : secsDesign.positionId}</dd></div>
               <div><dt>{copy.secsTargetCurve}</dt><dd>{secsDesign.settings.targetCurve === "flat" ? copy.secsTargetFlat : copy.targetLabels[secsDesign.settings.targetCurve]}</dd></div>
+              {secsDesign.adaptiveHf && (
+                <div><dt>{copy.adaptiveHfTitle}</dt><dd>{adaptiveHfDescription(copy, secsDesign.adaptiveHf)}</dd></div>
+              )}
               {secsDesign.sharedSubBandHz !== null && (
                 <div><dt>{copy.secsSharedSubBand}</dt><dd>{copy.secsSharedSubBandValue.replace("{hz}", secsDesign.sharedSubBandHz.toFixed(0))}</dd></div>
               )}
@@ -2407,6 +2665,19 @@ export function LiveMeasurementPanel({
         {secsDesign && secsSkipVerification && !verification?.passed && (
           <p className="live-warning">{copy.secsSkipVerificationVerifyHint}</p>
         )}
+        {/*
+          Verification captures run through the same `capture` call, so the
+          playback opt-in reaches them too. Showing the control here keeps that
+          visible instead of a sweep starting with no switch on screen.
+        */}
+        <SweepPlaybackToggle
+          copy={copy}
+          checked={playSweepInApp}
+          speakerSelected={outputDeviceId !== null}
+          deviceSampleRateHz={outputDeviceRateHz}
+          disabled={busy !== null}
+          onChange={setPlaySweepInApp}
+        />
         <div className="live-verification-captures">
           {LIVE_CHANNELS.map((channel) => (
             <CaptureCell
@@ -2675,6 +2946,37 @@ export function ZipDownloadControl({
   );
 }
 
+/**
+ * Human-readable adaptive-HF provenance: what the default target's HF
+ * section actually became (measured rolloff, full preferred slope, or a
+ * named fallback). Derived from the baseline measurement — provenance of a
+ * prediction, never verification language.
+ */
+function adaptiveHfDescription(
+  copy: Messages["liveMeasurement"],
+  summary: LiveAdaptiveHfSummary,
+): string {
+  if (summary.applied && summary.breakFrequencyHz !== null) {
+    return copy.adaptiveHfRolloff
+      .replace("{slope}", (summary.fittedSlopeDbPerOctave ?? 0).toFixed(2))
+      .replace("{break}", summary.breakFrequencyHz.toFixed(0));
+  }
+  if (summary.applied) {
+    return copy.adaptiveHfPreferred.replace(
+      "{slope}",
+      (summary.fittedSlopeDbPerOctave ?? 0).toFixed(2),
+    );
+  }
+  const reason = summary.fallbackReason;
+  const reasonText =
+    (reason !== null
+      ? copy.adaptiveHfFallbackReasons[reason as LiveAdaptiveHfFallbackReason]
+      : undefined) ??
+    reason ??
+    "";
+  return copy.adaptiveHfFallback.replace("{reason}", reasonText);
+}
+
 export function TargetCurveSelector({
   copy,
   target,
@@ -2699,7 +3001,7 @@ export function TargetCurveSelector({
     <>
       <fieldset className="live-target-options">
         <legend>{copy.selectedTarget}</legend>
-        {(["bk", "harman", "custom"] as const).map((candidate) => (
+        {(["harman_6db", "custom"] as const).map((candidate) => (
           <label
             className={target === candidate ? "is-selected" : ""}
             key={candidate}
@@ -2716,6 +3018,18 @@ export function TargetCurveSelector({
           </label>
         ))}
       </fieldset>
+      {/* Source attribution for the built-in default, plus what its
+          measurement-adaptive HF rolloff does — default selection only. */}
+      <p className="live-hint">
+        {copy.defaultTargetNote}{" "}
+        <a
+          href={DIRAC_TARGET_SOURCE_URL}
+          target="_blank"
+          rel="noreferrer noopener"
+        >
+          {copy.defaultTargetSourceLink}
+        </a>
+      </p>
       <div className="live-custom-target">
         <input
           ref={inputRef}
@@ -2903,6 +3217,63 @@ export function CaptureProgressPanel({
       <p>{copy.levelGuidance[status]}</p>
       <small>{copy.recommendedLevel}</small>
       <small>{copy.estimatedSplNote}</small>
+    </div>
+  );
+}
+
+/**
+ * Opt-in for playing the sweep from this app instead of an external player.
+ *
+ * It is a convenience only. Whichever way the sweep is emitted, the capture
+ * records the room and the recognizer finds the sweep by its timing markers;
+ * this switch feeds nothing into that analysis.
+ */
+export function SweepPlaybackToggle({
+  copy,
+  checked,
+  speakerSelected,
+  deviceSampleRateHz,
+  disabled,
+  onChange,
+}: {
+  copy: Messages["liveMeasurement"];
+  checked: boolean;
+  speakerSelected: boolean;
+  deviceSampleRateHz: number | null;
+  disabled: boolean;
+  onChange: (value: boolean) => void;
+}) {
+  const armed = checked && speakerSelected;
+  // Only worth saying while playback is armed, and only when the sweep will
+  // actually be converted. An externally played sweep never involves any of it.
+  const rateNote =
+    armed &&
+    deviceSampleRateHz !== null &&
+    deviceSampleRateHz !== PROJECT_SAMPLE_RATE_HZ
+      ? copy.playSweepInAppRateNote.replaceAll(
+          "{rate}",
+          deviceSampleRateHz.toString(),
+        )
+      : null;
+  return (
+    <div className="live-sweep-playback">
+      <label>
+        <input
+          type="checkbox"
+          checked={armed}
+          disabled={disabled || !speakerSelected}
+          onChange={(event) => onChange(event.target.checked)}
+        />
+        <span>{copy.playSweepInApp}</span>
+      </label>
+      <small>
+        {speakerSelected
+          ? copy.playSweepInAppNote
+          : copy.playSweepInAppNoSpeaker}
+      </small>
+      {rateNote === null ? null : (
+        <small className="live-sweep-playback__rate">{rateNote}</small>
+      )}
     </div>
   );
 }

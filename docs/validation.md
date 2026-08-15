@@ -111,7 +111,14 @@ not lost. A measurement enters a spatial/design set only when all of these are t
 - the calibrated known-sweep deconvolver retains enough pre-roll and post-roll;
 - marker-referenced deconvolution retains a fixed 4,800-sample pre-zero window and
   records its -100 ms origin without moving the impulse peak;
-- calibration covers 20 Hz-20 kHz and is applied without extrapolation;
+- the calibration profile in force covers 20 Hz-20 kHz and is applied without
+  extrapolation. A session may deliberately run with no TXT - for a microphone that
+  applies its correction internally - and then measures through an identity profile
+  that is exactly 0 dB across that band, so the calibrated response is bit-identical to
+  the raw one. Such a session binds to its own evidence identity
+  (`none:uncalibrated-microphone-v1`), which is not a hex digest and therefore cannot
+  collide with a real file's SHA-256, and every manifest carries
+  `calibration.uncalibrated: true`;
 - no sample reaches the 0.999 clipping threshold;
 - recognized main-sweep peak is within the hard -48 to -6 dBFS range; -30 dBFS is the
   preferred lower boundary;
@@ -617,12 +624,27 @@ multi-seat guarantees.
   so a full-band comparison would demand a reproduction the physics cannot
   deliver. Correctness above the judged band rests on the SHA-bound filter,
   the applied-scale fit, and listening.
-- Export (`secs-native-rerun-v1`, "(a)" strategy): each Roon native rate is a
-  fresh SECS design on the P0 impulse resampled with a resampler pinned to
-  scipy `resample_poly` by the parity fixture, with the verified automatic
-  delay locked. The 48 kHz member must be byte-identical to the verified
-  trial WAV. Other members are level-aligned to it by their mean 20-500 Hz
-  response difference (recorded per rate and charged to the headroom bound);
+- Export (`secs-native-rerun-v3-resampled-fir`): only the 48 kHz member is
+  designed - it must remain byte-identical to the verified trial WAV - and
+  every other member is that finished FIR resampled with the resampler
+  pinned to scipy `resample_poly` by the parity fixture, so all six rates
+  carry one transfer function by construction. History: v1 let each rate
+  re-fit its own excess phase - below ~100 Hz that is modal noise and grids
+  7% apart fit it differently, shipping members ~35 ms apart in 20-100 Hz
+  group delay. v2 transplanted the 48 kHz corrector by phase interpolation
+  but still re-ran the pre-ring windowing, the phase guard, and the
+  minimum-phase magnitude EQ per grid; near a razor-sharp modal cut the
+  assembled response passes close to zero and the winding count of the
+  realized phase proved grid-dependent - a real 2026-08-14 package's 44.1
+  kHz family sat 33.6 ms from the verified member with the transplant
+  working as designed. Each member's regression 20-100 Hz group delay
+  (`secs_band_group_delay_fit_ms`) is still recorded in the manifest, and
+  the export still fails closed if any member sits more than 5 ms from the
+  48 kHz reference - under v3 that gate verifies resampler fidelity
+  (measured 0.06 ms worst on the failing real package) instead of policing
+  independent designs. Members need no level alignment - one filter is one level (v2's per-rate
+  alignment, applied to identical members, would only chase comparison-grid
+  aliasing of narrow modes);
   their smoothed 20-500 Hz agreement with the verified response is recorded
   as a diagnostic with only a 6 dB gross-corruption backstop, because the
   measured gap between legitimate narrow-mode grid variation (1.20 dB on the

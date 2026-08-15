@@ -7,6 +7,7 @@ import {
 import { messages, type Locale } from "./i18n";
 import {
   buildInputDeviceChoices,
+  buildOutputDeviceChoices,
   type AudioDeviceInventory,
   type AudioScanError,
   type AudioScanState,
@@ -14,7 +15,7 @@ import {
 
 function App() {
   const [locale, setLocale] = useState<Locale>("ko");
-  const [target, setTarget] = useState<LiveTargetKind>("bk");
+  const [target, setTarget] = useState<LiveTargetKind>("harman_6db");
   const [audioInventory, setAudioInventory] =
     useState<AudioDeviceInventory | null>(null);
   const [audioScanState, setAudioScanState] =
@@ -22,8 +23,18 @@ function App() {
   const [audioScanError, setAudioScanError] =
     useState<AudioScanError>(null);
   const [selectedInput, setSelectedInput] = useState("");
+  // The output inventory is scanned separately and only on request: a user who
+  // plays the sweep from Roon never causes an output device to be queried.
+  const [outputInventory, setOutputInventory] =
+    useState<AudioDeviceInventory | null>(null);
+  const [outputScanState, setOutputScanState] =
+    useState<AudioScanState>("idle");
+  const [outputScanError, setOutputScanError] =
+    useState<AudioScanError>(null);
+  const [selectedOutput, setSelectedOutput] = useState("");
   const copy = messages[locale];
   const inputChoices = buildInputDeviceChoices(audioInventory?.inputs ?? []);
+  const outputChoices = buildOutputDeviceChoices(outputInventory?.outputs ?? []);
   const selectedInputChoice = inputChoices.find(
     (choice) => choice.value === selectedInput,
   );
@@ -64,6 +75,35 @@ function App() {
       setSelectedInput("");
       setAudioScanState("error");
       setAudioScanError({ kind: "runtime", detail: String(error) });
+    }
+  };
+
+  const scanOutputDevices = async () => {
+    if (!isTauri()) {
+      setOutputScanState("error");
+      setOutputScanError({ kind: "native_shell_required" });
+      return;
+    }
+
+    setOutputScanState("scanning");
+    setOutputScanError(null);
+    try {
+      const inventory = await invoke<AudioDeviceInventory>(
+        "scan_output_devices",
+      );
+      const choices = buildOutputDeviceChoices(inventory.outputs);
+      setOutputInventory(inventory);
+      // Playback is opt-in, so a scan never silently selects a speaker; the
+      // user picks one, and only that picks the playback checkbox by default.
+      setSelectedOutput((current) =>
+        choices.some((choice) => choice.value === current) ? current : "",
+      );
+      setOutputScanState("ready");
+    } catch (error) {
+      setOutputInventory(null);
+      setSelectedOutput("");
+      setOutputScanState("error");
+      setOutputScanError({ kind: "runtime", detail: String(error) });
     }
   };
 
@@ -124,6 +164,12 @@ function App() {
           audioScanError={audioScanError}
           onScanInputDevices={() => void scanInputDevices()}
           onSelectedInputChange={setSelectedInput}
+          outputChoices={outputChoices}
+          selectedOutput={selectedOutput}
+          outputScanState={outputScanState}
+          outputScanError={outputScanError}
+          onScanOutputDevices={() => void scanOutputDevices()}
+          onSelectedOutputChange={setSelectedOutput}
           target={target}
           onTargetChange={setTarget}
         />

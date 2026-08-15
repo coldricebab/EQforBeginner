@@ -243,6 +243,7 @@ fn config_from_fixture(config: &Value) -> SecsConfig {
         // SECS.py has no house-curve overlay, no shared-sub-band
         // commonization, and no phase guard; parity pins the plain path.
         target_overlay: None,
+        excess_phase_transplant: None,
         shared_low_frequency_hz: None,
         phase_guard: false,
         // SECS.py has one fixed ceiling; parity pins it.

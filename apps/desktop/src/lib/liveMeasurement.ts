@@ -145,6 +145,8 @@ export type CalibrationImportSummary = {
   minimumFrequencyHz: number;
   maximumFrequencyHz: number;
   correctionBandCovered: boolean;
+  /** True only for the identity stand-in used when no TXT was imported. */
+  uncalibrated: boolean;
 };
 
 export type TargetImportSummary = {
@@ -178,6 +180,22 @@ export type LiveSweepImportSummary = {
   startMarkerChannelSeparationDb: number | null;
   endMarkerChannelSeparationDb: number | null;
 };
+
+/**
+ * The sweep pair embedded in the app, imported through the ordinary path.
+ *
+ * A session loads this the moment it starts, so measuring never waits on a
+ * file choice; choosing a sweep WAV replaces it for that channel only.
+ */
+export type BuiltInSweepImportSummary = {
+  leftFileName: string;
+  rightFileName: string;
+  left: LiveSweepImportSummary;
+  right: LiveSweepImportSummary;
+};
+
+/** Where a channel's loaded sweep came from. */
+export type LiveSweepOrigin = "built_in" | "chosen_file";
 
 export type LiveCaptureProgressPhase =
   | "waiting_for_start"
@@ -219,6 +237,19 @@ export type LiveMeasurementLevelAssessment = {
   recommendedPeakMaximumDbfs: number;
   recommendedSplMinimumDb: number;
   recommendedSplMaximumDb: number;
+};
+
+/**
+ * What one in-app sweep playback did to the output device.
+ *
+ * Playback sits outside the measurement path, so the panel reads only the part
+ * that outlives the sweep: a device borrowed at 48 kHz and not handed back.
+ */
+export type LiveSweepPlaybackReport = {
+  deviceRateBeforeHz: number | null;
+  deviceRateForced: boolean;
+  deviceRateRestored: boolean;
+  deviceRateRestoreError: string | null;
 };
 
 export type LiveCaptureSummary = {
@@ -285,8 +316,34 @@ export type LiveDesignSummary = {
   maximumAttenuationDb: number;
   maximumBoostDb: number;
   protectedDipsPassed: boolean;
+  /** Adaptive-HF provenance of the built-in default target; null whenever a
+   * custom target was designed (the adaptive fit is default-target-only). */
+  adaptiveHf: LiveAdaptiveHfSummary | null;
   warning: string;
 };
+
+/** Guard codes of the adaptive HF fit, mirrored from dsp-core. */
+export type LiveAdaptiveHfFallbackReason =
+  | "insufficient_coverage"
+  | "too_few_fit_points"
+  | "non_finite_measurement"
+  | "ill_conditioned_fit";
+
+/** What the measurement-adaptive HF rolloff (`harman-6db-adaptive-hf-v1`)
+ * decided for the built-in default target. Derived from the baseline
+ * measurement — design provenance, never verification evidence. */
+export type LiveAdaptiveHfSummary = {
+  algorithmVersion: string;
+  applied: boolean;
+  fittedSlopeDbPerOctave: number | null;
+  breakFrequencyHz: number | null;
+  fallbackReason: string | null;
+};
+
+/** The built-in default target's bass shelf follows the Harman +6 dB curve
+ * published on Dirac's official target-curve resource page. */
+export const DIRAC_TARGET_SOURCE_URL =
+  "https://www.dirac.com/resources/target-curve";
 
 /** Original SECS by 한플 (Hanpeul); credit link requested by the author. */
 export const SECS_ORIGINAL_URL =
@@ -296,7 +353,7 @@ export type LiveSecsResolution = "low" | "normal" | "high";
 export type LiveSecsLatencyMode = "normal" | "low" | "zero";
 /** App target curve the SECS correction steers toward; "flat" keeps the
  * SECS-native adaptive flat target, the rest match the main target selector. */
-export type LiveSecsTargetCurve = "flat" | "bk" | "harman" | "custom";
+export type LiveSecsTargetCurve = "flat" | "harman_6db" | "custom";
 
 export type LiveSecsDesignSettings = {
   maxBoostDb: number;
@@ -371,6 +428,9 @@ export type LiveSecsDesignSummary = {
   groupDelayReport: LiveSecsGroupDelayBand[];
   /** Predicted-only raw/target/predicted display curves (verified empty). */
   frequencyResponse: LiveFrequencyResponsePlot;
+  /** Adaptive-HF provenance when following the built-in default target;
+   * null for the flat and custom targets. */
+  adaptiveHf: LiveAdaptiveHfSummary | null;
   warning: string;
 };
 

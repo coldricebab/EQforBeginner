@@ -11,11 +11,14 @@
 use crate::wireless_sweep::{decode_reference_wav, ReferenceChannel};
 use chrono::Local;
 use eqforbeginner_audio_io::{
-    InputCaptureCancellation, MonoInputCapture, MonoInputCaptureRequest, PROJECT_SAMPLE_RATE_HZ,
+    output_device_sample_rate, InputCaptureCancellation, InterleavedOutputPlaybackRequest,
+    MonoInputCapture, MonoInputCaptureRequest, OutputPlaybackCancellation,
+    INPUT_CLIPPING_THRESHOLD_LINEAR, PROJECT_SAMPLE_RATE_HZ,
 };
 use eqforbeginner_dsp_core::analysis::{frequency_response, FrequencyResponse};
 use eqforbeginner_dsp_core::calibration::{
-    parse_umik_calibration, MicrophoneCalibration, UMIK_CALIBRATION_PARSER_VERSION,
+    parse_umik_calibration, MicrophoneCalibration, MicrophoneCalibrationPoint,
+    UMIK_CALIBRATION_PARSER_VERSION,
 };
 use eqforbeginner_dsp_core::measurement::{
     deconvolve_recognized_sweep, SweepDeconvolutionConfig, SweepMeasurement,
@@ -30,10 +33,10 @@ use eqforbeginner_dsp_core::phase6::{
     Phase6DesignIntent, Phase6NativeResult, PHASE6_ALGORITHM_VERSION, ROON_NATIVE_SAMPLE_RATES,
 };
 use eqforbeginner_dsp_core::secs::{
-    design_secs_stereo_filter, secs_auto_delay_ceiling_ms, secs_filter_group_delay_report,
-    secs_next_fast_len, secs_resample_poly, SecsConfig, SecsResolutionMode, SECS_ALGORITHM_VERSION,
-    SECS_AUTO_DELAY_MAX_MS, SECS_AUTO_DELAY_MIN_MS, SECS_MAXIMUM_DELAY_CEILING_MS,
-    SECS_PHASE_GUARD_VERSION,
+    design_secs_stereo_filter, secs_auto_delay_ceiling_ms, secs_band_group_delay_fit_ms,
+    secs_filter_group_delay_report, secs_next_fast_len, secs_resample_poly, SecsConfig,
+    SecsResolutionMode, SECS_ALGORITHM_VERSION, SECS_AUTO_DELAY_MAX_MS, SECS_AUTO_DELAY_MIN_MS,
+    SECS_MAXIMUM_DELAY_CEILING_MS, SECS_PHASE_GUARD_VERSION,
 };
 use eqforbeginner_dsp_core::smoothing::gaussian_log_frequency_smooth_at_db;
 use eqforbeginner_dsp_core::spatial::weighted_energy_average_db;
@@ -46,8 +49,8 @@ use eqforbeginner_dsp_core::sub_integration::{
     WIDE_BAND_CROSSOVER_SYNTHESIS_VERSION,
 };
 use eqforbeginner_dsp_core::target::{
-    interpolate_log_frequency_grid, parse_target_txt, TargetCurve, TargetPreset,
-    TARGET_TXT_PARSER_VERSION,
+    harman_6db_adaptive_hf_target, interpolate_log_frequency_grid, parse_target_txt,
+    AdaptiveHfOutcome, TargetCurve, HARMAN_6DB_ADAPTIVE_HF_VERSION, TARGET_TXT_PARSER_VERSION,
 };
 use eqforbeginner_dsp_core::validation::{
     fft_convolve, log_frequency_smoothed_curve, log_frequency_smoothed_rmse_db,
@@ -131,6 +134,25 @@ pub const LIVE_ACCEPTED_MEASUREMENT_CACHE_VERSION: &str = "accepted-measurement-
 const LIVE_REW_EXPORT_DIRECTORY: &str = "rew";
 pub const LIVE_REW_EXPORT_VERSION: &str = "rew-impulse-export-v1";
 pub const MAX_LIVE_SWEEP_BYTES: usize = 32 * 1024 * 1024;
+/// The sweep pair the app falls back to when the user picks no file.
+///
+/// These are the same `assets/sweeps/*_refR.wav` files the regression fixtures
+/// use, embedded in the binary rather than read from disk: a shipped app has no
+/// repository beside it, and a path that resolves in `cargo test` but not in a
+/// packaged bundle would make the default work only for developers. Embedding
+/// them byte-for-byte also keeps their SHA-256 identical to the copy a user has
+/// already imported by hand, so the accepted-measurement cache - which keys on
+/// that hash - still recognizes sessions measured before this default existed.
+///
+/// They go through `import_sweep` unchanged, so the marker analysis, the IR
+/// tail-capacity check and the stored `inputs/` evidence copy are exactly what
+/// a hand-picked file gets. Nothing downstream can tell the two apart.
+static BUILT_IN_LEFT_SWEEP_WAV: &[u8] =
+    include_bytes!("../../../../assets/sweeps/Sweep_L_20-20k_refR.wav");
+static BUILT_IN_RIGHT_SWEEP_WAV: &[u8] =
+    include_bytes!("../../../../assets/sweeps/Sweep_R_20-20k_refR.wav");
+pub const BUILT_IN_LEFT_SWEEP_FILE_NAME: &str = "Sweep_L_20-20k_refR.wav";
+pub const BUILT_IN_RIGHT_SWEEP_FILE_NAME: &str = "Sweep_R_20-20k_refR.wav";
 const REQUIRED_CALIBRATION_BAND_HZ: [f64; 2] = [20.0, 20_000.0];
 const MAX_CALIBRATION_TEXT_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_LIVE_TARGET_TEXT_BYTES: usize = 2 * 1024 * 1024;
@@ -138,6 +160,10 @@ const CAPTURE_DEADLINE_GRACE_MILLISECONDS: u64 = 1_000;
 #[cfg(test)]
 const CAPTURE_DEADLINE_GRACE_SAMPLES: usize =
     PROJECT_SAMPLE_RATE_HZ as usize * CAPTURE_DEADLINE_GRACE_MILLISECONDS as usize / 1_000;
+/// Rates the sweep is resampled to rather than forcing the device to 48 kHz.
+/// Anything outside this falls back to the 48 kHz path, where playback moves
+/// the device and puts it back.
+const SWEEP_PLAYBACK_RESAMPLE_RANGE_HZ: std::ops::RangeInclusive<u32> = 8_000..=192_000;
 const MARKER_SEARCH_STEP_SAMPLES: usize = PROJECT_SAMPLE_RATE_HZ as usize / 2;
 const MARKER_SEARCH_MARGIN_SAMPLES: usize = PROJECT_SAMPLE_RATE_HZ as usize;
 const MINIMUM_MARKER_CORRELATION: f64 = 0.20;
@@ -471,6 +497,10 @@ pub struct CalibrationImportSummary {
     pub minimum_frequency_hz: f64,
     pub maximum_frequency_hz: f64,
     pub correction_band_covered: bool,
+    /// True for the identity stand-in used when the user runs without a
+    /// calibration TXT. Every manifest and cache record carries this flag so a
+    /// package can never be read as "microphone-corrected" when it is not.
+    pub uncalibrated: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -507,6 +537,19 @@ pub struct LiveSweepImportSummary {
     pub end_marker_channel: Option<ReferenceChannel>,
     pub start_marker_channel_separation_db: Option<f64>,
     pub end_marker_channel_separation_db: Option<f64>,
+}
+
+/// Both channels of the embedded default sweep, imported in one call.
+///
+/// The file names travel with the summaries so the UI can name what it loaded
+/// without hard-coding the same strings twice.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BuiltInSweepImportSummary {
+    pub left_file_name: &'static str,
+    pub right_file_name: &'static str,
+    pub left: LiveSweepImportSummary,
+    pub right: LiveSweepImportSummary,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -659,7 +702,90 @@ pub struct LiveDesignSummary {
     pub maximum_attenuation_db: f64,
     pub maximum_boost_db: f64,
     pub protected_dips_passed: bool,
+    /// How the built-in default target's HF section was resolved. `None`
+    /// whenever the design ran with a custom (or SECS flat) target - the
+    /// adaptive fit exists for the built-in default only.
+    pub adaptive_hf: Option<LiveAdaptiveHfSummary>,
     pub warning: String,
+}
+
+/// Provenance of the measurement-adaptive HF rolloff
+/// (`harman-6db-adaptive-hf-v1`): what the fit measured and what the target
+/// actually became. This is a value derived from the baseline measurement -
+/// it is prediction provenance, never verification evidence.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveAdaptiveHfSummary {
+    pub algorithm_version: String,
+    /// True when the fit ran (preferred slope kept or measured rolloff
+    /// followed); false when a guard fell back to the static curve.
+    pub applied: bool,
+    /// Broad measured treble trend over the fit band, dB/octave.
+    pub fitted_slope_db_per_octave: Option<f64>,
+    /// Where the target bends from the preferred slope onto the measured
+    /// trend; `None` when the full preferred slope was kept.
+    pub break_frequency_hz: Option<f64>,
+    /// Machine-readable guard code when `applied` is false.
+    pub fallback_reason: Option<String>,
+}
+
+impl LiveAdaptiveHfSummary {
+    fn from_outcome(outcome: &AdaptiveHfOutcome) -> Self {
+        let algorithm_version = HARMAN_6DB_ADAPTIVE_HF_VERSION.to_string();
+        match outcome {
+            AdaptiveHfOutcome::PreferredSlope {
+                fitted_slope_db_per_octave,
+            } => Self {
+                algorithm_version,
+                applied: true,
+                fitted_slope_db_per_octave: Some(*fitted_slope_db_per_octave),
+                break_frequency_hz: None,
+                fallback_reason: None,
+            },
+            AdaptiveHfOutcome::MeasuredRolloff {
+                fitted_slope_db_per_octave,
+                break_frequency_hz,
+            } => Self {
+                algorithm_version,
+                applied: true,
+                fitted_slope_db_per_octave: Some(*fitted_slope_db_per_octave),
+                break_frequency_hz: Some(*break_frequency_hz),
+                fallback_reason: None,
+            },
+            AdaptiveHfOutcome::Fallback { reason } => Self {
+                algorithm_version,
+                applied: false,
+                fitted_slope_db_per_octave: None,
+                break_frequency_hz: None,
+                fallback_reason: Some(reason.as_str().to_string()),
+            },
+        }
+    }
+
+    /// One human-readable provenance line for trial README files.
+    fn readme_line(&self) -> String {
+        match (
+            self.applied,
+            self.fitted_slope_db_per_octave,
+            self.break_frequency_hz,
+        ) {
+            (true, Some(slope), Some(break_hz)) => format!(
+                "Target HF ({}): follows the measured treble trend ({slope:.2} dB/oct) \
+                 above {break_hz:.0} Hz; no boost is demanded where the speaker rolls off",
+                self.algorithm_version
+            ),
+            (true, Some(slope), None) => format!(
+                "Target HF ({}): measured treble trend {slope:.2} dB/oct is at or above \
+                 the preferred slope, so the full -1 dB/oct line is kept",
+                self.algorithm_version
+            ),
+            _ => format!(
+                "Target HF ({}): adaptive fit unavailable ({}), static curve used",
+                self.algorithm_version,
+                self.fallback_reason.as_deref().unwrap_or("unknown")
+            ),
+        }
+    }
 }
 
 /// User-adjustable SECS parameters, mirroring the SECS.py control panel.
@@ -757,20 +883,35 @@ impl Default for LiveSecsDesignSettings {
 pub enum LiveSecsTargetCurve {
     #[default]
     Flat,
-    Bk,
-    Harman,
+    /// Explicit rename: serde's snake_case would drop the underscore before
+    /// the digit (`harman6db`), while the selector's wire value is
+    /// `harman_6db`.
+    #[serde(rename = "harman_6db")]
+    Harman6db,
     Custom,
 }
 
 impl LiveSecsTargetCurve {
     /// Resolve to the overlay curve the dsp-core design takes; `Custom`
-    /// requires the session's imported target, exactly like Phase 4.
-    fn overlay(self, custom_target: Option<&TargetEntry>) -> Result<Option<TargetCurve>, String> {
+    /// requires the session's imported target, exactly like Phase 4, and the
+    /// built-in default needs the measured response set for its adaptive HF
+    /// rolloff (the adaptive fit runs for that selection only).
+    fn overlay(
+        self,
+        custom_target: Option<&TargetEntry>,
+        response_set: Option<&MeasuredStereoResponseSet>,
+    ) -> Result<(Option<TargetCurve>, Option<LiveAdaptiveHfSummary>), String> {
         Ok(match self {
-            Self::Flat => None,
-            Self::Bk => Some(TargetCurve::preset(TargetPreset::BkStyle)),
-            Self::Harman => Some(TargetCurve::preset(TargetPreset::HarmanStyle)),
-            Self::Custom => Some(target_from_name("custom", custom_target)?),
+            Self::Flat => (None, None),
+            Self::Harman6db => {
+                let (curve, adaptive) =
+                    target_from_name("harman_6db", custom_target, response_set)?;
+                (Some(curve), adaptive)
+            }
+            Self::Custom => {
+                let (curve, _) = target_from_name("custom", custom_target, None)?;
+                (Some(curve), None)
+            }
         })
     }
 }
@@ -907,6 +1048,7 @@ fn secs_config_for(
         // pure settings-to-config mapping deliberately does not see.
         target_overlay: None,
         shared_low_frequency_hz: None,
+        excess_phase_transplant: None,
         phase_guard: settings.improved_phase,
         maximum_delay_ms,
     }
@@ -968,6 +1110,9 @@ pub struct LiveSecsDesignSummary {
     /// Predicted-only raw/target/predicted display curves (verified curves
     /// empty until a real remeasurement exists).
     pub frequency_response: LiveFrequencyResponsePlot,
+    /// Adaptive-HF provenance when the built-in default target was followed;
+    /// `None` for the flat and custom targets.
+    pub adaptive_hf: Option<LiveAdaptiveHfSummary>,
     pub warning: String,
 }
 
@@ -1089,6 +1234,79 @@ struct CalibrationEntry {
     profile: MicrophoneCalibration,
 }
 
+/// Evidence identity of a session run without a calibration TXT.
+///
+/// It deliberately is not a hex digest, so it can never collide with the
+/// SHA-256 of a real calibration file: a measurement captured uncalibrated
+/// never restores into a calibrated session, nor the reverse.
+const UNCALIBRATED_MICROPHONE_SHA256: &str = "none:uncalibrated-microphone-v1";
+const UNCALIBRATED_MICROPHONE_VERSION: &str = "uncalibrated-microphone-v1";
+
+/// The identity stand-in for a microphone that already carries its own
+/// correction (a calibrated-in-firmware measurement mic, or a UMIK whose file
+/// the user has deliberately not supplied).
+///
+/// The two points are exactly 0 dB and span the required band, so the
+/// interpolated correction is 0 dB at every bin and the calibrated spectrum is
+/// bit-identical to the raw one - the correction loop multiplies by
+/// `10^(0/20) == 1.0`. This keeps one code path for calibrated and
+/// uncalibrated sessions instead of a second, separately-tested branch, while
+/// `uncalibrated: true` keeps the record honest.
+fn uncalibrated_microphone_entry() -> CalibrationEntry {
+    let profile = MicrophoneCalibration {
+        parser_version: UNCALIBRATED_MICROPHONE_VERSION,
+        serial_number: None,
+        sensitivity_factor_db: None,
+        points: vec![
+            MicrophoneCalibrationPoint {
+                frequency_hz: REQUIRED_CALIBRATION_BAND_HZ[0],
+                correction_db: 0.0,
+                phase_degrees: None,
+            },
+            MicrophoneCalibrationPoint {
+                frequency_hz: REQUIRED_CALIBRATION_BAND_HZ[1],
+                correction_db: 0.0,
+                phase_degrees: None,
+            },
+        ],
+    };
+    CalibrationEntry {
+        summary: CalibrationImportSummary {
+            file_name: "(no calibration file)".to_string(),
+            sha256: UNCALIBRATED_MICROPHONE_SHA256.to_string(),
+            parser_version: UNCALIBRATED_MICROPHONE_VERSION.to_string(),
+            serial_number: None,
+            sensitivity_factor_db: None,
+            point_count: 0,
+            minimum_frequency_hz: REQUIRED_CALIBRATION_BAND_HZ[0],
+            maximum_frequency_hz: REQUIRED_CALIBRATION_BAND_HZ[1],
+            correction_band_covered: false,
+            uncalibrated: true,
+        },
+        profile,
+    }
+}
+
+/// The calibration this session measures with: the imported file when there is
+/// one, otherwise the identity stand-in above. A calibration TXT is optional
+/// because some measurement microphones apply their correction internally;
+/// supplying one for a microphone that already self-corrects would apply it
+/// twice.
+fn calibration_algorithm_for(session: &LiveSession) -> &'static str {
+    if session.calibration.is_some() {
+        UMIK_CALIBRATION_PARSER_VERSION
+    } else {
+        UNCALIBRATED_MICROPHONE_VERSION
+    }
+}
+
+fn session_calibration(session: &LiveSession) -> CalibrationEntry {
+    session
+        .calibration
+        .clone()
+        .unwrap_or_else(uncalibrated_microphone_entry)
+}
+
 #[derive(Clone, Debug)]
 struct TargetEntry {
     summary: TargetImportSummary,
@@ -1102,6 +1320,11 @@ pub(crate) struct LiveSweepReference {
     pub(crate) source_frame_count: usize,
     measurement_source_start_sample: usize,
     timing_markers: Vec<TimingMarker>,
+    /// The imported WAV as written into the project, kept only so the optional
+    /// in-app playback can send the *whole* file - markers included - to a
+    /// speaker. Recognition uses `samples` and `timing_markers` above and never
+    /// reads this.
+    source_wav_path: PathBuf,
 }
 
 #[derive(Clone, Debug)]
@@ -1261,6 +1484,12 @@ struct LiveSession {
 pub struct LiveMeasurementState {
     session: Mutex<Option<LiveSession>>,
     active_capture: Mutex<Option<InputCaptureCancellation>>,
+    /// Deliberately a separate lock from `active_capture`. The optional in-app
+    /// sweep playback is a convenience for users without a second player, not
+    /// a part of the measurement: it never gates, times, or informs sweep
+    /// recognition, and a capture behaves identically whether the sweep came
+    /// from here, from Roon, or from a phone held at the speaker.
+    active_playback: Mutex<Option<OutputPlaybackCancellation>>,
 }
 
 fn unix_milliseconds() -> Result<u128, String> {
@@ -1490,8 +1719,9 @@ fn validate_capture_evidence(
     let calibration_sha256 = session
         .calibration
         .as_ref()
-        .map(|entry| entry.summary.sha256.as_str())
-        .ok_or_else(|| "microphone calibration disappeared during capture".to_string())?;
+        .map_or(UNCALIBRATED_MICROPHONE_SHA256, |entry| {
+            entry.summary.sha256.as_str()
+        });
     if calibration_sha256 != evidence.calibration_sha256 {
         return Err("microphone calibration changed during capture".to_string());
     }
@@ -1559,8 +1789,9 @@ fn validate_stored_evidence(
     let calibration_sha256 = session
         .calibration
         .as_ref()
-        .map(|entry| entry.summary.sha256.as_str())
-        .ok_or_else(|| "microphone calibration is absent".to_string())?;
+        .map_or(UNCALIBRATED_MICROPHONE_SHA256, |entry| {
+            entry.summary.sha256.as_str()
+        });
     if evidence.calibration_sha256 != calibration_sha256 {
         return Err("stored measurement uses a different microphone calibration".to_string());
     }
@@ -2589,6 +2820,7 @@ impl LiveMeasurementState {
             minimum_frequency_hz: range[0],
             maximum_frequency_hz: range[1],
             correction_band_covered: profile.covers(REQUIRED_CALIBRATION_BAND_HZ),
+            uncalibrated: false,
         };
         if !summary.correction_band_covered {
             return Err(format!(
@@ -3486,6 +3718,214 @@ mod tests {
         assert_eq!(summary.sensitivity_factor_db, Some(-2.434));
         assert!(summary.point_count > 600);
         assert!(summary.correction_band_covered);
+        assert!(!summary.uncalibrated);
+    }
+
+    /// A microphone that already applies its correction internally needs no
+    /// TXT: the session must measure without one, produce numerically the same
+    /// response as an explicitly flat file, and still bind its evidence to a
+    /// distinct identity so cached measurements never cross between a
+    /// calibrated and an uncalibrated session.
+    #[test]
+    fn a_session_without_a_calibration_file_measures_and_binds_to_its_own_identity() {
+        let wav = test_sweep_wav();
+        let mut magnitudes = Vec::new();
+        let mut calibration_shas = Vec::new();
+        for import_calibration_file in [true, false] {
+            let temporary = tempdir().unwrap();
+            let state = LiveMeasurementState::default();
+            state.start_session(temporary.path()).unwrap();
+            if import_calibration_file {
+                state
+                    .import_calibration("flat.txt", "20 0\n20000 0\n")
+                    .unwrap();
+            }
+            state.import_sweep(LiveChannel::Left, &wav).unwrap();
+            state.import_sweep(LiveChannel::Right, &wav).unwrap();
+            let (_, _, sweep, calibration, evidence, _) = state
+                .begin_capture(
+                    LiveCaptureKind::Baseline,
+                    LiveChannel::Left,
+                    "P0",
+                    "synthetic::input",
+                    0,
+                )
+                .unwrap();
+            let capture = synthetic_capture(&sweep.samples, &[0.2]);
+            let summary = analyze_and_store_capture(
+                &state,
+                LiveCaptureKind::Baseline,
+                LiveChannel::Left,
+                "P0".into(),
+                &sweep,
+                &calibration,
+                &evidence,
+                &capture,
+            )
+            .unwrap();
+            state.finish_capture();
+            assert!(summary.accepted, "{:?}", summary.issue_codes);
+            calibration_shas.push(evidence.calibration_sha256.clone());
+            let guard = state.session.lock().unwrap();
+            let session = guard.as_ref().unwrap();
+            magnitudes.push(
+                session
+                    .measurements
+                    .get(&(
+                        LiveCaptureKind::Baseline,
+                        "P0".to_string(),
+                        LiveChannel::Left,
+                    ))
+                    .unwrap()
+                    .calibrated_frequency_response
+                    .magnitude_db
+                    .clone(),
+            );
+        }
+
+        // 0 dB of correction is exactly 0 dB whichever way it is supplied.
+        assert_eq!(magnitudes[0], magnitudes[1]);
+        assert_ne!(calibration_shas[0], calibration_shas[1]);
+        assert_eq!(calibration_shas[1], UNCALIBRATED_MICROPHONE_SHA256);
+    }
+
+    /// The uncalibrated identity must never look like a real file's digest,
+    /// and the manifest must say so in words rather than by omission.
+    #[test]
+    fn the_uncalibrated_identity_cannot_be_mistaken_for_a_calibration_file() {
+        let entry = uncalibrated_microphone_entry();
+
+        assert!(entry.summary.uncalibrated);
+        assert!(!entry.summary.correction_band_covered);
+        assert!(
+            !entry
+                .summary
+                .sha256
+                .chars()
+                .all(|character| character.is_ascii_hexdigit()),
+            "the sentinel must be unreachable as a SHA-256 digest"
+        );
+        for frequency_hz in [20.0, 63.0, 997.3, 20_000.0] {
+            assert_eq!(entry.profile.correction_db_at(frequency_hz).unwrap(), 0.0);
+        }
+    }
+
+    /// The in-app playback must emit the imported file, not a re-synthesis of
+    /// it: a stereo sweep keeps its marker channel, and a mono sweep is placed
+    /// on the side it was imported as - a mono left sweep must never come out
+    /// of the right speaker.
+    #[test]
+    fn sweep_playback_lays_each_imported_file_out_on_the_side_it_measures() {
+        let stereo = vec![vec![0.1_f32, 0.2], vec![0.7, 0.8]];
+        let (frames, channels) = sweep_playback_frames(&stereo, LiveChannel::Left).unwrap();
+        assert_eq!(channels, 2);
+        assert_eq!(frames, vec![0.1, 0.7, 0.2, 0.8]);
+
+        let mono = vec![vec![0.5_f32, -0.5]];
+        let (left_frames, channels) = sweep_playback_frames(&mono, LiveChannel::Left).unwrap();
+        assert_eq!(channels, 2);
+        assert_eq!(left_frames, vec![0.5, 0.0, -0.5, 0.0]);
+
+        let (right_frames, _) = sweep_playback_frames(&mono, LiveChannel::Right).unwrap();
+        assert_eq!(right_frames, vec![0.0, 0.5, 0.0, -0.5]);
+
+        assert!(sweep_playback_frames(&[], LiveChannel::Left).is_err());
+    }
+
+    /// Playback opens the device at the rate it is already running, so the
+    /// sweep is re-authored to meet it rather than the device being moved to
+    /// meet the sweep. Moving the device rewrites a global CoreAudio format,
+    /// which stops - and on a shared virtual device hangs - every other client.
+    #[test]
+    fn sweep_playback_meets_the_device_rate_instead_of_moving_it() {
+        let duration = PROJECT_SAMPLE_RATE_HZ as usize / 10;
+        let mut frames = vec![0.0_f32; duration * 2];
+        for index in 0..duration {
+            let time = index as f64 / f64::from(PROJECT_SAMPLE_RATE_HZ);
+            // Left only: the silent right channel proves the two channels are
+            // resampled independently and never bleed into each other.
+            frames[index * 2] = (std::f64::consts::TAU * 200.0 * time).sin() as f32 * 0.5;
+        }
+
+        // A device already on the project rate is handed the file untouched.
+        let (untouched, rate) =
+            resample_playback_frames(frames.clone(), 2, PROJECT_SAMPLE_RATE_HZ).unwrap();
+        assert_eq!(rate, PROJECT_SAMPLE_RATE_HZ);
+        assert_eq!(untouched, frames);
+
+        let (converted, rate) = resample_playback_frames(frames.clone(), 2, 44_100).unwrap();
+        assert_eq!(rate, 44_100);
+        let converted_frames = converted.len() / 2;
+        assert!(
+            converted_frames.abs_diff(duration * 147 / 160) <= 1,
+            "44.1 kHz playback should be {} frames, got {converted_frames}",
+            duration * 147 / 160
+        );
+        assert!(converted.iter().skip(1).step_by(2).all(|s| *s == 0.0));
+        let peak = converted
+            .iter()
+            .step_by(2)
+            .fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
+        assert!((peak - 0.5).abs() < 0.01, "200 Hz peak survived as {peak}");
+
+        // An implausible rate is not resampled to; that device is played at
+        // 48 kHz and put back afterwards by the playback path.
+        let (fallback, rate) = resample_playback_frames(frames.clone(), 2, 1_000_000).unwrap();
+        assert_eq!(rate, PROJECT_SAMPLE_RATE_HZ);
+        assert_eq!(fallback, frames);
+    }
+
+    /// Playback is a convenience, never an input to recognition. It must work
+    /// with no capture running, refuse to overlap itself, and hand out exactly
+    /// the imported file's frames.
+    #[test]
+    fn sweep_playback_is_independent_of_capture_and_refuses_to_overlap() {
+        let temporary = tempdir().unwrap();
+        let state = LiveMeasurementState::default();
+        state.start_session(temporary.path()).unwrap();
+
+        assert!(state
+            .begin_sweep_playback(LiveChannel::Left, "coreaudio::speaker")
+            .unwrap_err()
+            .contains("import the left measurement sweep"));
+
+        let wav = test_sweep_wav();
+        state.import_sweep(LiveChannel::Left, &wav).unwrap();
+        state.import_sweep(LiveChannel::Right, &wav).unwrap();
+        let (_, imported_channels) = decode_live_wav_channels(&wav).unwrap();
+        let imported_frames = imported_channels[0].len();
+
+        assert!(state
+            .begin_sweep_playback(LiveChannel::Left, "   ")
+            .unwrap_err()
+            .contains("select an output device"));
+
+        // No capture is running, and none is needed.
+        let (request, cancellation) = state
+            .begin_sweep_playback(LiveChannel::Left, "coreaudio::speaker")
+            .unwrap();
+        assert_eq!(request.channels, 2);
+        assert_eq!(
+            request.frames.len(),
+            imported_frames * 2,
+            "the whole imported file plays, markers and silences included"
+        );
+        assert!(!cancellation.is_cancelled());
+
+        // A second request while one is in flight is refused rather than
+        // queued, so two sweeps never overlap in the room.
+        assert!(state
+            .begin_sweep_playback(LiveChannel::Right, "coreaudio::speaker")
+            .unwrap_err()
+            .contains("already playing"));
+        assert!(state.cancel_sweep_playback().unwrap());
+        assert!(cancellation.is_cancelled());
+
+        state.finish_sweep_playback();
+        assert!(!state.cancel_sweep_playback().unwrap());
+        assert!(state
+            .begin_sweep_playback(LiveChannel::Right, "coreaudio::speaker")
+            .is_ok());
     }
 
     #[test]
@@ -3637,15 +4077,21 @@ mod tests {
             .contains("normal latency"));
         // The custom target curve needs an imported target, like Phase 4.
         assert!(LiveSecsTargetCurve::Custom
-            .overlay(None)
+            .overlay(None, None)
             .unwrap_err()
             .contains("import a valid custom target"));
-        assert!(LiveSecsTargetCurve::Flat.overlay(None).unwrap().is_none());
+        assert!(LiveSecsTargetCurve::Flat
+            .overlay(None, None)
+            .unwrap()
+            .0
+            .is_none());
 
         // A 2.1 project is no longer refused outright (bass management is
         // linear, so per-channel correction of the combined main+sub capture
         // is exact at the seat): SECS proceeds to the ordinary evidence
-        // requirements, which here fail on the missing calibration/sweeps.
+        // requirements, which here fail on the missing sweeps. (The
+        // calibration TXT is optional and is deliberately not part of that
+        // gate.)
         let temporary = tempdir().unwrap();
         let state = LiveMeasurementState::default();
         state
@@ -3659,7 +4105,7 @@ mod tests {
             "2.1 must not be refused: {error}"
         );
         assert!(
-            error.contains("calibration and both measurement sweeps"),
+            error.contains("both measurement sweeps are required"),
             "{error}"
         );
     }
@@ -3702,6 +4148,27 @@ mod tests {
         let round_tripped: LiveSecsDesignSettings =
             serde_json::from_value(serde_json::to_value(default).unwrap()).unwrap();
         assert_eq!(round_tripped, default);
+    }
+
+    #[test]
+    fn the_secs_target_wire_names_match_the_selector() {
+        // The selector's wire value is `harman_6db`; serde's snake_case
+        // would silently emit `harman6db`, so the rename is pinned here.
+        assert_eq!(
+            serde_json::to_value(LiveSecsTargetCurve::Harman6db).unwrap(),
+            serde_json::json!("harman_6db")
+        );
+        let parsed: LiveSecsTargetCurve = serde_json::from_value(serde_json::json!("harman_6db"))
+            .expect("the selector wire name must deserialize");
+        assert_eq!(parsed, LiveSecsTargetCurve::Harman6db);
+        assert_eq!(
+            serde_json::to_value(LiveSecsTargetCurve::Flat).unwrap(),
+            serde_json::json!("flat")
+        );
+        assert_eq!(
+            serde_json::to_value(LiveSecsTargetCurve::Custom).unwrap(),
+            serde_json::json!("custom")
+        );
     }
 
     #[test]
@@ -3986,6 +4453,44 @@ mod tests {
         .unwrap();
         state.finish_capture();
         assert!(measurement.accepted, "{:?}", measurement.issue_codes);
+    }
+
+    #[test]
+    fn the_built_in_sweep_default_is_the_repository_pair_byte_for_byte() {
+        let temporary = tempdir().unwrap();
+        let state = LiveMeasurementState::default();
+        state.start_session(temporary.path()).unwrap();
+
+        let loaded = state.import_built_in_sweeps().unwrap();
+        assert_eq!(loaded.left_file_name, BUILT_IN_LEFT_SWEEP_FILE_NAME);
+        assert_eq!(loaded.right_file_name, BUILT_IN_RIGHT_SWEEP_FILE_NAME);
+        assert_eq!(loaded.left.channel, LiveChannel::Left);
+        assert_eq!(loaded.right.channel, LiveChannel::Right);
+
+        // The embedded bytes must stay identical to the files on disk. The
+        // accepted-measurement cache keys on this hash, so a default that only
+        // resembled the pair the user has been importing by hand would silently
+        // invalidate every session already measured with it.
+        let fixture_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../assets/sweeps");
+        for (file_name, summary) in [
+            (BUILT_IN_LEFT_SWEEP_FILE_NAME, &loaded.left),
+            (BUILT_IN_RIGHT_SWEEP_FILE_NAME, &loaded.right),
+        ] {
+            let on_disk = fs::read(fixture_root.join(file_name)).unwrap();
+            assert_eq!(summary.sha256, sha256_hex(&on_disk));
+            // And it clears the same import gates a hand-picked file does.
+            assert_eq!(summary.sample_rate_hz, PROJECT_SAMPLE_RATE_HZ);
+            assert_eq!(summary.timing_marker_count, 2);
+        }
+
+        // Loading the default again is a no-op rather than a re-import, so the
+        // "back to the built-in sweep" path cannot throw away measurements.
+        state
+            .import_sweep(LiveChannel::Left, &[0_u8; 0])
+            .expect_err("an empty WAV must still be rejected");
+        let reloaded = state.import_built_in_sweeps().unwrap();
+        assert_eq!(reloaded.left.sha256, loaded.left.sha256);
+        assert_eq!(reloaded.right.sha256, loaded.right.sha256);
     }
 
     #[test]
@@ -5170,7 +5675,10 @@ mod tests {
             .import_sweep(LiveChannel::Left, &wav)
             .unwrap_err()
             .contains("active microphone capture"));
-        assert!(state.design_trial("bk").unwrap_err().contains("active"));
+        assert!(state
+            .design_trial("harman_6db")
+            .unwrap_err()
+            .contains("active"));
         assert!(state.verification_summary().unwrap_err().contains("active"));
         assert!(state.finalize_export().unwrap_err().contains("active"));
 
@@ -5473,7 +5981,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(restored.restored_captures.len(), 2);
-        assert_eq!(restored.compatible_snapshot_count, 3);
+        // The older session's right-channel snapshot is a duplicate of the
+        // key the newer session already claimed, and the scan now skips
+        // duplicates BEFORE restoring them (a restore can be a full raw
+        // re-analysis), so only the two winners count as compatible.
+        assert_eq!(restored.compatible_snapshot_count, 2);
         assert_eq!(
             restored.source_session_ids,
             vec![
@@ -5550,6 +6062,211 @@ mod tests {
                 "restored response drifted from the capture-time response:                  {magnitude_diff:e} dB, {phase_diff:e} rad"
             );
         }
+    }
+
+    /// A deconvolution-version bump must not cost the user their measurement
+    /// positions. The raw capture is version-independent evidence, so a
+    /// snapshot from a recomputable predecessor restores by re-analysing that
+    /// audio - and the stale arrays it carries must be ignored entirely, which
+    /// is what corrupting them here proves.
+    #[test]
+    fn a_superseded_snapshot_restores_by_recomputing_from_its_raw_capture() {
+        let temporary = tempdir().unwrap();
+        let calibration_text = "10 0\n1000 3\n24000 3\n";
+        let wav = test_sweep_wav();
+
+        let source = LiveMeasurementState::default();
+        source.start_session(temporary.path()).unwrap();
+        source
+            .import_calibration("umik.txt", calibration_text)
+            .unwrap();
+        source.import_sweep(LiveChannel::Left, &wav).unwrap();
+        source.import_sweep(LiveChannel::Right, &wav).unwrap();
+        let (_, _, sweep, calibration, evidence, _) = source
+            .begin_capture(
+                LiveCaptureKind::Baseline,
+                LiveChannel::Left,
+                "P0",
+                "synthetic::input",
+                0,
+            )
+            .unwrap();
+        let capture = synthetic_capture(&sweep.samples, &[0.2]);
+        let summary = analyze_and_store_capture(
+            &source,
+            LiveCaptureKind::Baseline,
+            LiveChannel::Left,
+            "P0".into(),
+            &sweep,
+            &calibration,
+            &evidence,
+            &capture,
+        )
+        .unwrap();
+        source.finish_capture();
+        assert!(summary.accepted);
+
+        // Age the snapshot to the superseded version and poison its derived
+        // arrays. Anything that reads them instead of the WAV now fails loudly.
+        let snapshot_path = summary.measurement_snapshot_path.clone().unwrap();
+        let mut stored: serde_json::Value =
+            serde_json::from_slice(&fs::read(&snapshot_path).unwrap()).unwrap();
+        stored["deconvolutionAlgorithm"] =
+            serde_json::Value::String(RECOMPUTABLE_DECONVOLUTION_VERSIONS[0].to_string());
+        for key in ["calibratedMagnitudeDb", "calibratedImpulseSamples"] {
+            let poisoned = stored[key]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|value| serde_json::json!(value.as_f64().unwrap() + 40.0))
+                .collect::<Vec<_>>();
+            stored[key] = serde_json::Value::Array(poisoned);
+        }
+        fs::write(&snapshot_path, serde_json::to_vec(&stored).unwrap()).unwrap();
+
+        let restored_state = LiveMeasurementState::default();
+        restored_state.start_session(temporary.path()).unwrap();
+        restored_state
+            .import_calibration("same.txt", calibration_text)
+            .unwrap();
+        restored_state
+            .import_sweep(LiveChannel::Left, &wav)
+            .unwrap();
+        restored_state
+            .import_sweep(LiveChannel::Right, &wav)
+            .unwrap();
+        let restored = restored_state
+            .restore_accepted_measurements("synthetic::input", 0, LiveRestoreScope::General, false)
+            .unwrap();
+
+        assert_eq!(restored.restored_captures.len(), 1);
+        let restored_summary = &restored.restored_captures[0];
+        assert!(restored_summary.restored_from_cache);
+        assert!(restored_summary
+            .diagnostic_codes
+            .iter()
+            .any(|code| code == RECOMPUTED_FROM_RAW_DIAGNOSTIC));
+        // The stale snapshot is not this measurement's evidence any more.
+        assert!(restored_summary.measurement_snapshot_path.is_none());
+
+        // The recomputed response must equal a fresh capture of the same
+        // audio, not the poisoned arrays (which sit 40 dB high).
+        let source_guard = source.session.lock().unwrap();
+        let fresh = &source_guard.as_ref().unwrap().measurements[&(
+            LiveCaptureKind::Baseline,
+            "P0".to_string(),
+            LiveChannel::Left,
+        )];
+        let restored_guard = restored_state.session.lock().unwrap();
+        let recomputed = &restored_guard.as_ref().unwrap().measurements[&(
+            LiveCaptureKind::Baseline,
+            "P0".to_string(),
+            LiveChannel::Left,
+        )];
+        let fresh_fr = &fresh.calibrated_frequency_response;
+        let recomputed_fr = &recomputed.calibrated_frequency_response;
+        assert_eq!(recomputed_fr.frequencies_hz, fresh_fr.frequencies_hz);
+        let worst = recomputed_fr
+            .magnitude_db
+            .iter()
+            .zip(&fresh_fr.magnitude_db)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            worst < 1.0e-9,
+            "recomputed response drifted from a fresh analysis of the same capture: {worst:e} dB"
+        );
+        drop(source_guard);
+        drop(restored_guard);
+
+        // The recompute wrote its result back as a current-version sidecar,
+        // so a third session pays a JSON read instead of a re-analysis and
+        // its evidence points at that sidecar.
+        let third = LiveMeasurementState::default();
+        third.start_session(temporary.path()).unwrap();
+        third
+            .import_calibration("same.txt", calibration_text)
+            .unwrap();
+        third.import_sweep(LiveChannel::Left, &wav).unwrap();
+        third.import_sweep(LiveChannel::Right, &wav).unwrap();
+        let fast = third
+            .restore_accepted_measurements("synthetic::input", 0, LiveRestoreScope::General, false)
+            .unwrap();
+        assert_eq!(fast.restored_captures.len(), 1);
+        let fast_summary = &fast.restored_captures[0];
+        let sidecar_path = fast_summary
+            .measurement_snapshot_path
+            .as_deref()
+            .expect("the sidecar restore is a plain current-version restore");
+        assert!(
+            sidecar_path.ends_with(".recomputed.json"),
+            "expected the sidecar, got {sidecar_path}"
+        );
+        // Provenance survives the fast path.
+        assert!(fast_summary
+            .diagnostic_codes
+            .iter()
+            .any(|code| code == RECOMPUTED_FROM_RAW_DIAGNOSTIC));
+    }
+
+    /// The recompute path re-analyses through the session's own calibration,
+    /// so it must not become a way around the hash gate: a different file is
+    /// still a different measurement.
+    #[test]
+    fn a_superseded_snapshot_still_refuses_a_different_calibration_file() {
+        let temporary = tempdir().unwrap();
+        let wav = test_sweep_wav();
+
+        let source = LiveMeasurementState::default();
+        source.start_session(temporary.path()).unwrap();
+        source
+            .import_calibration("umik.txt", "10 0\n24000 0\n")
+            .unwrap();
+        source.import_sweep(LiveChannel::Left, &wav).unwrap();
+        source.import_sweep(LiveChannel::Right, &wav).unwrap();
+        let (_, _, sweep, calibration, evidence, _) = source
+            .begin_capture(
+                LiveCaptureKind::Baseline,
+                LiveChannel::Left,
+                "P0",
+                "synthetic::input",
+                0,
+            )
+            .unwrap();
+        let capture = synthetic_capture(&sweep.samples, &[0.2]);
+        let summary = analyze_and_store_capture(
+            &source,
+            LiveCaptureKind::Baseline,
+            LiveChannel::Left,
+            "P0".into(),
+            &sweep,
+            &calibration,
+            &evidence,
+            &capture,
+        )
+        .unwrap();
+        source.finish_capture();
+
+        let snapshot_path = summary.measurement_snapshot_path.clone().unwrap();
+        let mut stored: serde_json::Value =
+            serde_json::from_slice(&fs::read(&snapshot_path).unwrap()).unwrap();
+        stored["deconvolutionAlgorithm"] =
+            serde_json::Value::String(RECOMPUTABLE_DECONVOLUTION_VERSIONS[0].to_string());
+        fs::write(&snapshot_path, serde_json::to_vec(&stored).unwrap()).unwrap();
+
+        let other = LiveMeasurementState::default();
+        other.start_session(temporary.path()).unwrap();
+        other
+            .import_calibration("different.txt", "10 0\n1000 2\n24000 2\n")
+            .unwrap();
+        other.import_sweep(LiveChannel::Left, &wav).unwrap();
+        other.import_sweep(LiveChannel::Right, &wav).unwrap();
+        let restored = other
+            .restore_accepted_measurements("synthetic::input", 0, LiveRestoreScope::General, false)
+            .unwrap();
+
+        assert!(restored.restored_captures.is_empty());
+        assert_eq!(restored.compatible_snapshot_count, 0);
     }
 
     #[test]
@@ -5973,11 +6690,46 @@ mod tests {
             assert!((0.99..=1.01).contains(&scale), "applied scale {scale}");
         }
 
-        // (a)-mode export: six per-rate SECS re-runs, the 48 kHz member byte-
-        // bound to the verified trial, and a validated six-rate Roon ZIP.
+        // (a)-mode export: the 48 kHz member byte-bound to the verified
+        // trial, five siblings resampled from it, and a validated six-rate
+        // Roon ZIP.
         let exported = state.finalize_export().unwrap();
         assert_eq!(exported.native_rate_count, 6);
         assert!(exported.cross_rate_passed);
+
+        // v3 property: a sibling member IS the verified member resampled -
+        // not a fresh design, which near razor-sharp EQ features realized a
+        // grid-dependent phase winding (33.6 ms of 20-100 Hz group delay on
+        // a real 2026-08-14 package). A fresh design differs from the
+        // resample at the 1e-2 scale; f32 quantization sits below 1e-5.
+        {
+            let package_directory = Path::new(&exported.project_path).parent().unwrap();
+            let member_left = |rate: u32| -> Vec<f64> {
+                let path = package_directory.join(format!("EQforBeginner_{rate}_stereo.wav"));
+                hound::WavReader::open(path)
+                    .unwrap()
+                    .samples::<f32>()
+                    .map(Result::unwrap)
+                    .step_by(2)
+                    .map(f64::from)
+                    .collect()
+            };
+            // The rate-ratio gain keeps the transfer function (not the
+            // waveform) invariant; see the export's resample closure.
+            let gain = 48_000.0 / 44_100.0;
+            let resampled = secs_resample_poly(&member_left(48_000), 147, 160).unwrap();
+            let member = member_left(44_100);
+            assert_eq!(member.len(), resampled.len());
+            let worst = member
+                .iter()
+                .zip(&resampled)
+                .map(|(a, b)| (a - b * gain).abs())
+                .fold(0.0_f64, f64::max);
+            assert!(
+                worst < 1.0e-5,
+                "the 44.1 kHz member deviates from the resampled verified member by {worst}"
+            );
+        }
         assert!(exported
             .algorithm_version
             .contains(SECS_NATIVE_RERUN_VERSION));
@@ -6100,25 +6852,36 @@ mod tests {
         assert!(!single_summary.multi_position_applied);
         assert_eq!(single_summary.position_count, 1);
 
-        // Target-curve wiring: a Harman-style overlay must be echoed, stored
-        // for the export path, and actually steer the design away from the
-        // flat-target filter; the custom value resolves to the curve imported
-        // above. (P1 is a P0 clone, so the taps difference below is
-        // attributable to the overlay alone.)
+        // Target-curve wiring: the built-in default overlay must be echoed,
+        // stored for the export path, and actually steer the design away
+        // from the flat-target filter; the custom value resolves to the
+        // curve imported above. (P1 is a P0 clone, so the taps difference
+        // below is attributable to the overlay alone.)
         let flat_taps = {
             let guard = state.session.lock().unwrap();
             let session = guard.as_ref().unwrap();
             let secs = session.secs_design.as_ref().unwrap();
             assert!(secs.target_overlay.is_none());
+            assert!(secs.summary.adaptive_hf.is_none());
             secs.left_taps.clone()
         };
         let followed = state
             .design_secs_trial(LiveSecsDesignSettings {
-                target_curve: LiveSecsTargetCurve::Harman,
+                target_curve: LiveSecsTargetCurve::Harman6db,
                 ..LiveSecsDesignSettings::default()
             })
             .unwrap();
-        assert_eq!(followed.settings.target_curve, LiveSecsTargetCurve::Harman);
+        assert_eq!(
+            followed.settings.target_curve,
+            LiveSecsTargetCurve::Harman6db
+        );
+        // The default target always records its adaptive-HF provenance:
+        // either the fit ran (with a slope) or a named guard fell back.
+        let followed_adaptive = followed.adaptive_hf.as_ref().unwrap();
+        assert!(
+            followed_adaptive.applied == followed_adaptive.fitted_slope_db_per_octave.is_some()
+        );
+        assert!(followed_adaptive.applied || followed_adaptive.fallback_reason.is_some());
         let followed_taps = {
             let guard = state.session.lock().unwrap();
             let session = guard.as_ref().unwrap();
@@ -6246,8 +7009,23 @@ mod tests {
         assert_eq!(target.point_count, 26);
         assert!(target.correction_band_covered);
         assert!(Path::new(&target.stored_path).is_file());
+        // The built-in default target always records adaptive-HF provenance
+        // (fit result or a named fallback) and a Dirac-versioned curve; the
+        // custom design that follows carries no adaptive record, because the
+        // fit exists for the default selection only.
+        let default_design = state.design_trial("harman_6db").unwrap();
+        assert!(default_design.numerical_passed);
+        let default_adaptive = default_design.adaptive_hf.as_ref().unwrap();
+        assert!(default_adaptive.applied || default_adaptive.fallback_reason.is_some());
+        {
+            let guard = state.session.lock().unwrap();
+            let session = guard.as_ref().unwrap();
+            let stored = session.design.as_ref().unwrap();
+            assert!(stored.target_version.contains("dirac-harman-6db-v1"));
+        }
         let design = state.design_trial("custom").unwrap();
         assert!(design.numerical_passed);
+        assert!(design.adaptive_hf.is_none());
         let trial_download_path = temporary.path().join("downloaded-trial.zip");
         let trial_download = state
             .save_zip_artifact(LiveZipArtifactKind::Trial, &trial_download_path)
@@ -7833,7 +8611,20 @@ fn fir_worst_case_peak_bound_db(taps: &[f64]) -> Result<f64, String> {
 /// Version of the (a)-mode SECS native-rate strategy: each Roon rate is a
 /// fresh SECS design on the P0 impulse resampled to that rate, with the
 /// verified trial's automatic delay locked.
-const SECS_NATIVE_RERUN_VERSION: &str = "secs-native-rerun-v1";
+/// v3: sibling members are the verified 48 kHz FIR resampled with the
+/// scipy-parity resampler - one transfer function on every grid by
+/// construction. v2 transplanted the excess corrector but re-ran windowing,
+/// the phase guard, and the min-phase EQ per grid, and near a razor-sharp
+/// modal cut the realized phase's winding count proved grid-dependent
+/// (2026-08-14: the 44.1 kHz family shipped 33.6 ms of 20-100 Hz group
+/// delay away from the verified member).
+const SECS_NATIVE_RERUN_VERSION: &str = "secs-native-rerun-v3-resampled-fir";
+
+/// Fail-closed bound on how far any native member's 20-100 Hz group delay may
+/// sit from the verified 48 kHz member's. The transplant makes members agree
+/// to well under a millisecond by construction; this trips only if that
+/// machinery regresses (v1 shipped members 25 ms apart with no check at all).
+const SECS_CROSS_RATE_LOW_BAND_SPREAD_LIMIT_MS: f64 = 5.0;
 
 /// Gross-corruption backstop for the SECS package: smoothed, level-aligned
 /// RMSE over 20-500 Hz between each rate's filter response and the verified
@@ -7875,6 +8666,14 @@ struct SecsNativeRateRecord {
     /// Diagnostic: smoothed, level-aligned 20-500 Hz RMSE against the
     /// verified 48 kHz response (0 for the 48 kHz member itself).
     smoothed_agreement_rmse_db: f64,
+    /// Diagnostic (v2): regression 20-100 Hz group delay of this member's
+    /// taps re its own 1-16 kHz baseline, ms
+    /// (`secs_band_group_delay_fit_ms`). Members of one package must agree
+    /// here - the v1 rerun let each rate re-fit low-band modal noise on its
+    /// own grid, and 44.1k-family members shipped ~35 ms apart from
+    /// 48k-family ones with every magnitude check green.
+    low_band_group_delay_left_ms: f64,
+    low_band_group_delay_right_ms: f64,
 }
 
 #[derive(Serialize)]
@@ -8546,12 +9345,7 @@ impl LiveMeasurementState {
         let zip_bytes = fs::read(&zip_path)
             .map_err(|error| format!("could not hash final Roon ZIP: {error}"))?;
         let zip_sha256 = sha256_hex(&zip_bytes);
-        let calibration = session
-            .calibration
-            .as_ref()
-            .ok_or_else(|| "calibration disappeared before export".to_string())?
-            .summary
-            .clone();
+        let calibration = session_calibration(&session).summary;
         let project = FinalProjectSnapshot {
             project_version: LIVE_MEASUREMENT_PROJECT_VERSION,
             session_id: session.id.clone(),
@@ -8563,7 +9357,7 @@ impl LiveMeasurementState {
             verification_state: "hardware-remeasured-minimum-phase",
             correction_algorithm: PHASE4_OFFLINE_ALGORITHM_VERSION,
             deconvolution_algorithm: KNOWN_SWEEP_DECONVOLUTION_VERSION,
-            calibration_algorithm: UMIK_CALIBRATION_PARSER_VERSION,
+            calibration_algorithm: calibration_algorithm_for(&session),
             closed_loop_algorithm: LIVE_CLOSED_LOOP_VERSION,
             native_rate_algorithm: PHASE6_ALGORITHM_VERSION,
             native_48k_binding_algorithm: LIVE_NATIVE_BINDING_VERSION,
@@ -8710,58 +9504,51 @@ impl LiveMeasurementState {
         };
         let use_average = secs.settings.multi_position && seats.len() > 1;
         let mut rate_designs = Vec::with_capacity(ROON_NATIVE_SAMPLE_RATES.len());
-        for sample_rate_hz in ROON_NATIVE_SAMPLE_RATES {
-            let resample = |samples: &[f64], label: &str| -> Result<Vec<f64>, String> {
-                if sample_rate_hz == PROJECT_SAMPLE_RATE_HZ {
-                    return Ok(samples.to_vec());
-                }
-                let divisor = gcd_u32(sample_rate_hz, PROJECT_SAMPLE_RATE_HZ);
-                secs_resample_poly(
-                    samples,
-                    sample_rate_hz / divisor,
-                    PROJECT_SAMPLE_RATE_HZ / divisor,
-                )
-                .map_err(|error| format!("{label} resample to {sample_rate_hz} Hz failed: {error}"))
-            };
-            let mut left_ir = resample(&left.calibrated_impulse_samples, "left P0")?;
-            let mut right_ir = resample(&right.calibrated_impulse_samples, "right P0")?;
+        // v3: only the 48 kHz member is designed - exactly as the verified
+        // trial ran, so its bytes reproduce that trial - and every sibling
+        // member is that finished FIR resampled with the scipy-parity
+        // resampler. A resampled FIR is the same transfer function on every
+        // grid by construction, so the cross-rate consistency the gate below
+        // demands is structural rather than statistical.
+        //
+        // v2 transplanted the excess-phase corrector but still re-ran the
+        // pre-ring windowing, the phase guard, and the minimum-phase
+        // magnitude EQ on each rate's own grid. Near a razor-sharp modal cut
+        // the assembled response passes close to zero, and which side of
+        // zero it passes - hence the winding count of the realized phase -
+        // proved grid-dependent: the 2026-08-14 session's 72 Hz cut shipped
+        // the whole 44.1 kHz family with 20-100 Hz group delay 33.6 ms away
+        // from the verified member while the 48 kHz family matched. The
+        // divergence sat in stages the transplant deliberately re-ran, so
+        // the fix is to stop re-running them.
+        {
+            let mut left_ir = left.calibrated_impulse_samples.clone();
+            let mut right_ir = right.calibrated_impulse_samples.clone();
             // SECS.py zero-pads the loaded impulse to a fast FFT length.
             let padded_length = secs_next_fast_len(left_ir.len());
             left_ir.resize(padded_length, 0.0);
             right_ir.resize(padded_length, 0.0);
             let averaged_magnitudes = if use_average {
-                let mut rate_seats = Vec::with_capacity(seats.len());
-                for (id, weight, seat_left, seat_right) in &seats {
-                    rate_seats.push((
-                        id.clone(),
-                        *weight,
-                        resample(seat_left, "seat")?,
-                        resample(seat_right, "seat")?,
-                    ));
-                }
-                Some(secs_average_magnitudes(&rate_seats, padded_length)?)
+                Some(secs_average_magnitudes(&seats, padded_length)?)
             } else {
                 None
             };
             let magnitude_overrides = averaged_magnitudes
                 .as_ref()
                 .map(|(left, right)| (left.as_slice(), right.as_slice()));
-            // Exactly the settings the verified trial ran with, at this
-            // rate, with the trial's delay choice locked (in the low/zero
-            // latency modes the design forces delay 0 itself) and the
-            // trial's RESOLVED ceiling replayed - an automatic ceiling must
-            // not be re-probed here, the verified budget is what ships.
+            // Exactly the settings the verified trial ran with, with the
+            // trial's delay choice locked (in the low/zero latency modes the
+            // design forces delay 0 itself) and the trial's RESOLVED ceiling
+            // replayed - an automatic ceiling must not be re-probed here,
+            // the verified budget is what ships.
             let mut config = secs_config_for(
                 &secs.settings,
                 secs.summary.maximum_delay_resolved_ms,
-                sample_rate_hz,
+                PROJECT_SAMPLE_RATE_HZ,
             );
             config.target_delay_ms = locked_delay_ms;
             config.target_overlay = secs.target_overlay.clone();
             config.shared_low_frequency_hz = secs.shared_low_frequency_hz;
-            let taps = config.taps;
-            // The delay is locked to the verified trial's choice so every
-            // rate carries the same latency and pre-ringing budget.
             let design = design_secs_stereo_filter(
                 &left_ir,
                 &right_ir,
@@ -8769,23 +9556,62 @@ impl LiveMeasurementState {
                 Some(std::slice::from_ref(&locked_delay_ms)),
                 magnitude_overrides,
             )
-            .map_err(|error| format!("SECS design at {sample_rate_hz} Hz failed: {error}"))?;
+            .map_err(|error| format!("SECS design at 48000 Hz failed: {error}"))?;
             if (design.auto_delay_ms - locked_delay_ms).abs() > 1e-9 {
-                return Err(format!(
-                    "SECS design at {sample_rate_hz} Hz drifted from the locked delay"
-                ));
+                return Err("SECS design at 48000 Hz drifted from the locked delay".to_string());
             }
-            rate_designs.push(SecsRateDesign {
-                sample_rate_hz,
-                taps,
-                preamp_db: design.preamp_db,
-                level_alignment_db: 0.0,
-                left_taps: design.left_taps,
-                right_taps: design.right_taps,
-                comparison_left_db: Vec::new(),
-                comparison_right_db: Vec::new(),
-            });
+            for sample_rate_hz in ROON_NATIVE_SAMPLE_RATES {
+                let (left_taps, right_taps) = if sample_rate_hz == PROJECT_SAMPLE_RATE_HZ {
+                    (design.left_taps.clone(), design.right_taps.clone())
+                } else {
+                    let divisor = gcd_u32(sample_rate_hz, PROJECT_SAMPLE_RATE_HZ);
+                    // Waveform resampling preserves sample amplitude, which
+                    // scales a FILTER's transfer function by the rate ratio:
+                    // a unit impulse interpolated to 2x rate sums to 2, a
+                    // +6 dB gain the 6 dB RMSE backstop caught on the
+                    // synthetic fixture. The rate-ratio gain restores the
+                    // verified member's transfer function exactly.
+                    let gain = f64::from(PROJECT_SAMPLE_RATE_HZ) / f64::from(sample_rate_hz);
+                    let resample = |taps: &[f64], label: &str| -> Result<Vec<f64>, String> {
+                        Ok(secs_resample_poly(
+                            taps,
+                            sample_rate_hz / divisor,
+                            PROJECT_SAMPLE_RATE_HZ / divisor,
+                        )
+                        .map_err(|error| {
+                            format!(
+                                "{label} member resample to {sample_rate_hz} Hz failed: {error}"
+                            )
+                        })?
+                        .into_iter()
+                        .map(|tap| tap * gain)
+                        .collect())
+                    };
+                    (
+                        resample(&design.left_taps, "left")?,
+                        resample(&design.right_taps, "right")?,
+                    )
+                };
+                if left_taps.len() != right_taps.len() {
+                    return Err(format!(
+                        "resampled {sample_rate_hz} Hz member channels differ in length"
+                    ));
+                }
+                rate_designs.push(SecsRateDesign {
+                    sample_rate_hz,
+                    taps: left_taps.len(),
+                    // One filter at every rate, so the verified member's
+                    // normalization is every member's normalization.
+                    preamp_db: design.preamp_db,
+                    level_alignment_db: 0.0,
+                    left_taps,
+                    right_taps,
+                    comparison_left_db: Vec::new(),
+                    comparison_right_db: Vec::new(),
+                });
+            }
         }
+        rate_designs.sort_by_key(|design| design.sample_rate_hz);
 
         // Compute each member's response over the verified band.
         for design in rate_designs.iter_mut() {
@@ -8807,16 +9633,14 @@ impl LiveMeasurementState {
             design.comparison_right_db = comparison(&design.right_taps)?;
         }
 
-        // Level continuity across sample rates. Each per-rate design carries
-        // its own normalization scalar and its own target anchor (both drift
-        // slightly with the analysis grid), so self-normalized members would
-        // play the corrected band at levels differing by up to ~1 dB and
-        // loudness would step when Roon switches sample rates. Align every
-        // member to the verified 48 kHz member by the mean 20-500 Hz response
-        // difference (one scalar per rate, both channels together, so the
-        // rate's own L/R balance is preserved). The 48 kHz member itself is
-        // never touched - byte identity with the verified trial. Any response
-        // peak above 0 dB this creates is charged to the headroom below.
+        // Level continuity across sample rates is structural under v3: every
+        // member is the same filter, so no per-rate alignment gain exists any
+        // more (`level_alignment_db` stays 0.0). v2's alignment corrected
+        // genuinely independent normalizations, but applied to identical
+        // members it only chased comparison-grid aliasing of narrow modes -
+        // the synthetic fixture's 1.5 Hz-wide mode moved the 96-point mean
+        // by 0.56 dB between grids, scaling a byte-equivalent member for no
+        // physical reason.
         let (reference_left, reference_right) = {
             let reference = rate_designs
                 .iter()
@@ -8833,34 +9657,9 @@ impl LiveMeasurementState {
                 cross_rate_diagnostics.push((design.sample_rate_hz, 0.0));
                 continue;
             }
-            let point_count = (reference_left.len() + reference_right.len()) as f64;
-            let alignment_db = (reference_left
-                .iter()
-                .zip(&design.comparison_left_db)
-                .chain(reference_right.iter().zip(&design.comparison_right_db))
-                .map(|(reference, member)| reference - member)
-                .sum::<f64>())
-                / point_count;
-            let gain = 10f64.powf(alignment_db / 20.0);
-            for tap in design
-                .left_taps
-                .iter_mut()
-                .chain(design.right_taps.iter_mut())
-            {
-                *tap *= gain;
-            }
-            for value in design
-                .comparison_left_db
-                .iter_mut()
-                .chain(design.comparison_right_db.iter_mut())
-            {
-                *value += alignment_db;
-            }
-            design.level_alignment_db = alignment_db;
-
             // Recorded diagnostic + gross-corruption backstop on the
-            // smoothed, aligned curves (see SECS_CROSS_RATE_SANITY_RMSE_DB
-            // for why this is not a precision gate).
+            // smoothed curves (see SECS_CROSS_RATE_SANITY_RMSE_DB for why
+            // this is not a precision gate).
             let smoothed_reference_left =
                 log_frequency_smoothed_curve(&comparison_frequencies_hz, &reference_left);
             let smoothed_reference_right =
@@ -8981,6 +9780,56 @@ impl LiveMeasurementState {
                 + HEADROOM_SAFETY_MARGIN_DB,
         );
 
+        // Per-member low-band timing (v2 visibility fix): the group-delay
+        // gate only ever ran on the 48 kHz trial design, so a member whose
+        // low band disagreed was invisible. Record every member's 20-100 Hz
+        // figure in the manifest, and fail closed if the transplant did not
+        // deliver the consistency it exists for.
+        let mut native_rate_records = Vec::with_capacity(rate_designs.len());
+        let mut reference_low_band_ms: Option<(f64, f64)> = None;
+        for (design, (_, agreement_rmse_db)) in rate_designs.iter().zip(&cross_rate_diagnostics) {
+            let band = |taps: &[f64]| -> Result<f64, String> {
+                secs_band_group_delay_fit_ms(taps, design.sample_rate_hz, 20.0, 100.0).map_err(
+                    |error| {
+                        format!(
+                            "band group-delay fit at {} Hz failed: {error}",
+                            design.sample_rate_hz
+                        )
+                    },
+                )
+            };
+            let low_band_left_ms = band(&design.left_taps)?;
+            let low_band_right_ms = band(&design.right_taps)?;
+            if design.sample_rate_hz == PROJECT_SAMPLE_RATE_HZ {
+                reference_low_band_ms = Some((low_band_left_ms, low_band_right_ms));
+            }
+            native_rate_records.push(SecsNativeRateRecord {
+                sample_rate_hz: design.sample_rate_hz,
+                taps: design.taps,
+                preamp_db: design.preamp_db,
+                level_alignment_db: design.level_alignment_db,
+                smoothed_agreement_rmse_db: *agreement_rmse_db,
+                low_band_group_delay_left_ms: low_band_left_ms,
+                low_band_group_delay_right_ms: low_band_right_ms,
+            });
+        }
+        if let Some((reference_left_ms, reference_right_ms)) = reference_low_band_ms {
+            for record in &native_rate_records {
+                let spread = (record.low_band_group_delay_left_ms - reference_left_ms)
+                    .abs()
+                    .max((record.low_band_group_delay_right_ms - reference_right_ms).abs());
+                if spread > SECS_CROSS_RATE_LOW_BAND_SPREAD_LIMIT_MS {
+                    return Err(format!(
+                        "native {} Hz member's 20-100 Hz group delay differs from the verified \
+                         48 kHz member by {spread:.1} ms (limit \
+                         {SECS_CROSS_RATE_LOW_BAND_SPREAD_LIMIT_MS} ms); the package would not \
+                         be one consistent correction",
+                        record.sample_rate_hz
+                    ));
+                }
+            }
+        }
+
         let verified = verification.is_some();
         let zip_path = session.root.join("final").join(format!(
             "EQforBeginner_{}_secs_{}_{artifact_index:06}.zip",
@@ -9020,16 +9869,13 @@ impl LiveMeasurementState {
              designed from the central P0 pair only. Other seats are not part of\n\
              this design's evidence.\n\
              {verification_readme_line}\n\
-             Native rates: 44.1, 48, 88.2, 96, 176.4, 192 kHz - each designed from the\n\
-             same P0 measurement resampled to that rate, with the {delay_wording} delay of\n\
-             {locked_delay_ms:.1} ms locked. The 48 kHz member is byte-identical to the\n\
-             trial WAV. Other rates are level-aligned to it over 20-500 Hz so\n\
-             loudness does not step when Roon switches sample rates; their smoothed\n\
-             20-500 Hz agreement with the trial response is recorded in project.json\n\
-             (worst member: {worst_cross_rate_rmse_db:.2} dB - narrow modal cuts\n\
-             legitimately realize slightly differently on each rate's analysis grid).\n\
-             Any member response peak above 0 dB created by the level alignment is\n\
-             included in the recommended headroom.\n\
+             Native rates: 44.1, 48, 88.2, 96, 176.4, 192 kHz - the 48 kHz member is\n\
+             byte-identical to the trial WAV ({delay_wording} delay of\n\
+             {locked_delay_ms:.1} ms locked), and every other member is that exact\n\
+             filter resampled to its rate, so all six members carry one\n\
+             transfer function and one level. Their smoothed 20-500 Hz\n\
+             agreement with the trial response is recorded in project.json\n\
+             (worst member: {worst_cross_rate_rmse_db:.2} dB).\n\
              Recommended Roon headroom: {recommended_headroom_db:.1} dB\n\
              Headroom basis (v3+program-peak-v2): the largest of the 4x-oversampled\n\
              registered-sweep ratio ({measured_true_peak_ratio_db:.3} dB), the filter's\n\
@@ -9057,12 +9903,7 @@ impl LiveMeasurementState {
         let zip_bytes = fs::read(&zip_path)
             .map_err(|error| format!("could not hash final SECS Roon ZIP: {error}"))?;
         let zip_sha256 = sha256_hex(&zip_bytes);
-        let calibration = session
-            .calibration
-            .as_ref()
-            .ok_or_else(|| "calibration disappeared before export".to_string())?
-            .summary
-            .clone();
+        let calibration = session_calibration(session).summary;
         let project = FinalSecsProjectSnapshot {
             project_version: LIVE_MEASUREMENT_PROJECT_VERSION,
             session_id: session.id.clone(),
@@ -9078,7 +9919,7 @@ impl LiveMeasurementState {
             },
             correction_algorithm: SECS_ALGORITHM_VERSION,
             deconvolution_algorithm: KNOWN_SWEEP_DECONVOLUTION_VERSION,
-            calibration_algorithm: UMIK_CALIBRATION_PARSER_VERSION,
+            calibration_algorithm: calibration_algorithm_for(session),
             closed_loop_algorithm: LIVE_CLOSED_LOOP_VERSION,
             native_rate_algorithm: SECS_NATIVE_RERUN_VERSION,
             headroom_algorithm: SECS_HEADROOM_VERSION,
@@ -9100,17 +9941,7 @@ impl LiveMeasurementState {
             final_48k_binding_maximum_magnitude_difference_db,
             final_48k_binding_maximum_relative_group_delay_difference_ms,
             cross_rate_sanity_limit_rmse_db: SECS_CROSS_RATE_SANITY_RMSE_DB,
-            native_rates: rate_designs
-                .iter()
-                .zip(&cross_rate_diagnostics)
-                .map(|(design, (_, agreement_rmse_db))| SecsNativeRateRecord {
-                    sample_rate_hz: design.sample_rate_hz,
-                    taps: design.taps,
-                    preamp_db: design.preamp_db,
-                    level_alignment_db: design.level_alignment_db,
-                    smoothed_agreement_rmse_db: *agreement_rmse_db,
-                })
-                .collect(),
+            native_rates: native_rate_records,
             calibration,
             sweeps: session
                 .sweeps
@@ -9239,6 +10070,113 @@ fn longest_active_region(samples: &[f32], sample_rate_hz: u32) -> Result<(usize,
         return Err("the longest active sweep region is shorter than one second".to_string());
     }
     Ok((start, end))
+}
+
+/// Lay an imported sweep out as an interleaved stereo playback buffer.
+///
+/// A stereo file plays as it is, so the marker channel reaches the same
+/// speaker Roon would have driven. A mono file carries only the measurement
+/// signal, and `import_sweep` reads that signal as this channel's sweep, so it
+/// is placed on the matching side and the other side stays silent - a mono
+/// left sweep must not come out of the right speaker.
+fn sweep_playback_frames(
+    channels: &[Vec<f32>],
+    channel: LiveChannel,
+) -> Result<(Vec<f32>, u16), String> {
+    match channels {
+        [left, right] => {
+            if left.len() != right.len() {
+                return Err("the stored sweep WAV has channels of unequal length".to_string());
+            }
+            let mut frames = Vec::with_capacity(left.len() * 2);
+            for (left_sample, right_sample) in left.iter().zip(right.iter()) {
+                frames.push(*left_sample);
+                frames.push(*right_sample);
+            }
+            Ok((frames, 2))
+        }
+        [mono] => {
+            let measurement_channel = match channel {
+                LiveChannel::Left => 0,
+                LiveChannel::Right => 1,
+            };
+            let mut frames = vec![0.0_f32; mono.len() * 2];
+            for (index, sample) in mono.iter().enumerate() {
+                frames[index * 2 + measurement_channel] = *sample;
+            }
+            Ok((frames, 2))
+        }
+        _ => Err("the stored sweep WAV is neither mono nor stereo".to_string()),
+    }
+}
+
+/// Re-author an interleaved 48 kHz sweep at the output device's own rate.
+///
+/// Opening a device at a rate it is not already running rewrites the device
+/// format. On macOS that is global state - every other client of the device
+/// moves with it - and on a virtual loopback shared with a convolution host the
+/// write has been observed to stall CoreAudio's `AudioComponentInstanceNew`
+/// indefinitely, so the sweep never plays at all. Handing the device the rate
+/// it already has avoids the write, which is why this exists.
+///
+/// It changes what recognition sees not at all. `secs_resample_poly` is the
+/// same band-limited polyphase resampler the per-rate export path runs, so the
+/// sweep and its timing markers survive the rate change intact, and the
+/// analysis still works only from what the microphone captured at 48 kHz.
+///
+/// A device already on 48 kHz, or one whose rate could not be read, is left to
+/// the 48 kHz path.
+fn resample_playback_frames(
+    frames: Vec<f32>,
+    channels: u16,
+    device_rate_hz: u32,
+) -> Result<(Vec<f32>, u32), String> {
+    let channel_count = usize::from(channels);
+    if device_rate_hz == PROJECT_SAMPLE_RATE_HZ
+        || channel_count == 0
+        || !SWEEP_PLAYBACK_RESAMPLE_RANGE_HZ.contains(&device_rate_hz)
+    {
+        return Ok((frames, PROJECT_SAMPLE_RATE_HZ));
+    }
+    let divisor = greatest_common_divisor(device_rate_hz, PROJECT_SAMPLE_RATE_HZ);
+    let (up, down) = (device_rate_hz / divisor, PROJECT_SAMPLE_RATE_HZ / divisor);
+
+    let mut resampled: Vec<Vec<f64>> = Vec::with_capacity(channel_count);
+    for channel_index in 0..channel_count {
+        let source: Vec<f64> = frames
+            .iter()
+            .skip(channel_index)
+            .step_by(channel_count)
+            .map(|sample| f64::from(*sample))
+            .collect();
+        resampled.push(secs_resample_poly(&source, up, down).map_err(|error| {
+            format!("could not resample the sweep to {device_rate_hz} Hz: {error}")
+        })?);
+    }
+    // Polyphase output length is a ceiling, so a rounding difference between
+    // channels would otherwise leave a ragged last frame.
+    let frame_count = resampled
+        .iter()
+        .map(Vec::len)
+        .min()
+        .ok_or_else(|| "the sweep has no channels to resample".to_string())?;
+
+    let mut output = vec![0.0_f32; frame_count * channel_count];
+    for (channel_index, samples) in resampled.iter().enumerate() {
+        for (frame_index, sample) in samples.iter().take(frame_count).enumerate() {
+            output[frame_index * channel_count + channel_index] = *sample as f32;
+        }
+    }
+    Ok((output, device_rate_hz))
+}
+
+fn greatest_common_divisor(mut left: u32, mut right: u32) -> u32 {
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    left
 }
 
 fn decode_live_wav_channels(bytes: &[u8]) -> Result<(u32, Vec<Vec<f32>>), String> {
@@ -9533,6 +10471,7 @@ impl LiveMeasurementState {
                 source_frame_count: decoded.metadata.frame_count,
                 measurement_source_start_sample: start,
                 timing_markers,
+                source_wav_path: path,
             },
         );
         session.measurements.clear();
@@ -9544,6 +10483,24 @@ impl LiveMeasurementState {
         session.design = None;
         advance_evidence_generation(session)?;
         Ok(summary)
+    }
+
+    /// Import the embedded default sweep pair.
+    ///
+    /// This is the ordinary import path called twice, so a default sweep is
+    /// validated, stored and hashed exactly like a chosen file. Re-importing
+    /// the same bytes is idempotent inside `import_sweep`, which means calling
+    /// this on a session that already holds the default keeps every accepted
+    /// measurement instead of clearing it.
+    pub fn import_built_in_sweeps(&self) -> Result<BuiltInSweepImportSummary, String> {
+        let left = self.import_sweep(LiveChannel::Left, BUILT_IN_LEFT_SWEEP_WAV)?;
+        let right = self.import_sweep(LiveChannel::Right, BUILT_IN_RIGHT_SWEEP_WAV)?;
+        Ok(BuiltInSweepImportSummary {
+            left_file_name: BUILT_IN_LEFT_SWEEP_FILE_NAME,
+            right_file_name: BUILT_IN_RIGHT_SWEEP_FILE_NAME,
+            left,
+            right,
+        })
     }
 
     pub fn begin_capture(
@@ -9678,10 +10635,7 @@ impl LiveMeasurementState {
                 return Err("verification is captured at the central position P0".to_string());
             }
         }
-        let calibration_entry = session
-            .calibration
-            .as_ref()
-            .ok_or_else(|| "import a covering UMIK calibration before capturing".to_string())?;
+        let calibration_entry = session_calibration(session);
         let calibration = calibration_entry.profile.clone();
         let sweep =
             session.sweeps.get(&channel).cloned().ok_or_else(|| {
@@ -9724,6 +10678,89 @@ impl LiveMeasurementState {
     pub fn finish_capture(&self) {
         if let Ok(mut active) = self.active_capture.lock() {
             *active = None;
+        }
+    }
+
+    /// Prepare the optional in-app playback of one imported sweep.
+    ///
+    /// This reads the sweep WAV exactly as the user imported it, so what the
+    /// speaker emits is the same file they would have played from Roon -
+    /// timing markers, level, and silences included. It intentionally takes no
+    /// part in recognition: it does not touch `active_capture`, does not
+    /// require a capture to be running, and returns no timing that any
+    /// analysis consumes.
+    pub fn begin_sweep_playback(
+        &self,
+        channel: LiveChannel,
+        output_device_id: &str,
+    ) -> Result<(InterleavedOutputPlaybackRequest, OutputPlaybackCancellation), String> {
+        if output_device_id.trim().is_empty() {
+            return Err("select an output device before playing the sweep".to_string());
+        }
+        let mut active = self
+            .active_playback
+            .lock()
+            .map_err(|_| "sweep playback state lock was poisoned".to_string())?;
+        if active.is_some() {
+            return Err("a sweep is already playing".to_string());
+        }
+        let source_wav_path = {
+            let guard = self
+                .session
+                .lock()
+                .map_err(|_| "live session state lock was poisoned".to_string())?;
+            let session = guard
+                .as_ref()
+                .ok_or_else(|| "start a live project before playing a sweep".to_string())?;
+            session
+                .sweeps
+                .get(&channel)
+                .ok_or_else(|| format!("import the {} measurement sweep first", channel.as_str()))?
+                .source_wav_path
+                .clone()
+        };
+        let bytes = fs::read(&source_wav_path).map_err(|error| {
+            format!("could not read the stored sweep WAV for playback: {error}")
+        })?;
+        let (_, channels) = decode_live_wav_channels(&bytes)?;
+        let (frames, channel_count) = sweep_playback_frames(&channels, channel)?;
+        // Play at whatever the device is already running. A rate it is not on
+        // makes CPAL rewrite the device format, which disturbs - and on a
+        // shared virtual device can hang - every other client of it.
+        let device_rate_hz =
+            output_device_sample_rate(output_device_id).unwrap_or(PROJECT_SAMPLE_RATE_HZ);
+        let (frames, sample_rate_hz) =
+            resample_playback_frames(frames, channel_count, device_rate_hz)?;
+        let cancellation = OutputPlaybackCancellation::new();
+        *active = Some(cancellation.clone());
+        Ok((
+            InterleavedOutputPlaybackRequest {
+                device_id: output_device_id.to_string(),
+                frames,
+                channels: channel_count,
+                sample_rate_hz,
+            },
+            cancellation,
+        ))
+    }
+
+    pub fn finish_sweep_playback(&self) {
+        if let Ok(mut active) = self.active_playback.lock() {
+            *active = None;
+        }
+    }
+
+    pub fn cancel_sweep_playback(&self) -> Result<bool, String> {
+        let cancellation = self
+            .active_playback
+            .lock()
+            .map_err(|_| "sweep playback state lock was poisoned".to_string())?
+            .clone();
+        if let Some(cancellation) = cancellation {
+            cancellation.cancel();
+            Ok(true)
+        } else {
+            Ok(false)
         }
     }
 
@@ -11191,6 +12228,47 @@ struct CachedMeasurementSnapshot {
 /// identifiable in its stored snapshot after the fact.
 const DEBUG_RELAXED_EVIDENCE_DIAGNOSTIC: &str = "debug_relaxed_evidence_restore";
 
+/// Older deconvolution versions whose stored arrays are stale but whose raw
+/// capture the current pipeline can re-analyse from scratch.
+///
+/// A snapshot holds two very different things: the raw microphone WAV, which
+/// no algorithm version can invalidate, and the arrays derived from it, which
+/// every version can. Discarding a whole session because the derived half went
+/// stale costs the user ten physical measurement positions to recover
+/// something the retained audio already contains. So a listed version is
+/// admitted on the condition that [`restore_cached_snapshot`] ignores its
+/// arrays entirely and re-runs recognition plus deconvolution over the WAV,
+/// which yields evidence identical to a fresh capture.
+///
+/// Only add a version here after confirming its raw WAV is still what the
+/// current pipeline expects - same sample rate, channel layout, and retained
+/// extent. A version that changed how the capture itself was recorded is NOT
+/// recomputable and must stay off this list.
+///
+/// v5 differed from v6 only in the sign of the microphone calibration, which
+/// is applied well after the WAV is written, so every v5 capture recomputes
+/// exactly.
+const RECOMPUTABLE_DECONVOLUTION_VERSIONS: [&str; 1] = ["known-sweep-deconvolution-v5"];
+
+/// Diagnostic stamped onto a measurement whose arrays this session recomputed
+/// from the cached raw capture rather than reading from the snapshot.
+const RECOMPUTED_FROM_RAW_DIAGNOSTIC: &str = "recomputed_from_cached_raw_capture";
+
+fn is_recomputable_deconvolution(algorithm: &str) -> bool {
+    RECOMPUTABLE_DECONVOLUTION_VERSIONS.contains(&algorithm)
+}
+
+/// The calibration profile a restore must re-analyse through, which is the
+/// session's own file or the identity stand-in when it runs uncalibrated.
+/// `cached_snapshot_matches_session` has already required the hash to match,
+/// so this is by construction the file the snapshot was captured with.
+fn session_calibration_profile(session: &LiveSession) -> MicrophoneCalibration {
+    session.calibration.as_ref().map_or_else(
+        || uncalibrated_microphone_entry().profile,
+        |entry| entry.profile.clone(),
+    )
+}
+
 fn cached_subwoofer_setup_matches(
     cached: Option<&CachedSubwooferSetup>,
     current: Option<&LiveSubwooferSetupSummary>,
@@ -11288,7 +12366,8 @@ fn cached_snapshot_matches_session(
     debug_relax_evidence: bool,
 ) -> bool {
     if cached.project_version != LIVE_MEASUREMENT_PROJECT_VERSION
-        || cached.deconvolution_algorithm != KNOWN_SWEEP_DECONVOLUTION_VERSION
+        || !(cached.deconvolution_algorithm == KNOWN_SWEEP_DECONVOLUTION_VERSION
+            || is_recomputable_deconvolution(&cached.deconvolution_algorithm))
         || cached.sample_rate_hz != PROJECT_SAMPLE_RATE_HZ
         || cached.system_mode != session.system_mode
         || !cached.accepted
@@ -11304,13 +12383,16 @@ fn cached_snapshot_matches_session(
     {
         return false;
     }
-    let Some(calibration) = session.calibration.as_ref() else {
-        return false;
-    };
     let Some(sweep) = session.sweeps.get(&cached.channel) else {
         return false;
     };
-    if cached.calibration_sha256 != calibration.summary.sha256
+    let calibration_sha256 = session
+        .calibration
+        .as_ref()
+        .map_or(UNCALIBRATED_MICROPHONE_SHA256, |entry| {
+            entry.summary.sha256.as_str()
+        });
+    if cached.calibration_sha256 != calibration_sha256
         || cached.sweep_sha256 != sweep.summary.sha256
     {
         return false;
@@ -11347,16 +12429,20 @@ fn restore_cached_snapshot(
     cached: CachedMeasurementSnapshot,
     snapshot_path: &Path,
     evidence: LiveCaptureEvidence,
+    sweep: &LiveSweepReference,
+    calibration: &MicrophoneCalibration,
 ) -> Result<StoredMeasurement, String> {
-    if cached.frequency_hz.len() != cached.calibrated_magnitude_db.len()
-        || cached.frequency_hz.len() < 3
-        || cached.calibrated_impulse_samples.is_empty()
-        || cached
-            .frequency_hz
-            .iter()
-            .chain(&cached.calibrated_magnitude_db)
-            .chain(&cached.calibrated_impulse_samples)
-            .any(|value| !value.is_finite())
+    let recompute = cached.deconvolution_algorithm != KNOWN_SWEEP_DECONVOLUTION_VERSION;
+    if !recompute
+        && (cached.frequency_hz.len() != cached.calibrated_magnitude_db.len()
+            || cached.frequency_hz.len() < 3
+            || cached.calibrated_impulse_samples.is_empty()
+            || cached
+                .frequency_hz
+                .iter()
+                .chain(&cached.calibrated_magnitude_db)
+                .chain(&cached.calibrated_impulse_samples)
+                .any(|value| !value.is_finite()))
     {
         return Err("cached measurement arrays are empty, inconsistent, or non-finite".to_string());
     }
@@ -11369,12 +12455,6 @@ fn restore_cached_snapshot(
     // arrival estimator sampled the same phase curves at half the density.
     // The cache compatibility check already requires this deconvolution
     // version, so every restorable snapshot carries an impulse this grid fits.
-    let response = frequency_response(
-        &cached.calibrated_impulse_samples,
-        PROJECT_SAMPLE_RATE_HZ,
-        SweepDeconvolutionConfig::default().analysis_fft_size,
-    )
-    .map_err(|error| format!("could not reconstruct cached response phase: {error}"))?;
     let raw_path = PathBuf::from(&cached.raw_capture_wav);
     if !raw_path.is_file() {
         return Err(format!(
@@ -11385,23 +12465,58 @@ fn restore_cached_snapshot(
     let captured_frames = hound::WavReader::open(&raw_path)
         .map_err(|error| format!("could not inspect cached raw WAV: {error}"))?
         .duration() as usize;
-    let level_assessment = LiveMeasurementLevelAssessment {
-        algorithm_version: LIVE_LEVEL_ASSESSMENT_VERSION,
-        status: cached.level_assessment.status,
-        acceptable_for_measurement: cached.level_assessment.acceptable_for_measurement,
-        measurement_peak_dbfs: cached.level_assessment.measurement_peak_dbfs,
-        measurement_rms_dbfs: cached.level_assessment.measurement_rms_dbfs,
-        estimated_spl_db: cached.level_assessment.estimated_spl_db,
-        estimated_spl_assumption: cached
-            .level_assessment
-            .estimated_spl_assumption
-            .as_ref()
-            .map(|_| "UMIK Sens Factor with operating-system input gain fixed at 0 dB"),
-        minimum_accepted_peak_dbfs: cached.level_assessment.minimum_accepted_peak_dbfs,
-        recommended_peak_minimum_dbfs: cached.level_assessment.recommended_peak_minimum_dbfs,
-        recommended_peak_maximum_dbfs: cached.level_assessment.recommended_peak_maximum_dbfs,
-        recommended_spl_minimum_db: cached.level_assessment.recommended_spl_minimum_db,
-        recommended_spl_maximum_db: cached.level_assessment.recommended_spl_maximum_db,
+    // A snapshot written by an older deconvolution version has usable raw
+    // audio and unusable derived arrays, so the arrays are recomputed from
+    // that audio rather than trusted or discarded.
+    let recomputed = if recompute {
+        Some(recompute_cached_measurement(
+            &raw_path,
+            sweep,
+            calibration,
+            &cached,
+        )?)
+    } else {
+        None
+    };
+    let (response, calibrated_impulse_samples, frequencies_hz, magnitude_db) = match &recomputed {
+        Some(recomputed) => (
+            recomputed.measurement.calibrated_frequency_response.clone(),
+            recomputed.measurement.calibrated_impulse_samples.clone(),
+            recomputed.frequencies_hz.clone(),
+            recomputed.magnitude_db.clone(),
+        ),
+        None => (
+            frequency_response(
+                &cached.calibrated_impulse_samples,
+                PROJECT_SAMPLE_RATE_HZ,
+                SweepDeconvolutionConfig::default().analysis_fft_size,
+            )
+            .map_err(|error| format!("could not reconstruct cached response phase: {error}"))?,
+            cached.calibrated_impulse_samples,
+            cached.frequency_hz,
+            cached.calibrated_magnitude_db,
+        ),
+    };
+    let level_assessment = match &recomputed {
+        Some(recomputed) => recomputed.level_assessment.clone(),
+        None => LiveMeasurementLevelAssessment {
+            algorithm_version: LIVE_LEVEL_ASSESSMENT_VERSION,
+            status: cached.level_assessment.status,
+            acceptable_for_measurement: cached.level_assessment.acceptable_for_measurement,
+            measurement_peak_dbfs: cached.level_assessment.measurement_peak_dbfs,
+            measurement_rms_dbfs: cached.level_assessment.measurement_rms_dbfs,
+            estimated_spl_db: cached.level_assessment.estimated_spl_db,
+            estimated_spl_assumption: cached
+                .level_assessment
+                .estimated_spl_assumption
+                .as_ref()
+                .map(|_| "UMIK Sens Factor with operating-system input gain fixed at 0 dB"),
+            minimum_accepted_peak_dbfs: cached.level_assessment.minimum_accepted_peak_dbfs,
+            recommended_peak_minimum_dbfs: cached.level_assessment.recommended_peak_minimum_dbfs,
+            recommended_peak_maximum_dbfs: cached.level_assessment.recommended_peak_maximum_dbfs,
+            recommended_spl_minimum_db: cached.level_assessment.recommended_spl_minimum_db,
+            recommended_spl_maximum_db: cached.level_assessment.recommended_spl_maximum_db,
+        },
     };
     let diagnostics = LiveAudioStreamDiagnostics {
         xrun_count: cached.audio_stream_diagnostics.xrun_count,
@@ -11423,24 +12538,65 @@ fn restore_cached_snapshot(
         source_channel_count: cached.source_channel_count,
         accepted: true,
         issue_codes: Vec::new(),
-        diagnostic_codes: cached.diagnostic_codes,
+        diagnostic_codes: {
+            let mut codes = cached.diagnostic_codes;
+            if recomputed.is_some() {
+                codes.push(RECOMPUTED_FROM_RAW_DIAGNOSTIC.to_string());
+            }
+            codes
+        },
         audio_stream_diagnostics: diagnostics,
         capture_peak_dbfs: cached.capture_peak_dbfs,
-        capture_snr_db: cached.capture_snr_db,
-        reconstruction_fit_db: cached.reconstruction_fit_db,
-        reconstruction_fit_required: cached.reconstruction_fit_required,
-        correlation: cached.correlation,
-        clock_drift_ppm: cached.clock_drift_ppm,
-        start_marker_detected: cached.start_marker_detected,
-        end_marker_detected: cached.end_marker_detected,
-        start_marker_rms_dbfs: cached.start_marker_rms_dbfs,
-        octave_band_snr_db: cached.octave_band_snr_db,
+        capture_snr_db: recomputed.as_ref().map_or(cached.capture_snr_db, |value| {
+            value.measurement.quality.capture_snr_db
+        }),
+        reconstruction_fit_db: recomputed
+            .as_ref()
+            .map_or(cached.reconstruction_fit_db, |value| {
+                Some(value.measurement.quality.reconstruction_fit_db)
+            }),
+        reconstruction_fit_required: recomputed
+            .as_ref()
+            .map_or(cached.reconstruction_fit_required, |value| {
+                value.measurement.quality.reconstruction_fit_required
+            }),
+        correlation: recomputed.as_ref().map_or(cached.correlation, |value| {
+            Some(value.detection.start_absolute_correlation)
+        }),
+        clock_drift_ppm: recomputed.as_ref().map_or(cached.clock_drift_ppm, |value| {
+            Some(value.detection.estimated_clock_drift_ppm)
+        }),
+        start_marker_detected: recomputed
+            .as_ref()
+            .map_or(cached.start_marker_detected, |value| {
+                value.start_marker_detected
+            }),
+        end_marker_detected: recomputed
+            .as_ref()
+            .map_or(cached.end_marker_detected, |value| {
+                value.end_marker_detected
+            }),
+        start_marker_rms_dbfs: recomputed
+            .as_ref()
+            .map_or(cached.start_marker_rms_dbfs, |value| {
+                value.start_marker_rms_dbfs
+            }),
+        octave_band_snr_db: recomputed
+            .as_ref()
+            .map_or(cached.octave_band_snr_db, |value| {
+                value.octave_band_snr_db.clone()
+            }),
         automatic_completion_detected: cached.automatic_completion_detected,
         level_assessment,
         captured_frames,
         raw_wav_path: raw_path.display().to_string(),
-        measurement_snapshot_path: Some(snapshot_path.display().to_string()),
-        frequency_bin_count: cached.frequency_hz.len(),
+        // A recomputed measurement is not what the source snapshot holds, so
+        // it must not claim that file as its own evidence; the raw WAV above
+        // stays the honest provenance.
+        measurement_snapshot_path: recomputed
+            .is_none()
+            .then(|| snapshot_path.display().to_string()),
+        frequency_bin_count: frequencies_hz.len(),
         timing_eligible: cached.timing_eligible,
         restored_from_cache: true,
         cache_source_session_id: Some(cached.session_id),
@@ -11448,13 +12604,228 @@ fn restore_cached_snapshot(
     Ok(StoredMeasurement {
         summary,
         calibrated_frequency_response: response,
-        calibrated_impulse_samples: cached.calibrated_impulse_samples,
-        recognized_sweep_start_capture_sample: cached
-            .recognized_sweep_start_capture_sample
-            .unwrap_or(0.0),
-        frequencies_hz: cached.frequency_hz,
-        magnitude_db: cached.calibrated_magnitude_db,
+        calibrated_impulse_samples,
+        recognized_sweep_start_capture_sample: recomputed.as_ref().map_or(
+            cached.recognized_sweep_start_capture_sample.unwrap_or(0.0),
+            |value| value.detection.estimated_sweep_start_sample,
+        ),
+        frequencies_hz,
+        magnitude_db,
         evidence,
+    })
+}
+
+/// Persist a recomputed measurement as a current-version snapshot beside its
+/// superseded source, so the recompute cost is paid once per capture instead
+/// of once per restore.
+///
+/// The sidecar is the ORIGINAL snapshot JSON with only the re-derived fields
+/// replaced - every evidence field (hashes, device identity, subwoofer
+/// context) is carried through byte-faithfully rather than reconstructed.
+/// Its name sorts after the source file, and the scan walks a session's
+/// snapshots newest-name-first with first-claim-wins per measurement key, so
+/// the sidecar shadows its superseded twin without any special casing.
+/// Failures are swallowed: cache warming must never fail a restore.
+fn write_recomputed_snapshot_sidecar(
+    snapshot_path: &Path,
+    original_bytes: &[u8],
+    restored: &StoredMeasurement,
+) {
+    let Ok(serde_json::Value::Object(mut snapshot)) =
+        serde_json::from_slice::<serde_json::Value>(original_bytes)
+    else {
+        return;
+    };
+    let patch = |value: &mut serde_json::Map<String, serde_json::Value>,
+                 key: &str,
+                 replacement: serde_json::Value| {
+        value.insert(key.to_string(), replacement);
+    };
+    let summary = &restored.summary;
+    let Ok(level_assessment) = serde_json::to_value(&summary.level_assessment) else {
+        return;
+    };
+    let to_json = |values: &[f64]| serde_json::json!(values);
+    patch(
+        &mut snapshot,
+        "deconvolutionAlgorithm",
+        serde_json::json!(KNOWN_SWEEP_DECONVOLUTION_VERSION),
+    );
+    patch(
+        &mut snapshot,
+        "frequencyHz",
+        to_json(&restored.frequencies_hz),
+    );
+    patch(
+        &mut snapshot,
+        "calibratedMagnitudeDb",
+        to_json(&restored.magnitude_db),
+    );
+    patch(
+        &mut snapshot,
+        "calibratedImpulseSamples",
+        to_json(&restored.calibrated_impulse_samples),
+    );
+    patch(
+        &mut snapshot,
+        "recognizedSweepStartCaptureSample",
+        serde_json::json!(restored.recognized_sweep_start_capture_sample),
+    );
+    patch(
+        &mut snapshot,
+        "captureSnrDb",
+        serde_json::json!(summary.capture_snr_db),
+    );
+    patch(
+        &mut snapshot,
+        "reconstructionFitDb",
+        serde_json::json!(summary.reconstruction_fit_db),
+    );
+    patch(
+        &mut snapshot,
+        "reconstructionFitRequired",
+        serde_json::json!(summary.reconstruction_fit_required),
+    );
+    patch(
+        &mut snapshot,
+        "correlation",
+        serde_json::json!(summary.correlation),
+    );
+    patch(
+        &mut snapshot,
+        "clockDriftPpm",
+        serde_json::json!(summary.clock_drift_ppm),
+    );
+    patch(
+        &mut snapshot,
+        "startMarkerRmsDbfs",
+        serde_json::json!(summary.start_marker_rms_dbfs),
+    );
+    patch(
+        &mut snapshot,
+        "octaveBandSnrDb",
+        serde_json::json!(summary.octave_band_snr_db),
+    );
+    patch(&mut snapshot, "levelAssessment", level_assessment);
+    patch(
+        &mut snapshot,
+        "diagnosticCodes",
+        serde_json::json!(summary.diagnostic_codes),
+    );
+    // "<stem>.recomputed.json"; a re-recompute in a later version overwrites
+    // the same sidecar instead of chaining suffixes.
+    let stem = snapshot_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(|stem| stem.trim_end_matches(".recomputed").to_string());
+    let Some(stem) = stem else {
+        return;
+    };
+    let sidecar = snapshot_path.with_file_name(format!("{stem}.recomputed.json"));
+    if let Ok(bytes) = serde_json::to_vec(&serde_json::Value::Object(snapshot)) {
+        let _ = fs::write(sidecar, bytes);
+    }
+}
+
+/// Re-derive one cached capture with the current pipeline.
+///
+/// The result must clear the same gates a fresh capture does. If it does not,
+/// the snapshot is refused rather than restored: a measurement that only
+/// passed under the old algorithm is not evidence for this one.
+struct RecomputedMeasurement {
+    measurement: SweepMeasurement,
+    detection: WirelessSweepDetection,
+    start_marker_detected: bool,
+    end_marker_detected: bool,
+    start_marker_rms_dbfs: Option<f64>,
+    octave_band_snr_db: Option<Vec<Option<f64>>>,
+    level_assessment: LiveMeasurementLevelAssessment,
+    frequencies_hz: Vec<f64>,
+    magnitude_db: Vec<f64>,
+}
+
+fn recompute_cached_measurement(
+    raw_path: &Path,
+    sweep: &LiveSweepReference,
+    calibration: &MicrophoneCalibration,
+    cached: &CachedMeasurementSnapshot,
+) -> Result<RecomputedMeasurement, String> {
+    let mut reader = hound::WavReader::open(raw_path)
+        .map_err(|error| format!("could not open cached raw WAV: {error}"))?;
+    let spec = reader.spec();
+    if spec.channels != 1 || spec.sample_rate != PROJECT_SAMPLE_RATE_HZ {
+        return Err(format!(
+            "cached raw capture is {} channel(s) at {} Hz, not mono 48 kHz",
+            spec.channels, spec.sample_rate
+        ));
+    }
+    let microphone_samples = reader
+        .samples::<f32>()
+        .map(|sample| {
+            sample
+                .map(f64::from)
+                .map_err(|error| format!("could not read cached raw WAV: {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // The snapshot only stores clipping as an acceptance outcome, so the flag
+    // is re-derived from the retained audio with the same threshold the live
+    // capture path applies.
+    let input_clipped = microphone_samples
+        .iter()
+        .any(|sample| sample.abs() >= f64::from(INPUT_CLIPPING_THRESHOLD_LINEAR));
+    let recognized =
+        recognize_and_deconvolve(sweep, calibration, &microphone_samples, input_clipped)?;
+    if !recognized.measurement.quality.accepted {
+        return Err(format!(
+            "recomputed measurement no longer passes its quality gates: {:?}",
+            recognized.measurement.quality.issues
+        ));
+    }
+    if !recognized.level_assessment.acceptable_for_measurement {
+        return Err("recomputed measurement level is outside the accepted range".to_string());
+    }
+    if recognized.start_marker_detected != cached.start_marker_detected
+        || recognized.end_marker_detected != cached.end_marker_detected
+    {
+        return Err("recomputed marker detection disagrees with the cached capture".to_string());
+    }
+    let retained = recognized
+        .measurement
+        .calibrated_frequency_response
+        .frequencies_hz
+        .iter()
+        .enumerate()
+        .filter_map(|(index, frequency)| {
+            (*frequency > 0.0 && *frequency <= 20_000.0).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    Ok(RecomputedMeasurement {
+        frequencies_hz: retained
+            .iter()
+            .map(|index| {
+                recognized
+                    .measurement
+                    .calibrated_frequency_response
+                    .frequencies_hz[*index]
+            })
+            .collect(),
+        magnitude_db: retained
+            .iter()
+            .map(|index| {
+                recognized
+                    .measurement
+                    .calibrated_frequency_response
+                    .magnitude_db[*index]
+            })
+            .collect(),
+        measurement: recognized.measurement,
+        detection: recognized.detection,
+        start_marker_detected: recognized.start_marker_detected,
+        end_marker_detected: recognized.end_marker_detected,
+        start_marker_rms_dbfs: recognized.start_marker_rms_dbfs,
+        octave_band_snr_db: recognized.octave_band_snr_db,
+        level_assessment: recognized.level_assessment,
     })
 }
 
@@ -11493,10 +12864,9 @@ impl LiveMeasurementState {
         let session = guard
             .as_mut()
             .ok_or_else(|| "start a live project before restoring measurements".to_string())?;
-        if session.calibration.is_none() || session.sweeps.len() != 2 {
+        if session.sweeps.len() != 2 {
             return Err(
-                "import the calibration and both exact sweep WAV files before restoring measurements"
-                    .to_string(),
+                "import both exact sweep WAV files before restoring measurements".to_string(),
             );
         }
         if session.system_mode == LiveSystemMode::SingleSub21
@@ -11573,7 +12943,15 @@ impl LiveMeasurementState {
                         .is_some_and(|extension| extension == "json")
                 })
                 .collect::<Vec<_>>();
+            // Newest artifact first within a session, so the freshest pass at
+            // a measurement key claims it and every older duplicate is
+            // skipped BEFORE the (possibly seconds-long) recompute runs. The
+            // forward-order original restored every compatible duplicate and
+            // let the map insert discard all but the last - harmless when a
+            // restore was a JSON read, a 90-recompute, 59-second scan once
+            // superseded snapshots re-analysed their raw captures.
             snapshot_paths.sort();
+            snapshot_paths.reverse();
             let canonical_project_root = project_root.canonicalize().ok();
             let mut source_measurements = BTreeMap::new();
             for snapshot_path in snapshot_paths {
@@ -11585,6 +12963,21 @@ impl LiveMeasurementState {
                     continue;
                 };
                 let LiveRestoreScope::General = scope;
+                let Ok(position_id) =
+                    validate_position_id(&cached.position_id, cached.capture_kind)
+                else {
+                    continue;
+                };
+                let claimed_key = (cached.capture_kind, position_id, cached.channel);
+                if source_measurements.contains_key(&claimed_key)
+                    || selected.contains_key(&claimed_key)
+                    || session
+                        .measurements
+                        .get(&claimed_key)
+                        .is_some_and(|current| current.summary.accepted)
+                {
+                    continue;
+                }
                 if !cached_snapshot_matches_session(
                     &cached,
                     session,
@@ -11604,11 +12997,6 @@ impl LiveMeasurementState {
                         input_channel_index,
                         false,
                     );
-                let Ok(position_id) =
-                    validate_position_id(&cached.position_id, cached.capture_kind)
-                else {
-                    continue;
-                };
                 let raw_path = PathBuf::from(&cached.raw_capture_wav);
                 let canonical_raw_path = raw_path.canonicalize().ok();
                 let raw_is_inside_source = canonical_project_root
@@ -11630,20 +13018,34 @@ impl LiveMeasurementState {
                     calibration_sha256: session
                         .calibration
                         .as_ref()
-                        .expect("calibration checked above")
-                        .summary
-                        .sha256
-                        .clone(),
+                        .map_or(UNCALIBRATED_MICROPHONE_SHA256, |entry| {
+                            entry.summary.sha256.as_str()
+                        })
+                        .to_string(),
                     sweep_sha256: sweep.summary.sha256.clone(),
                     design_sha256: None,
                     input_device_id: input_device_id.to_string(),
                     input_channel_index,
                 };
-                let kind = cached.capture_kind;
-                let channel = cached.channel;
                 compatible_snapshot_count = compatible_snapshot_count.saturating_add(1);
-                if let Ok(mut restored) = restore_cached_snapshot(cached, &snapshot_path, evidence)
-                {
+                if let Ok(mut restored) = restore_cached_snapshot(
+                    cached,
+                    &snapshot_path,
+                    evidence,
+                    sweep,
+                    &session_calibration_profile(session),
+                ) {
+                    // A recompute (recognisable by the withheld snapshot
+                    // path) writes its result back beside the superseded
+                    // source, so the next restore reads it as a
+                    // current-version snapshot instead of re-analysing the
+                    // raw capture again. Best effort - a read-only source
+                    // just pays the recompute every time. This runs before
+                    // the relaxed-admission stamp: that diagnostic describes
+                    // THIS session's admission, not the measurement.
+                    if restored.summary.measurement_snapshot_path.is_none() {
+                        write_recomputed_snapshot_sidecar(&snapshot_path, &bytes, &restored);
+                    }
                     if relaxed_admission {
                         debug_relaxed_snapshot_count =
                             debug_relaxed_snapshot_count.saturating_add(1);
@@ -11652,7 +13054,7 @@ impl LiveMeasurementState {
                             .diagnostic_codes
                             .push(DEBUG_RELAXED_EVIDENCE_DIAGNOSTIC.to_string());
                     }
-                    source_measurements.insert((kind, position_id, channel), restored);
+                    source_measurements.insert(claimed_key, restored);
                 }
             }
             let mut source_contributed = false;
@@ -11807,6 +13209,140 @@ impl LiveMeasurementState {
     }
 }
 
+/// Everything the current pipeline derives from one microphone capture.
+///
+/// Factored out of [`analyze_and_store_capture`] so the cache restore can run
+/// the identical path over a stored raw WAV. A snapshot's derived arrays are
+/// bound to the deconvolution version that wrote them, but the raw capture is
+/// not: re-running this over the retained WAV regenerates a measurement that
+/// is indistinguishable from a fresh one, which is what lets a cache survive a
+/// version bump without asking the user to re-measure ten positions.
+struct RecognizedCapture {
+    measurement: SweepMeasurement,
+    detection: WirelessSweepDetection,
+    start_marker_detected: bool,
+    end_marker_detected: bool,
+    start_marker_rms_dbfs: Option<f64>,
+    octave_band_snr_db: Option<Vec<Option<f64>>>,
+    level_assessment: LiveMeasurementLevelAssessment,
+}
+
+fn recognize_and_deconvolve(
+    sweep: &LiveSweepReference,
+    calibration: &MicrophoneCalibration,
+    microphone_samples: &[f64],
+    input_clipped: bool,
+) -> Result<RecognizedCapture, String> {
+    let mut deconvolution_config = SweepDeconvolutionConfig {
+        minimum_capture_snr_db: LIVE_MINIMUM_CAPTURE_SNR_DB,
+        maximum_timing_fit_rms_samples: MAGNITUDE_ONLY_MAXIMUM_TIMING_FIT_RMS_SAMPLES,
+        ..SweepDeconvolutionConfig::default()
+    };
+    let marker_pair = detect_timing_marker_pair(sweep, microphone_samples)?;
+    let start_marker_rms_dbfs = marker_pair.as_ref().and_then(|pair| {
+        let source_marker_samples = sweep
+            .timing_markers
+            .iter()
+            .find(|marker| marker.is_start_marker)
+            .map(|marker| marker.samples.len())?;
+        marker_capture_rms_dbfs(
+            microphone_samples,
+            pair.first.capture_start_sample,
+            source_marker_samples as f64 * pair.capture_samples_per_reference_sample,
+        )
+    });
+    if marker_pair.is_some() {
+        // This correlation belongs to a short acoustic marker, not to the
+        // broadband measurement sweep. The repeated pair spacing, clock-drift
+        // bound, reconstruction fit, and SNR provide the remaining independent
+        // gates for a marker-driven capture.
+        deconvolution_config.minimum_start_correlation = MINIMUM_MARKER_CORRELATION;
+        deconvolution_config.impulse_pre_zero_samples = MARKER_REFERENCED_IMPULSE_PRE_ZERO_SAMPLES;
+        deconvolution_config.enforce_minimum_reconstruction_fit = false;
+    }
+    let (detection, start_marker_detected, end_marker_detected) = if let Some(pair) = marker_pair {
+        (
+            marker_pair_measurement_detection(
+                &pair,
+                microphone_samples,
+                deconvolution_config.impulse_length_samples,
+            )?,
+            true,
+            true,
+        )
+    } else {
+        let recognition_config = WirelessSweepRecognitionConfig {
+            nominal_sample_rate_hz: PROJECT_SAMPLE_RATE_HZ,
+            maximum_reference_samples: sweep.samples.len().max(1),
+            maximum_capture_samples: microphone_samples.len().max(1),
+            // Room group delay biases frequency-changing segments. This live path
+            // never promotes the fit to channel timing; it retains a wider bound
+            // only for magnitude deconvolution and still rejects gross instability.
+            maximum_timing_fit_rms_samples: MAGNITUDE_ONLY_MAXIMUM_TIMING_FIT_RMS_SAMPLES,
+            // The retained segment must carry the whole deconvolution IR tail
+            // even at the worst admitted clock ratio, exactly like the
+            // marker-pair branch derives its own required post-roll.
+            capture_post_roll_samples: deconvolution_config.impulse_length_samples + 4_800,
+            ..WirelessSweepRecognitionConfig::default()
+        };
+        let recognition =
+            recognize_wireless_sweep(&sweep.samples, microphone_samples, &recognition_config)
+                .map_err(|error| format!("live sweep recognition failed: {error}"))?;
+        let detection = match recognition {
+            WirelessSweepRecognition::Detected(detection) => detection,
+            WirelessSweepRecognition::NotDetected(outcome) => {
+                return Err(format!(
+                    "neither the start/end marker pair nor the measurement sweep was detected: {:?}, strongest sweep correlation {:.3}",
+                    outcome.reason, outcome.strongest_absolute_correlation
+                ));
+            }
+            WirelessSweepRecognition::LikelyFalsePositive(outcome) => {
+                return Err(format!(
+                    "start/end markers were incomplete and only a likely false-positive sweep fragment was detected: {:?}, timing-fit {:?} samples, drift {:?} ppm",
+                    outcome.reason, outcome.timing_fit_rms_samples, outcome.estimated_clock_drift_ppm
+                ));
+            }
+            WirelessSweepRecognition::Ambiguous(outcome) => {
+                return Err(format!(
+                    "multiple complete sweep playbacks were detected ({:.3}/{:.3}); play exactly once",
+                    outcome.strongest_absolute_correlation, outcome.second_absolute_correlation
+                ));
+            }
+        };
+        let adjusted = measurement_detection(sweep, microphone_samples, &detection)?;
+        let repeated_markers =
+            adjusted.clock_drift_evidence == WirelessClockDriftEvidence::RepeatedTimingMarkers;
+        (adjusted, repeated_markers, repeated_markers)
+    };
+    let octave_band_snr_db = octave_band_snr_db(
+        microphone_samples,
+        detection.estimated_sweep_start_sample,
+        detection.estimated_sweep_end_sample_exclusive,
+    );
+    let level_assessment = assess_measurement_level(
+        microphone_samples,
+        &detection,
+        calibration.sensitivity_factor_db,
+        input_clipped,
+    )?;
+    let measurement = deconvolve_recognized_sweep(
+        &sweep.samples,
+        &detection,
+        Some(calibration),
+        &deconvolution_config,
+    )
+    .map_err(|error| format!("live sweep deconvolution failed: {error}"))?;
+    Ok(RecognizedCapture {
+        measurement,
+        detection,
+        start_marker_detected,
+        end_marker_detected,
+        start_marker_rms_dbfs,
+        octave_band_snr_db,
+        level_assessment,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn analyze_and_store_capture(
     state: &LiveMeasurementState,
@@ -11849,119 +13385,21 @@ pub fn analyze_and_store_capture(
         .iter()
         .map(|sample| f64::from(*sample))
         .collect::<Vec<_>>();
-    let mut deconvolution_config = SweepDeconvolutionConfig {
-        minimum_capture_snr_db: LIVE_MINIMUM_CAPTURE_SNR_DB,
-        maximum_timing_fit_rms_samples: MAGNITUDE_ONLY_MAXIMUM_TIMING_FIT_RMS_SAMPLES,
-        ..SweepDeconvolutionConfig::default()
-    };
-    let marker_pair = detect_timing_marker_pair(sweep, &microphone_samples)?;
-    let start_marker_rms_dbfs = marker_pair.as_ref().and_then(|pair| {
-        let source_marker_samples = sweep
-            .timing_markers
-            .iter()
-            .find(|marker| marker.is_start_marker)
-            .map(|marker| marker.samples.len())?;
-        marker_capture_rms_dbfs(
-            &microphone_samples,
-            pair.first.capture_start_sample,
-            source_marker_samples as f64 * pair.capture_samples_per_reference_sample,
-        )
-    });
-    if marker_pair.is_some() {
-        // This correlation belongs to a short acoustic marker, not to the
-        // broadband measurement sweep. The repeated pair spacing, clock-drift
-        // bound, reconstruction fit, and SNR provide the remaining independent
-        // gates for a marker-driven capture.
-        deconvolution_config.minimum_start_correlation = MINIMUM_MARKER_CORRELATION;
-        deconvolution_config.impulse_pre_zero_samples = MARKER_REFERENCED_IMPULSE_PRE_ZERO_SAMPLES;
-        deconvolution_config.enforce_minimum_reconstruction_fit = false;
-    }
-    let (deconvolution_detection, start_marker_detected, end_marker_detected) = if let Some(pair) =
-        marker_pair
-    {
-        (
-            marker_pair_measurement_detection(
-                &pair,
-                &microphone_samples,
-                deconvolution_config.impulse_length_samples,
-            )?,
-            true,
-            true,
-        )
-    } else {
-        let recognition_config = WirelessSweepRecognitionConfig {
-            nominal_sample_rate_hz: PROJECT_SAMPLE_RATE_HZ,
-            maximum_reference_samples: sweep.samples.len().max(1),
-            maximum_capture_samples: microphone_samples.len().max(1),
-            // Room group delay biases frequency-changing segments. This live path
-            // never promotes the fit to channel timing; it retains a wider bound
-            // only for magnitude deconvolution and still rejects gross instability.
-            maximum_timing_fit_rms_samples: MAGNITUDE_ONLY_MAXIMUM_TIMING_FIT_RMS_SAMPLES,
-            // The retained segment must carry the whole deconvolution IR tail
-            // even at the worst admitted clock ratio, exactly like the
-            // marker-pair branch derives its own required post-roll.
-            capture_post_roll_samples: deconvolution_config.impulse_length_samples + 4_800,
-            ..WirelessSweepRecognitionConfig::default()
-        };
-        let recognition =
-            recognize_wireless_sweep(&sweep.samples, &microphone_samples, &recognition_config)
-                .map_err(|error| format!("live sweep recognition failed: {error}"))?;
-        let detection = match recognition {
-            WirelessSweepRecognition::Detected(detection) => detection,
-            WirelessSweepRecognition::NotDetected(outcome) => {
-                return Err(format!(
-                        "neither the start/end marker pair nor the measurement sweep was detected: {:?}, strongest sweep correlation {:.3}; raw capture retained at {}",
-                        outcome.reason,
-                        outcome.strongest_absolute_correlation,
-                        raw_path.display()
-                    ));
-            }
-            WirelessSweepRecognition::LikelyFalsePositive(outcome) => {
-                return Err(format!(
-                        "start/end markers were incomplete and only a likely false-positive sweep fragment was detected: {:?}, timing-fit {:?} samples, drift {:?} ppm; raw capture retained at {}",
-                        outcome.reason,
-                        outcome.timing_fit_rms_samples,
-                        outcome.estimated_clock_drift_ppm,
-                        raw_path.display()
-                    ));
-            }
-            WirelessSweepRecognition::Ambiguous(outcome) => {
-                return Err(format!(
-                        "multiple complete sweep playbacks were detected ({:.3}/{:.3}); play exactly once. Raw capture retained at {}",
-                        outcome.strongest_absolute_correlation,
-                        outcome.second_absolute_correlation,
-                        raw_path.display()
-                    ));
-            }
-        };
-        let adjusted = measurement_detection(sweep, &microphone_samples, &detection)?;
-        let repeated_markers =
-            adjusted.clock_drift_evidence == WirelessClockDriftEvidence::RepeatedTimingMarkers;
-        (adjusted, repeated_markers, repeated_markers)
-    };
-    let octave_band_snr = octave_band_snr_db(
+    let RecognizedCapture {
+        measurement,
+        detection: deconvolution_detection,
+        start_marker_detected,
+        end_marker_detected,
+        start_marker_rms_dbfs,
+        octave_band_snr_db: octave_band_snr,
+        level_assessment,
+    } = recognize_and_deconvolve(
+        sweep,
+        calibration,
         &microphone_samples,
-        deconvolution_detection.estimated_sweep_start_sample,
-        deconvolution_detection.estimated_sweep_end_sample_exclusive,
-    );
-    let level_assessment = assess_measurement_level(
-        &microphone_samples,
-        &deconvolution_detection,
-        calibration.sensitivity_factor_db,
         capture.input_clipped,
-    )?;
-    let measurement = deconvolve_recognized_sweep(
-        &sweep.samples,
-        &deconvolution_detection,
-        Some(calibration),
-        &deconvolution_config,
     )
-    .map_err(|error| {
-        format!(
-            "live sweep deconvolution failed: {error}; raw capture retained at {}",
-            raw_path.display()
-        )
-    })?;
+    .map_err(|error| format!("{error}; raw capture retained at {}", raw_path.display()))?;
     let mut issue_codes = quality_issue_codes(&measurement, capture);
     let mut extra_diagnostic_codes = Vec::new();
     match isolated_path_leakage_issue(
@@ -12137,20 +13575,50 @@ pub fn analyze_and_store_capture(
     Ok(summary)
 }
 
+/// Weighted spatial energy average across every accepted position and both
+/// channels - the same statistic (weights included) the correction stage
+/// averages per channel, folded L+R because one target serves both channels.
+fn spatial_average_for_target(set: &MeasuredStereoResponseSet) -> Result<Vec<f64>, String> {
+    let mut responses = Vec::with_capacity(set.positions.len() * 2);
+    let mut weights = Vec::with_capacity(set.positions.len() * 2);
+    for position in &set.positions {
+        responses.push(position.left_magnitude_db.clone());
+        weights.push(position.weight);
+        responses.push(position.right_magnitude_db.clone());
+        weights.push(position.weight);
+    }
+    weighted_energy_average_db(&responses, &weights).map_err(|error| {
+        format!("could not average the measured responses for the target: {error}")
+    })
+}
+
+/// Resolve the selected target. The built-in default (`harman_6db`) is the
+/// only selection with the measurement-adaptive HF rolloff: it needs the
+/// accepted response set, and returns the fit's provenance alongside the
+/// curve. A custom TXT is always used verbatim.
 fn target_from_name(
     target: &str,
     custom_target: Option<&TargetEntry>,
-) -> Result<TargetCurve, String> {
+    response_set: Option<&MeasuredStereoResponseSet>,
+) -> Result<(TargetCurve, Option<LiveAdaptiveHfSummary>), String> {
     match target {
-        "bk" => Ok(TargetCurve::preset(TargetPreset::BkStyle)),
-        "harman" => Ok(TargetCurve::preset(TargetPreset::HarmanStyle)),
+        "harman_6db" => {
+            let set = response_set.ok_or_else(|| {
+                "internal: the built-in default target requires the measured response set"
+                    .to_string()
+            })?;
+            let average_db = spatial_average_for_target(set)?;
+            let (curve, outcome) = harman_6db_adaptive_hf_target(&set.frequencies_hz, &average_db)
+                .map_err(|error| format!("could not build the default target: {error}"))?;
+            Ok((curve, Some(LiveAdaptiveHfSummary::from_outcome(&outcome))))
+        }
         "custom" => custom_target
-            .map(|entry| entry.curve.clone())
+            .map(|entry| (entry.curve.clone(), None))
             .ok_or_else(|| {
                 "import a valid custom target TXT before selecting the custom target".to_string()
             }),
         other => Err(format!(
-            "unsupported live target `{other}`; choose `bk`, `harman`, or `custom`"
+            "unsupported live target `{other}`; choose `harman_6db` or `custom`"
         )),
     }
 }
@@ -12248,6 +13716,19 @@ fn timed_impulse(measurement: &StoredMeasurement) -> TimedCombinedImpulse {
     }
 }
 
+/// Per-bin energy mean of two dB curves: the merged magnitude of one seat
+/// measured twice. Averaging in energy matches `weighted_energy_average_db`,
+/// so a merged P0 at weight 2.0 equals the two repeats at weight 1.0 each.
+fn energy_mean_db(first_db: &[f64], second_db: &[f64]) -> Vec<f64> {
+    first_db
+        .iter()
+        .zip(second_db)
+        .map(|(first, second)| {
+            10.0 * (0.5 * (10f64.powf(first / 10.0) + 10f64.powf(second / 10.0))).log10()
+        })
+        .collect()
+}
+
 fn build_response_set(session: &LiveSession) -> Result<MeasuredStereoResponseSet, String> {
     let mut ids = session
         .measurements
@@ -12291,6 +13772,11 @@ fn build_response_set(session: &LiveSession) -> Result<MeasuredStereoResponseSet
     let mut positions = Vec::new();
     let mut frequencies = None;
     for id in ids {
+        if id == "P0_END" {
+            // The end repeat is the same physical seat measured twice, not an
+            // independent position: it folds into the P0 entry below.
+            continue;
+        }
         let left =
             session
                 .measurements
@@ -12317,16 +13803,59 @@ fn build_response_set(session: &LiveSession) -> Result<MeasuredStereoResponseSet
         } else {
             frequencies = Some(left.frequencies_hz.clone());
         }
-        let weight = match id.as_str() {
-            "P0" | "P0_END" if has_end_repeat => 1.0,
-            "P0" => 2.0,
-            _ => 1.0,
+        // The central seat always weighs 2.0 against 1.0 for every
+        // surrounding position. When the accepted end repeat exists its
+        // magnitudes are energy-averaged into P0 (halving that seat's
+        // uncorrelated capture noise); the merged seat keeps P0's own timed
+        // impulse, because averaging two impulses taken minutes apart smears
+        // the arrival phase the repeat exists to double-check, and the
+        // repeat's agreement was already enforced above.
+        let (weight, left_magnitude_db, right_magnitude_db) = if id == "P0" {
+            let repeat_pair = if has_end_repeat {
+                let repeat_left = session.measurements.get(&(
+                    LiveCaptureKind::Baseline,
+                    "P0_END".to_string(),
+                    LiveChannel::Left,
+                ));
+                let repeat_right = session.measurements.get(&(
+                    LiveCaptureKind::Baseline,
+                    "P0_END".to_string(),
+                    LiveChannel::Right,
+                ));
+                match (repeat_left, repeat_right) {
+                    (Some(repeat_left), Some(repeat_right))
+                        if repeat_left.summary.accepted && repeat_right.summary.accepted =>
+                    {
+                        validate_stored_evidence(session, repeat_left)?;
+                        validate_stored_evidence(session, repeat_right)?;
+                        if repeat_left.frequencies_hz != left.frequencies_hz
+                            || repeat_right.frequencies_hz != right.frequencies_hz
+                        {
+                            return Err("P0 end-repeat uses a different response grid".to_string());
+                        }
+                        Some((repeat_left, repeat_right))
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            match repeat_pair {
+                Some((repeat_left, repeat_right)) => (
+                    2.0,
+                    energy_mean_db(&left.magnitude_db, &repeat_left.magnitude_db),
+                    energy_mean_db(&right.magnitude_db, &repeat_right.magnitude_db),
+                ),
+                None => (2.0, left.magnitude_db.clone(), right.magnitude_db.clone()),
+            }
+        } else {
+            (1.0, left.magnitude_db.clone(), right.magnitude_db.clone())
         };
         positions.push(MeasuredStereoPosition {
             id,
             weight,
-            left_magnitude_db: left.magnitude_db.clone(),
-            right_magnitude_db: right.magnitude_db.clone(),
+            left_magnitude_db,
+            right_magnitude_db,
             left_timed_combined_ir: Some(timed_impulse(left)),
             right_timed_combined_ir: Some(timed_impulse(right)),
         });
@@ -12356,6 +13885,7 @@ impl LiveMeasurementState {
         }
         let (
             target_curve,
+            adaptive_hf,
             selected_custom_target,
             response_set,
             baseline_octave_snrs,
@@ -12373,7 +13903,18 @@ impl LiveMeasurementState {
             let session = guard
                 .as_mut()
                 .ok_or_else(|| "start a live project before filter design".to_string())?;
-            let target_curve = target_from_name(target, session.custom_target.as_ref())?;
+            if ![LiveChannel::Left, LiveChannel::Right]
+                .iter()
+                .all(|channel| session.sweeps.contains_key(channel))
+            {
+                return Err("both measurement sweeps are required before design".to_string());
+            }
+            // The response set is assembled before the target because the
+            // built-in default target adapts its HF section to the measured
+            // spatial average; the fit runs only for that selection.
+            let response_set = build_response_set(session)?;
+            let (target_curve, adaptive_hf) =
+                target_from_name(target, session.custom_target.as_ref(), Some(&response_set))?;
             let selected_custom_target = (target == "custom").then(|| {
                 session
                     .custom_target
@@ -12382,17 +13923,6 @@ impl LiveMeasurementState {
                     .summary
                     .clone()
             });
-            if session.calibration.is_none()
-                || ![LiveChannel::Left, LiveChannel::Right]
-                    .iter()
-                    .all(|channel| session.sweeps.contains_key(channel))
-            {
-                return Err(
-                    "calibration and both measurement sweeps are required before design"
-                        .to_string(),
-                );
-            }
-            let response_set = build_response_set(session)?;
             let baseline_octave_snrs: Vec<Option<Vec<Option<f64>>>> = session
                 .measurements
                 .iter()
@@ -12408,6 +13938,7 @@ impl LiveMeasurementState {
                 .ok_or_else(|| "live artifact counter overflowed".to_string())?;
             (
                 target_curve,
+                adaptive_hf,
                 selected_custom_target,
                 response_set,
                 baseline_octave_snrs,
@@ -12524,12 +14055,17 @@ impl LiveMeasurementState {
              Load this ZIP in one Roon convolution slot, keep volume and microphone gain fixed,\n\
              then perform the required P0 L/R verification measurements.\n\
              Target: {} ({})\n\
+             {}\
              Correction: minimum phase, 20-500 Hz, unity taper through 650 Hz;\n\
              broad spatially repeated shallow dips may receive at most +3 dB,\n\
              while deep/narrow dips remain protected.\n\
              Algorithm: {PHASE4_OFFLINE_ALGORITHM_VERSION}\n",
             config.target.name(),
             config.target.version(),
+            adaptive_hf
+                .as_ref()
+                .map(|summary| format!("{}\n", summary.readme_line()))
+                .unwrap_or_default(),
         );
         create_roon_zip(
             &trial_zip_path,
@@ -12569,6 +14105,7 @@ impl LiveMeasurementState {
             maximum_attenuation_db,
             maximum_boost_db,
             protected_dips_passed,
+            adaptive_hf,
             warning: "Predicted-only trial. Final export stays locked until a new P0 L/R capture is made with this exact filter active in Roon.".to_string(),
         };
         let mut guard = self
@@ -12645,6 +14182,7 @@ impl LiveMeasurementState {
             right_response,
             seats,
             target_overlay,
+            adaptive_hf,
             shared_low_frequency_hz,
             root,
             artifact_index,
@@ -12672,15 +14210,11 @@ impl LiveMeasurementState {
             // package) - is handled by the shared-sub-band commonization
             // below the confirmed crossover, the SECS analog of Phase 4's
             // common-low-bass constraint.
-            if session.calibration.is_none()
-                || ![LiveChannel::Left, LiveChannel::Right]
-                    .iter()
-                    .all(|channel| session.sweeps.contains_key(channel))
+            if ![LiveChannel::Left, LiveChannel::Right]
+                .iter()
+                .all(|channel| session.sweeps.contains_key(channel))
             {
-                return Err(
-                    "calibration and both measurement sweeps are required before design"
-                        .to_string(),
-                );
+                return Err("both measurement sweeps are required before design".to_string());
             }
             // Fail closed instead of designing crossover-blind: in a 2.1
             // project every crossover-aware stage (the shared-sub-band
@@ -12720,9 +14254,17 @@ impl LiveMeasurementState {
             } else {
                 Vec::new()
             };
-            let target_overlay = settings
+            // The built-in default target adapts its HF section to the
+            // session's accepted measurements; the adaptive fit exists for
+            // that selection only, so the response set is assembled only
+            // when it is needed.
+            let target_response_set = match settings.target_curve {
+                LiveSecsTargetCurve::Harman6db => Some(build_response_set(session)?),
+                _ => None,
+            };
+            let (target_overlay, adaptive_hf) = settings
                 .target_curve
-                .overlay(session.custom_target.as_ref())?;
+                .overlay(session.custom_target.as_ref(), target_response_set.as_ref())?;
             // 2.1: one shared subwoofer reproduces both channels below the
             // confirmed crossover; the design commonizes L/R there.
             let shared_low_frequency_hz = match session.system_mode {
@@ -12744,6 +14286,7 @@ impl LiveMeasurementState {
                 right_response,
                 seats,
                 target_overlay,
+                adaptive_hf,
                 shared_low_frequency_hz,
                 session.root.clone(),
                 index,
@@ -13079,7 +14622,13 @@ impl LiveMeasurementState {
                 None => "chosen by the user".to_string(),
             },
             match target_overlay.as_ref() {
-                Some(curve) => format!("{} ({})", curve.name(), curve.version()),
+                Some(curve) => {
+                    let mut line = format!("{} ({})", curve.name(), curve.version());
+                    if let Some(summary) = adaptive_hf.as_ref() {
+                        line.push_str(&format!(". {}", summary.readme_line()));
+                    }
+                    line
+                }
                 None => "SECS adaptive flat target".to_string(),
             },
             match shared_low_frequency_hz {
@@ -13122,6 +14671,7 @@ impl LiveMeasurementState {
             trial_zip_path: trial_zip_path.display().to_string(),
             group_delay_report,
             frequency_response: frequency_response_plot,
+            adaptive_hf,
             warning: {
                 let mut warning =
                     "Predicted-only SECS trial designed from P0 alone. Final export stays locked until a new P0 L/R capture is made with this exact filter active in Roon."
@@ -13181,10 +14731,15 @@ impl LiveMeasurementState {
 }
 
 /// Accepted baseline seats carrying impulse evidence, in a deterministic
-/// order, with the Phase 4 seat weights (P0 and P0_END weigh 1.0 each when
-/// the end repeat exists, P0 alone weighs 2.0, every surrounding seat 1.0).
-/// Seats whose pair is incomplete or predates impulse storage are skipped,
-/// mirroring the magnitude design's seat collection.
+/// order. The central seat always weighs 2.0 against 1.0 per surrounding
+/// seat; P0 and its end repeat are ONE merged seat of that weight, realized
+/// as two impulse entries of 1.0 each because a magnitude average cannot be
+/// formed at the impulse level without an FFT - mathematically identical to
+/// a single energy-merged P0 at 2.0, and bit-identical to what every
+/// verified trial to date was designed with, which the final export's
+/// byte-binding to the trial WAV depends on. Seats whose pair is incomplete
+/// or predates impulse storage are skipped, mirroring the magnitude design's
+/// seat collection.
 /// One accepted baseline seat's identity, weight, and impulse pair.
 type SecsSeatImpulse = (String, f64, Vec<f64>, Vec<f64>);
 
@@ -13221,6 +14776,8 @@ fn secs_seat_impulses(session: &LiveSession) -> Result<Vec<SecsSeatImpulse>, Str
         }
         validate_stored_evidence(session, left)?;
         validate_stored_evidence(session, right)?;
+        // Half of the merged central seat's 2.0 when the end repeat exists
+        // (see the type docs above); the whole 2.0 when P0 stands alone.
         let weight = match id.as_str() {
             "P0" | "P0_END" if has_end_repeat => 1.0,
             "P0" => 2.0,
