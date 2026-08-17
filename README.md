@@ -73,8 +73,8 @@ https://gall.dcinside.com/mgallery/board/view/?id=speakers&no=514096&s_type=sear
 스윕을 다른 플레이어(Roon 등)에서 직접 재생하고 싶을 때만 쓰세요. 앱에 내장된 파일과
 같은 파일입니다.
 
-- [L 스윕 다운로드 링크](https://drive.google.com/file/d/1oUExSKQPChtX7unysMLhCc10M9hqM8DW/view?usp=sharing)
-- [R 스윕 다운로드 링크](https://drive.google.com/file/d/1FIxWwctuwBQ99odKo2pj-PBXEp3CO1Ce/view?usp=sharing)
+- ~~[L 스윕 다운로드 링크](https://drive.google.com/file/d/1oUExSKQPChtX7unysMLhCc10M9hqM8DW/view?usp=sharing)~~
+- ~~[R 스윕 다운로드 링크](https://drive.google.com/file/d/1FIxWwctuwBQ99odKo2pj-PBXEp3CO1Ce/view?usp=sharing)~~
 
 ### 0 - 측정 전 준비물
 
