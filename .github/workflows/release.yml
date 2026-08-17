@@ -30,7 +30,7 @@ jobs:
             rust-targets: aarch64-apple-darwin,x86_64-apple-darwin
             extra-args: --target universal-apple-darwin
           - os: windows-latest
-            bundles: msi,nsis
+            bundles: nsis
             artifact: windows-installers
             rust-targets: ""
             extra-args: ""
@@ -69,6 +69,18 @@ jobs:
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: npm run tauri --prefix apps/desktop -- build --bundles ${{ matrix.bundles }} ${{ matrix.extra-args }}
+
+      # MSI is a bonus, not the deliverable — the NSIS .exe above is what people
+      # actually double-click. Windows Installer's ProductVersion is three
+      # integers, so a pre-release version such as 0.1.5-a has no representation
+      # there. Bundling both in one command would let that failure take the NSIS
+      # installer down with it, so MSI gets its own best-effort step. The Rust
+      # artifacts are already compiled at this point, so this only re-runs the
+      # bundler.
+      - name: Build MSI (best effort)
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        run: npm run tauri --prefix apps/desktop -- build --bundles msi
 
       # State what actually happened rather than letting a download imply more
       # trust than the artifact carries.
