@@ -7,8 +7,12 @@ import {
   expectedSubTripletCount,
   formatMetric,
   hasAcceptedP0,
+  LIVE_BASELINE_POSITIONS,
   liveWizardStages,
   parseCrossoverCandidates,
+  SECS_CORRECTION_UPPER_LIMITS_HZ,
+  SECS_CRUSH_INTENSITY_LIMITS,
+  SECS_DEFAULT_SETTINGS,
   WIDE_BAND_MAIN_POSITION_ID,
   WIDE_BAND_SUB_POSITION_ID,
   type LiveCaptureKind,
@@ -75,6 +79,23 @@ function capture(
 }
 
 describe("live measurement workflow helpers", () => {
+  it("keeps the SECS bug-fix edition opt-in with the backend's option defaults", () => {
+    // Off by default: the original port keeps running until the user opts in.
+    expect(SECS_DEFAULT_SETTINGS.bugfixEdition).toBe(false);
+    // The edition's recommended option values, mirrored from the backend.
+    expect(SECS_DEFAULT_SETTINGS.correctionUpperHz).toBe(500);
+    expect(SECS_DEFAULT_SETTINGS.magnitudeDelaySearch).toBe(false);
+    expect(SECS_DEFAULT_SETTINGS.crushIntensity).toBe(0.3);
+    // The target's HF rolloff applies by default (cut-only above the limit).
+    expect(SECS_DEFAULT_SETTINGS.hfTargetFollow).toBe(true);
+    // The edition requires the improved phase path, which is the default.
+    expect(SECS_DEFAULT_SETTINGS.improvedPhase).toBe(true);
+    // The input limits match the backend's validation; 20000 Hz is the
+    // documented "original full-band behavior" end of the range.
+    expect(SECS_CORRECTION_UPPER_LIMITS_HZ).toEqual({ min: 200, max: 20000 });
+    expect(SECS_CRUSH_INTENSITY_LIMITS).toEqual({ min: 0, max: 1 });
+  });
+
   it("requires an accepted L/R pair before admitting P0", () => {
     const captures: Record<string, LiveCaptureSummary> = {};
     captures[captureKey("baseline", "P0", "left")] = capture(
@@ -91,6 +112,25 @@ describe("live measurement workflow helpers", () => {
     );
     expect(hasAcceptedP0(captures, "baseline")).toBe(true);
     expect(acceptedPairCount(captures)).toBe(1);
+  });
+
+  it("measures the listening centre once: nine positions, no end repeat", () => {
+    // The centre is a single capture. The end repeat was removed because the
+    // microphone is replaced by hand, so a second centre pass is a different
+    // seat above a few hundred Hz rather than a repeat of P0 - and the SECS
+    // excess-phase correction is built from the P0 capture alone.
+    expect(LIVE_BASELINE_POSITIONS).toEqual([
+      "P0",
+      "P1",
+      "P2",
+      "P3",
+      "P4",
+      "P5",
+      "P6",
+      "P7",
+      "P8",
+    ]);
+    expect(LIVE_BASELINE_POSITIONS).not.toContain("P0_END");
   });
 
   it("does not count a rejected surrounding-position pair", () => {

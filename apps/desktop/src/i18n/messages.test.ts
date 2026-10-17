@@ -168,6 +168,49 @@ describe("localized wizard copy", () => {
     }
   });
 
+  it("keeps the SECS bug-fix edition honest in both locales", () => {
+    for (const locale of Object.values(messages)) {
+      const copy = locale.liveMeasurement;
+      // The edition is still predicted-only until a measurement verifies it,
+      // and so far it has only been checked on synthetic signals - both
+      // locales must say both, and must say how to get the original back.
+      expect(copy.secsBugfixEditionNote).toMatch(/예측 전용|predicted-only/i);
+      expect(copy.secsBugfixEditionNote).toMatch(/합성|synthetic/i);
+      expect(copy.secsBugfixEditionNote).toMatch(/원본|original/i);
+      // It always runs on the improved phase path.
+      expect(copy.secsBugfixEditionNeedsImproved).toMatch(/개량|improved/i);
+      // 20000 Hz is the documented way back to the original band.
+      expect(copy.secsCorrectionUpperNote).toContain("20000");
+      // The delay fix costs latency; the note must say so.
+      expect(copy.secsMagnitudeDelaySearchNote).toMatch(/지연|latency/i);
+      expect(copy.secsCrushIntensityNote).toContain("0.3");
+      // Following the HF target only cuts and leaves the bass correction alone.
+      expect(copy.secsHfTargetFollowNote).toMatch(/깎기만|only cut/i);
+      expect(copy.secsHfTargetFollowNote).toMatch(/올리지 않|never lifted/i);
+      expect(copy.secsHfTargetFollowNote).toMatch(/저역|bass/i);
+      // The 1-10 kHz score measures reverberant decay, not phase.
+      expect(copy.secsDecayScore).toMatch(/감쇠|decay/i);
+      expect(copy.secsDecayScore).not.toMatch(/위상|phase/i);
+      expect(copy.secsEditionUpTo).toContain("{hz}");
+      expect(copy.secsEditionCrush).toContain("{value}");
+      for (const key of [
+        "secsBugfixEdition",
+        "secsCorrectionUpper",
+        "secsMagnitudeDelaySearch",
+        "secsCrushIntensity",
+        "secsEdition",
+        "secsEditionOriginal",
+        "secsEditionBugfix",
+        "secsEditionFullBand",
+        "secsEditionDelaySearch",
+        "secsHfTargetFollow",
+        "secsEditionHfFollow",
+      ] as const) {
+        expect(copy[key].trim()).not.toBe("");
+      }
+    }
+  });
+
   it("keeps the default target attributed to Dirac and its HF rolloff honest", () => {
     for (const locale of Object.values(messages)) {
       const copy = locale.liveMeasurement;

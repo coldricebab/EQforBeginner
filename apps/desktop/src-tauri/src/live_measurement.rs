@@ -35,8 +35,14 @@ use eqforbeginner_dsp_core::phase6::{
 use eqforbeginner_dsp_core::secs::{
     design_secs_stereo_filter, secs_auto_delay_ceiling_ms, secs_band_group_delay_fit_ms,
     secs_filter_group_delay_report, secs_next_fast_len, secs_resample_poly, SecsConfig,
-    SecsResolutionMode, SECS_ALGORITHM_VERSION, SECS_AUTO_DELAY_MAX_MS, SECS_AUTO_DELAY_MIN_MS,
-    SECS_MAXIMUM_DELAY_CEILING_MS, SECS_PHASE_GUARD_VERSION,
+    SecsResolutionMode, SecsStereoDesign, SECS_ALGORITHM_VERSION, SECS_AUTO_DELAY_MAX_MS,
+    SECS_AUTO_DELAY_MIN_MS, SECS_MAXIMUM_DELAY_CEILING_MS, SECS_PHASE_GUARD_VERSION,
+};
+use eqforbeginner_dsp_core::secs_edited::{
+    design_secs_stereo_filter_edited, secs_edited_auto_delay_ceiling_ms, SecsEditedDelayChoice,
+    SecsEditedOptions, SECS_EDITED_CORRECTION_UPPER_DEFAULT_HZ,
+    SECS_EDITED_CORRECTION_UPPER_MIN_HZ, SECS_EDITED_CORRECTION_UPPER_OFF_HZ,
+    SECS_EDITED_CRUSH_INTENSITY_DEFAULT, SECS_EDITED_VERSION,
 };
 use eqforbeginner_dsp_core::smoothing::gaussian_log_frequency_smooth_at_db;
 use eqforbeginner_dsp_core::spatial::weighted_energy_average_db;
@@ -230,11 +236,6 @@ const MINIMUM_APPLIED_CORRECTION_SCALE: f64 = 0.6;
 const MAXIMUM_APPLIED_CORRECTION_SCALE: f64 = 1.4;
 const PREDICTION_VERIFICATION_LOW_HZ: f64 = 20.0;
 const PREDICTION_VERIFICATION_HIGH_HZ: f64 = 650.0;
-const MAXIMUM_P0_REPEAT_LEVEL_SHIFT_DB: f64 = 1.0;
-// P0_END is hand-repositioned after the surrounding points, not held in a
-// measurement jig. Keep a loose gross-change guard while allowing normal
-// low-frequency modal differences from returning to the center area.
-const MAXIMUM_P0_REPEAT_SHAPE_RMSE_DB: f64 = 6.0;
 const MAGNITUDE_ONLY_MAXIMUM_TIMING_FIT_RMS_SAMPLES: f64 = 96.0;
 const TRUE_PEAK_OVERSAMPLE: usize = 4;
 const HEADROOM_SAFETY_MARGIN_DB: f64 = 1.0;
@@ -847,10 +848,59 @@ pub struct LiveSecsDesignSettings {
     /// the original 10 so they keep meaning what they ran.
     #[serde(default = "default_secs_maximum_delay_ms")]
     pub maximum_delay_ms: Option<f64>,
+    /// Bug-fix edition (app option, `secs_edited`): run the design through the
+    /// edition that fixes the defects reported in
+    /// `debugfiles/secs_bugfix_prompt.txt` instead of the parity-pinned
+    /// original port. The edition always applies its mandatory fixes
+    /// (normalized 5-band smoothing weights, a cut-only macro EQ, and a stereo
+    /// crop anchored on the earlier channel's main tap); the three fields
+    /// below tune its optional fixes and are ignored by the original. It
+    /// requires `improved_phase`: its delay fix spends a budget with taper
+    /// headroom, which only the improved path's extended window realizes
+    /// (the original full-taper window at a 10 ms budget was measured to cut
+    /// 25 Hz by 7.7 dB on a bass-managed speaker). Defaults to `false` so
+    /// settings stored before this field existed keep meaning what they ran.
+    #[serde(default)]
+    pub bugfix_edition: bool,
+    /// Bug-fix edition: correction upper limit, Hz (200-20000). The macro EQ
+    /// fades to unity between this frequency and twice it, and the level
+    /// anchor moves to the uncorrected band above it, so the reverberant
+    /// in-room treble no longer brightens the direct sound. 20000 restores
+    /// the original full-band macro EQ and its level anchor exactly.
+    #[serde(default = "default_secs_correction_upper_hz")]
+    pub correction_upper_hz: f64,
+    /// Bug-fix edition: `true` restores the original delay choice (the
+    /// magnitude-only 2-10 ms search inside the original budget). `false`,
+    /// the edition's default, designs at the resolved delay ceiling, which
+    /// the automatic setting resolves with taper headroom above the measured
+    /// low-band requirement.
+    #[serde(default)]
+    pub magnitude_delay_search: bool,
+    /// Bug-fix edition: peak-crush exponent below 500 Hz (0-1). SECS.py tied
+    /// it to the resolution (0.3/0.6/1.0), which cut narrow peaks without
+    /// filling dips and pulled the 100-400 Hz level down; the edition
+    /// defaults to 0.3.
+    #[serde(default = "default_secs_crush_intensity")]
+    pub crush_intensity: f64,
+    /// Bug-fix edition: above the correction upper limit keep the (cut-only)
+    /// macro EQ following the target, so the target curve's HF rolloff still
+    /// shapes the treble while reverberant treble below the target is never
+    /// lifted. The product default is on; settings stored before this field
+    /// existed deserialize to `false`, the fade-out they ran.
+    #[serde(default)]
+    pub hf_target_follow: bool,
 }
 
 fn default_secs_maximum_delay_ms() -> Option<f64> {
     Some(SECS_AUTO_DELAY_MAX_MS)
+}
+
+fn default_secs_correction_upper_hz() -> f64 {
+    SECS_EDITED_CORRECTION_UPPER_DEFAULT_HZ
+}
+
+fn default_secs_crush_intensity() -> f64 {
+    SECS_EDITED_CRUSH_INTENSITY_DEFAULT
 }
 
 impl Default for LiveSecsDesignSettings {
@@ -872,6 +922,13 @@ impl Default for LiveSecsDesignSettings {
             // Automatic ceiling: the design measures the room's late-bass
             // requirement and resolves the smallest covering ceiling.
             maximum_delay_ms: None,
+            // The bug-fix edition is opt-in; its option defaults are the
+            // edition's recommended values.
+            bugfix_edition: false,
+            correction_upper_hz: SECS_EDITED_CORRECTION_UPPER_DEFAULT_HZ,
+            magnitude_delay_search: false,
+            crush_intensity: SECS_EDITED_CRUSH_INTENSITY_DEFAULT,
+            hf_target_follow: true,
         }
     }
 }
@@ -941,10 +998,32 @@ fn validate_secs_settings(settings: &LiveSecsDesignSettings) -> Result<(), Strin
         ("bassBoostDb", settings.bass_boost_db),
         ("bassFrequencyHz", settings.bass_frequency_hz),
         ("curtainHz", settings.curtain_hz),
+        ("correctionUpperHz", settings.correction_upper_hz),
+        ("crushIntensity", settings.crush_intensity),
     ] {
         if !value.is_finite() {
             return Err(format!("SECS setting {label} must be finite"));
         }
+    }
+    // The bug-fix edition fields are range-checked even when the edition is
+    // off: they are stored provenance, and a stored value must always be one
+    // that could have run.
+    if !(SECS_EDITED_CORRECTION_UPPER_MIN_HZ..=SECS_EDITED_CORRECTION_UPPER_OFF_HZ)
+        .contains(&settings.correction_upper_hz)
+    {
+        return Err(format!(
+            "SECS correction upper limit must be between {SECS_EDITED_CORRECTION_UPPER_MIN_HZ:.0} and {SECS_EDITED_CORRECTION_UPPER_OFF_HZ:.0} Hz"
+        ));
+    }
+    if !(0.0..=1.0).contains(&settings.crush_intensity) {
+        return Err("SECS peak-crush intensity must be between 0 and 1".to_string());
+    }
+    // The edition's delay fix designs at a budget with taper headroom, which
+    // only the improved path's extended window realizes; at the original
+    // full-taper 10 ms window the same choice was measured to damage deep
+    // bass, so the combination is refused instead of silently degraded.
+    if settings.bugfix_edition && !settings.improved_phase {
+        return Err("the SECS bug-fix edition requires the improved phase option".to_string());
     }
     if !(0.0..=24.0).contains(&settings.max_boost_db) {
         return Err("SECS boost ceiling must be between 0 and 24 dB".to_string());
@@ -1052,6 +1131,119 @@ fn secs_config_for(
         phase_guard: settings.improved_phase,
         maximum_delay_ms,
     }
+}
+
+/// The bug-fix edition's optional fixes as the settings choose them.
+fn secs_edited_options_for(settings: &LiveSecsDesignSettings) -> SecsEditedOptions {
+    SecsEditedOptions {
+        correction_upper_hz: settings.correction_upper_hz,
+        delay_choice: if settings.magnitude_delay_search {
+            SecsEditedDelayChoice::MagnitudeSearch
+        } else {
+            SecsEditedDelayChoice::Ceiling
+        },
+        crush_intensity: settings.crush_intensity,
+        hf_target_follow: settings.hf_target_follow,
+    }
+}
+
+/// The SECS design the settings select: the parity-pinned original port or
+/// the bug-fix edition. The trial and the final export both design through
+/// here, so the export's 48 kHz member reproduces the verified trial byte for
+/// byte whichever edition ran.
+fn run_secs_design(
+    settings: &LiveSecsDesignSettings,
+    left_ir: &[f64],
+    right_ir: &[f64],
+    config: &SecsConfig,
+    delay_candidates_ms: Option<&[f64]>,
+    magnitude_overrides: Option<(&[f64], &[f64])>,
+) -> eqforbeginner_dsp_core::DspResult<SecsStereoDesign> {
+    if settings.bugfix_edition {
+        design_secs_stereo_filter_edited(
+            left_ir,
+            right_ir,
+            config,
+            &secs_edited_options_for(settings),
+            delay_candidates_ms,
+            magnitude_overrides,
+        )
+    } else {
+        design_secs_stereo_filter(
+            left_ir,
+            right_ir,
+            config,
+            delay_candidates_ms,
+            magnitude_overrides,
+        )
+    }
+}
+
+/// Version label recorded on every SECS artifact: the base port, plus each
+/// optional layer that actually ran.
+fn secs_algorithm_version_label(settings: &LiveSecsDesignSettings) -> String {
+    let mut label = SECS_ALGORITHM_VERSION.to_string();
+    if settings.improved_phase {
+        label.push('+');
+        label.push_str(SECS_PHASE_GUARD_VERSION);
+    }
+    if settings.bugfix_edition {
+        label.push('+');
+        label.push_str(SECS_EDITED_VERSION);
+    }
+    label
+}
+
+/// Upper end of the band a SECS design corrects in magnitude, and where its
+/// fade to unity ends, for the result chart. The original corrects the full
+/// band (its macro EQ is band-unlimited). The bug-fix edition's macro EQ
+/// fades out above the correction upper limit, but the minimum-phase step
+/// still reaches the curtain, so the larger of the two is where correction
+/// starts to fade.
+fn secs_magnitude_correction_band_hz(settings: &LiveSecsDesignSettings) -> (f64, f64) {
+    // Following the HF target keeps the (cut-only) macro EQ active over the
+    // whole band, so the correction does not fade out there either.
+    if !settings.bugfix_edition
+        || settings.correction_upper_hz >= SECS_EDITED_CORRECTION_UPPER_OFF_HZ
+        || settings.hf_target_follow
+    {
+        return (20_000.0, 20_000.0);
+    }
+    let high = settings.correction_upper_hz.max(settings.curtain_hz);
+    (high.min(20_000.0), (2.0 * high).min(20_000.0))
+}
+
+/// README line describing which SECS edition designed the filter.
+fn secs_edition_readme_line(settings: &LiveSecsDesignSettings) -> String {
+    if !settings.bugfix_edition {
+        return "original SECS port (numerically pinned to SECS.py)".to_string();
+    }
+    let upper = if settings.correction_upper_hz >= SECS_EDITED_CORRECTION_UPPER_OFF_HZ {
+        "off (original full-band macro EQ)".to_string()
+    } else if settings.hf_target_follow {
+        format!(
+            "{:.0} Hz (level anchored above it; above it the macro EQ only cuts\n\
+             toward the target, so the target's HF rolloff applies)",
+            settings.correction_upper_hz
+        )
+    } else {
+        format!(
+            "{:.0} Hz (macro EQ fades out by {:.0} Hz; level anchored above it)",
+            settings.correction_upper_hz,
+            2.0 * settings.correction_upper_hz
+        )
+    };
+    format!(
+        "SECS bug-fix edition ({SECS_EDITED_VERSION}): normalized 5-band smoothing\n\
+         weights, cut-only macro EQ, stereo crop anchored on the earlier main tap;\n\
+         correction upper limit {upper}; delay {}; peak-crush exponent {:.2}",
+        if settings.magnitude_delay_search {
+            "chosen by the original magnitude-only search"
+        } else {
+            "= the resolved ceiling (automatic ceilings keep taper headroom)"
+        },
+        settings.crush_intensity,
+    )
 }
 
 /// Summary of a predicted-only SECS trial design (advanced option).
@@ -1550,11 +1742,16 @@ fn validate_position_id(position_id: &str, kind: LiveCaptureKind) -> Result<Stri
         ));
     }
     let allowed: BTreeSet<&str> = match kind {
-        LiveCaptureKind::Baseline => [
-            "P0", "P0_END", "P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8",
-        ]
-        .into_iter()
-        .collect(),
+        // The central seat is captured ONCE. An end repeat used to exist here;
+        // it was removed because the microphone is repositioned by hand, so the
+        // second capture is a different seat above a few hundred Hz rather than
+        // a repeat, and blending it into P0 left the SECS design with a
+        // two-capture magnitude against a single-capture excess phase. Legacy
+        // `P0_END` snapshots therefore fail this check and are skipped by the
+        // measurement-cache restore, which is the intended migration.
+        LiveCaptureKind::Baseline => ["P0", "P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8"]
+            .into_iter()
+            .collect(),
         // Closed-loop verification is a central-seat experiment: the filter is
         // judged where it was designed to be judged.
         LiveCaptureKind::Verification => ["P0"].into_iter().collect(),
@@ -3647,61 +3844,6 @@ mod tests {
     }
 
     #[test]
-    fn p0_repeat_gate_separates_level_shift_from_response_shape() {
-        let frequencies = (20..=500).map(f64::from).collect::<Vec<_>>();
-        let initial = frequencies
-            .iter()
-            .map(|frequency| -20.0 * (frequency / 100.0).log10())
-            .collect::<Vec<_>>();
-        let stable = initial
-            .iter()
-            .enumerate()
-            .map(|(index, value)| value + 0.2 + 0.1 * (index as f64 / 20.0).sin())
-            .collect::<Vec<_>>();
-        validate_p0_repeat_response(&frequencies, &initial, &stable, LiveChannel::Left).unwrap();
-
-        let level_changed = initial.iter().map(|value| value + 1.2).collect::<Vec<_>>();
-        assert!(validate_p0_repeat_response(
-            &frequencies,
-            &initial,
-            &level_changed,
-            LiveChannel::Left,
-        )
-        .unwrap_err()
-        .contains("level shift"));
-
-        // Returning a microphone stand to the center after the eight
-        // surrounding measurements naturally changes modal detail. This must remain a
-        // useful second center sample rather than demand jig-level placement.
-        let realistically_repositioned = initial
-            .iter()
-            .enumerate()
-            .map(|(index, value)| value + 6.8 * (index as f64 / 12.0).sin())
-            .collect::<Vec<_>>();
-        validate_p0_repeat_response(
-            &frequencies,
-            &initial,
-            &realistically_repositioned,
-            LiveChannel::Right,
-        )
-        .unwrap();
-
-        let shape_changed = initial
-            .iter()
-            .enumerate()
-            .map(|(index, value)| value + 10.0 * (index as f64 / 12.0).sin())
-            .collect::<Vec<_>>();
-        assert!(validate_p0_repeat_response(
-            &frequencies,
-            &initial,
-            &shape_changed,
-            LiveChannel::Right,
-        )
-        .unwrap_err()
-        .contains("response-shape"));
-    }
-
-    #[test]
     fn bundled_umik_calibration_imports_through_the_live_session() {
         let temporary = tempdir().unwrap();
         let state = LiveMeasurementState::default();
@@ -4169,6 +4311,262 @@ mod tests {
             serde_json::to_value(LiveSecsTargetCurve::Custom).unwrap(),
             serde_json::json!("custom")
         );
+    }
+
+    #[test]
+    fn the_secs_bugfix_edition_settings_validate_and_deserialize_to_what_they_ran() {
+        // Records stored before the edition existed carry none of its fields:
+        // they ran the original port and must keep meaning that; the option
+        // fields fall back to the edition's recommended values.
+        let era_fields = serde_json::json!({
+            "maxBoostDb": 6.0,
+            "tiltDbPerOctave": 0.0,
+            "bassBoostDb": 0.0,
+            "bassFrequencyHz": 80.0,
+            "resolution": "normal",
+            "curtainHz": 300.0,
+            "latencyMode": "normal",
+            "fixedDelayMs": null,
+            "multiPosition": true,
+            "improvedPhase": true,
+            "maximumDelayMs": null,
+        });
+        let old: LiveSecsDesignSettings = serde_json::from_value(era_fields).unwrap();
+        assert!(!old.bugfix_edition);
+        assert_eq!(
+            old.correction_upper_hz,
+            SECS_EDITED_CORRECTION_UPPER_DEFAULT_HZ
+        );
+        assert!(!old.magnitude_delay_search);
+        // ... and the fade-out above the upper limit those settings ran.
+        assert!(!old.hf_target_follow);
+        assert!(LiveSecsDesignSettings::default().hf_target_follow);
+        assert_eq!(old.crush_intensity, SECS_EDITED_CRUSH_INTENSITY_DEFAULT);
+        assert!(validate_secs_settings(&old).is_ok());
+        // The product default leaves the edition off and round-trips.
+        let default = LiveSecsDesignSettings::default();
+        assert!(!default.bugfix_edition);
+        let round_tripped: LiveSecsDesignSettings =
+            serde_json::from_value(serde_json::to_value(default).unwrap()).unwrap();
+        assert_eq!(round_tripped, default);
+        let edition = LiveSecsDesignSettings {
+            bugfix_edition: true,
+            ..LiveSecsDesignSettings::default()
+        };
+        assert!(validate_secs_settings(&edition).is_ok());
+
+        // The edition designs at a budget only the improved path's extended
+        // window realizes, so it refuses the original phase path.
+        let without_guard = LiveSecsDesignSettings {
+            improved_phase: false,
+            maximum_delay_ms: Some(SECS_AUTO_DELAY_MAX_MS),
+            ..edition
+        };
+        assert!(validate_secs_settings(&without_guard)
+            .unwrap_err()
+            .contains("requires the improved phase"));
+        // Its option ranges are checked even while the edition is off: they
+        // are stored provenance.
+        for upper in [150.0, 25_000.0, f64::NAN] {
+            let settings = LiveSecsDesignSettings {
+                correction_upper_hz: upper,
+                ..LiveSecsDesignSettings::default()
+            };
+            assert!(validate_secs_settings(&settings).is_err(), "{upper}");
+        }
+        for crush in [-0.1, 1.5] {
+            let settings = LiveSecsDesignSettings {
+                crush_intensity: crush,
+                ..LiveSecsDesignSettings::default()
+            };
+            assert!(validate_secs_settings(&settings)
+                .unwrap_err()
+                .contains("peak-crush"));
+        }
+        // 20 kHz is the documented "original behavior" end of the range.
+        let legacy_upper = LiveSecsDesignSettings {
+            correction_upper_hz: SECS_EDITED_CORRECTION_UPPER_OFF_HZ,
+            ..edition
+        };
+        assert!(validate_secs_settings(&legacy_upper).is_ok());
+        assert_eq!(
+            secs_magnitude_correction_band_hz(&legacy_upper),
+            (20_000.0, 20_000.0)
+        );
+        // Following the HF target (default) keeps the cut-only macro EQ over
+        // the whole band; fading it out marks where correction ends.
+        assert_eq!(
+            secs_magnitude_correction_band_hz(&edition),
+            (20_000.0, 20_000.0)
+        );
+        let faded = LiveSecsDesignSettings {
+            hf_target_follow: false,
+            ..edition
+        };
+        assert_eq!(secs_magnitude_correction_band_hz(&faded), (500.0, 1_000.0));
+        assert_eq!(
+            secs_magnitude_correction_band_hz(&LiveSecsDesignSettings::default()),
+            (20_000.0, 20_000.0)
+        );
+    }
+
+    #[test]
+    fn the_secs_bugfix_edition_designs_records_and_exports_byte_bound() {
+        let temporary = tempdir().unwrap();
+        let state = LiveMeasurementState::default();
+        state.start_session(temporary.path()).unwrap();
+        state
+            .import_calibration("umik.txt", "10 0\n24000 0\n")
+            .unwrap();
+        let wav = test_sweep_wav();
+        state.import_sweep(LiveChannel::Left, &wav).unwrap();
+        state.import_sweep(LiveChannel::Right, &wav).unwrap();
+        for channel in [LiveChannel::Left, LiveChannel::Right] {
+            let (_, _, sweep, calibration, evidence, _) = state
+                .begin_capture(
+                    LiveCaptureKind::Baseline,
+                    channel,
+                    "P0",
+                    "synthetic::input",
+                    0,
+                )
+                .unwrap();
+            let capture = synthetic_capture(&sweep.samples, &[0.2]);
+            let summary = analyze_and_store_capture(
+                &state,
+                LiveCaptureKind::Baseline,
+                channel,
+                "P0".into(),
+                &sweep,
+                &calibration,
+                &evidence,
+                &capture,
+            )
+            .unwrap();
+            state.finish_capture();
+            assert!(summary.accepted, "{:?}", summary.issue_codes);
+        }
+        let fixture = SyntheticRoomFixture::phase1_48k().unwrap();
+        {
+            let mut guard = state.session.lock().unwrap();
+            let session = guard.as_mut().unwrap();
+            for (channel, impulse) in [
+                (LiveChannel::Left, &fixture.left_impulses[0]),
+                (LiveChannel::Right, &fixture.right_impulses[0]),
+            ] {
+                let stored = session
+                    .measurements
+                    .get_mut(&(LiveCaptureKind::Baseline, "P0".to_string(), channel))
+                    .unwrap();
+                stored.calibrated_impulse_samples = impulse.clone();
+            }
+        }
+        let trial_readme = |zip_path: &str| -> String {
+            let bytes = fs::read(zip_path).unwrap();
+            let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+            let mut text = String::new();
+            std::io::Read::read_to_string(&mut archive.by_name("README.txt").unwrap(), &mut text)
+                .unwrap();
+            text
+        };
+        let stored_taps = |state: &LiveMeasurementState| -> Vec<f64> {
+            let guard = state.session.lock().unwrap();
+            guard
+                .as_ref()
+                .unwrap()
+                .secs_design
+                .as_ref()
+                .unwrap()
+                .left_taps
+                .clone()
+        };
+
+        // The original port stays the default and says so.
+        let original = state
+            .design_secs_trial(LiveSecsDesignSettings::default())
+            .unwrap();
+        assert_eq!(
+            original.algorithm_version,
+            format!("{SECS_ALGORITHM_VERSION}+{SECS_PHASE_GUARD_VERSION}")
+        );
+        assert!(trial_readme(&original.trial_zip_path).contains("original SECS port"));
+        assert_eq!(original.frequency_response.correction_high_hz, 20_000.0);
+        let original_taps = stored_taps(&state);
+
+        // The bug-fix edition: opted into, labeled, described, and a
+        // different filter. Its automatic ceiling keeps taper headroom above
+        // the measured requirement and the design runs AT that ceiling.
+        let edition_settings = LiveSecsDesignSettings {
+            bugfix_edition: true,
+            ..LiveSecsDesignSettings::default()
+        };
+        let edition = state.design_secs_trial(edition_settings).unwrap();
+        assert!(edition.settings.bugfix_edition);
+        assert_eq!(
+            edition.algorithm_version,
+            format!("{SECS_ALGORITHM_VERSION}+{SECS_PHASE_GUARD_VERSION}+{SECS_EDITED_VERSION}")
+        );
+        let readme = trial_readme(&edition.trial_zip_path);
+        assert!(readme.contains("SECS bug-fix edition"), "{readme}");
+        assert!(readme.contains("correction upper limit 500 Hz"), "{readme}");
+        assert!(readme.contains("target's HF rolloff applies"), "{readme}");
+        let edition_taps = stored_taps(&state);
+        assert_ne!(original_taps, edition_taps);
+        let expected_ceiling = secs_edited_auto_delay_ceiling_ms(
+            &fixture.left_impulses[0],
+            &fixture.right_impulses[0],
+            PROJECT_SAMPLE_RATE_HZ,
+        )
+        .unwrap();
+        assert_eq!(
+            edition.maximum_delay_resolved_ms,
+            expected_ceiling.ceiling_ms
+        );
+        assert_eq!(
+            edition.delay_requirement_ms,
+            Some(expected_ceiling.requirement_ms)
+        );
+        assert_eq!(edition.auto_delay_ms, edition.maximum_delay_resolved_ms);
+        // Following the HF target (default), the cut-only macro EQ spans the
+        // whole band, so the chart shows no fade-out band.
+        assert_eq!(edition.frequency_response.correction_high_hz, 20_000.0);
+        assert_eq!(edition.frequency_response.taper_end_hz, 20_000.0);
+        // The improved path's group-delay gate still judges the edition.
+        assert!(edition.group_delay_report.iter().all(|band| !band.exceeded));
+
+        // The original delay choice can be restored inside the edition: the
+        // original ceiling rule and the magnitude-only search.
+        let searched = state
+            .design_secs_trial(LiveSecsDesignSettings {
+                magnitude_delay_search: true,
+                ..edition_settings
+            })
+            .unwrap();
+        let original_ceiling = secs_auto_delay_ceiling_ms(
+            &fixture.left_impulses[0],
+            &fixture.right_impulses[0],
+            PROJECT_SAMPLE_RATE_HZ,
+        )
+        .unwrap();
+        assert_eq!(
+            searched.maximum_delay_resolved_ms,
+            original_ceiling.ceiling_ms
+        );
+        assert!(trial_readme(&searched.trial_zip_path)
+            .contains("chosen by the original magnitude-only search"));
+
+        // Redesign the default edition and export it predicted-only: the
+        // export redesigns its 48 kHz member through the same edition and
+        // refuses unless those bytes equal the trial WAV, so success here is
+        // the byte binding holding for the edition.
+        state.design_secs_trial(edition_settings).unwrap();
+        let exported = state.finalize_export_skipping_verification().unwrap();
+        assert!(exported.algorithm_version.contains(SECS_EDITED_VERSION));
+        let project_text = fs::read_to_string(&exported.project_path).unwrap();
+        assert!(project_text.contains(&format!(
+            "\"correctionAlgorithm\": \"{SECS_ALGORITHM_VERSION}+{SECS_EDITED_VERSION}\""
+        )));
+        assert!(project_text.contains("\"bugfixEdition\": true"));
     }
 
     #[test]
@@ -6839,6 +7237,35 @@ mod tests {
                     .insert((LiveCaptureKind::Baseline, "P1".to_string(), channel), seat);
             }
         }
+        // The listening centre is captured once and carries the whole 2.0
+        // spatial weight in both collectors; the old end repeat that used to
+        // split it into 1.0 + 1.0 no longer exists, and its position id is no
+        // longer part of the baseline vocabulary (so a legacy `P0_END`
+        // snapshot is skipped by the measurement-cache restore).
+        {
+            let guard = state.session.lock().unwrap();
+            let session = guard.as_ref().unwrap();
+            let seats = secs_seat_impulses(session).unwrap();
+            let weights = seats
+                .iter()
+                .map(|(id, weight, _, _)| (id.as_str(), *weight))
+                .collect::<Vec<_>>();
+            assert_eq!(weights, vec![("P0", 2.0), ("P1", 1.0)]);
+            let response_set = build_response_set(session).unwrap();
+            let magnitude_weights = response_set
+                .positions
+                .iter()
+                .map(|position| (position.id.as_str(), position.weight))
+                .collect::<Vec<_>>();
+            assert_eq!(magnitude_weights, vec![("P0", 2.0), ("P1", 1.0)]);
+        }
+        assert!(validate_position_id("P0_END", LiveCaptureKind::Baseline)
+            .unwrap_err()
+            .contains("unsupported"));
+        for id in ["P0", "P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8"] {
+            validate_position_id(id, LiveCaptureKind::Baseline).unwrap();
+        }
+
         let multi = state
             .design_secs_trial(LiveSecsDesignSettings::default())
             .unwrap();
@@ -8173,11 +8600,12 @@ fn validate_secs_closed_loop(
         verified_left_db: verified_left_plot,
         verified_right_db: verified_right_plot,
         verified_average_db: verified_average_plot,
-        // SECS corrects the full displayed band; the judged band above is
-        // still 20-650 Hz (see the function comment).
+        // The original SECS corrects the full displayed band (the bug-fix
+        // edition stops at its correction upper limit); the judged band
+        // above is still 20-650 Hz either way (see the function comment).
         correction_low_hz: 20.0,
-        correction_high_hz: 20_000.0,
-        taper_end_hz: 20_000.0,
+        correction_high_hz: secs_magnitude_correction_band_hz(&secs.settings).0,
+        taper_end_hz: secs_magnitude_correction_band_hz(&secs.settings).1,
         protected_dip_frequencies_hz: Vec::new(),
         corrected_peak_frequencies_hz: Vec::new(),
     };
@@ -8687,7 +9115,9 @@ struct FinalSecsProjectSnapshot {
     subwoofer_search: Option<LiveSubwooferSearchSummary>,
     subwoofer_optimization: Option<LiveSubwooferOptimizationSummary>,
     verification_state: &'static str,
-    correction_algorithm: &'static str,
+    /// The base port, plus the bug-fix edition when it designed the filter
+    /// (the design summary below carries the complete label and settings).
+    correction_algorithm: String,
     deconvolution_algorithm: &'static str,
     calibration_algorithm: &'static str,
     closed_loop_algorithm: &'static str,
@@ -9549,7 +9979,10 @@ impl LiveMeasurementState {
             config.target_delay_ms = locked_delay_ms;
             config.target_overlay = secs.target_overlay.clone();
             config.shared_low_frequency_hz = secs.shared_low_frequency_hz;
-            let design = design_secs_stereo_filter(
+            // Same edition, same options as the verified trial (the stored
+            // settings carry both), so the byte binding below can hold.
+            let design = run_secs_design(
+                &secs.settings,
                 &left_ir,
                 &right_ir,
                 &config,
@@ -9857,6 +10290,7 @@ impl LiveMeasurementState {
         } else {
             "trial's automatic"
         };
+        let edition_readme_line = secs_edition_readme_line(&secs.settings);
         let readme = format!(
             "EQforBeginner {} developer-beta convolution (SECS advanced option)\n\
              Project: {}\n\
@@ -9868,6 +10302,7 @@ impl LiveMeasurementState {
              limits) plus minimum-phase magnitude EQ toward an adaptive target;\n\
              designed from the central P0 pair only. Other seats are not part of\n\
              this design's evidence.\n\
+             Edition: {edition_readme_line}.\n\
              {verification_readme_line}\n\
              Native rates: 44.1, 48, 88.2, 96, 176.4, 192 kHz - the 48 kHz member is\n\
              byte-identical to the trial WAV ({delay_wording} delay of\n\
@@ -9917,7 +10352,11 @@ impl LiveMeasurementState {
             } else {
                 "predicted-only-verification-skipped-by-user"
             },
-            correction_algorithm: SECS_ALGORITHM_VERSION,
+            correction_algorithm: if secs.settings.bugfix_edition {
+                format!("{SECS_ALGORITHM_VERSION}+{SECS_EDITED_VERSION}")
+            } else {
+                SECS_ALGORITHM_VERSION.to_string()
+            },
             deconvolution_algorithm: KNOWN_SWEEP_DECONVOLUTION_VERSION,
             calibration_algorithm: calibration_algorithm_for(session),
             closed_loop_algorithm: LIVE_CLOSED_LOOP_VERSION,
@@ -13634,8 +14073,7 @@ fn position_sort_key(position_id: &str) -> (u8, &str) {
         "P6" => (6, position_id),
         "P7" => (7, position_id),
         "P8" => (8, position_id),
-        "P0_END" => (9, position_id),
-        _ => (10, position_id),
+        _ => (9, position_id),
     }
 }
 
@@ -13652,61 +14090,6 @@ fn median(values: &mut [f64]) -> Option<f64> {
     })
 }
 
-fn validate_p0_repeat_response(
-    frequencies_hz: &[f64],
-    initial_db: &[f64],
-    repeated_db: &[f64],
-    channel: LiveChannel,
-) -> Result<(), String> {
-    if frequencies_hz.len() != initial_db.len()
-        || initial_db.len() != repeated_db.len()
-        || frequencies_hz.is_empty()
-    {
-        return Err("P0 repeat response grids are inconsistent".to_string());
-    }
-    let differences = frequencies_hz
-        .iter()
-        .zip(initial_db)
-        .zip(repeated_db)
-        .filter_map(|((frequency, initial), repeated)| {
-            (*frequency >= 20.0 && *frequency <= 500.0).then_some(repeated - initial)
-        })
-        .collect::<Vec<_>>();
-    let mut reference_band = frequencies_hz
-        .iter()
-        .zip(initial_db)
-        .zip(repeated_db)
-        .filter_map(|((frequency, initial), repeated)| {
-            (*frequency >= 200.0 && *frequency <= 500.0).then_some(repeated - initial)
-        })
-        .collect::<Vec<_>>();
-    let level_shift_db = median(&mut reference_band)
-        .ok_or_else(|| "P0 repeat has no finite 200-500 Hz reference bins".to_string())?;
-    if differences.is_empty() || differences.iter().any(|value| !value.is_finite()) {
-        return Err("P0 repeat has no finite 20-500 Hz comparison bins".to_string());
-    }
-    let shape_rmse_db = (differences
-        .iter()
-        .map(|difference| (difference - level_shift_db).powi(2))
-        .sum::<f64>()
-        / differences.len() as f64)
-        .sqrt();
-    if level_shift_db.abs() > MAXIMUM_P0_REPEAT_LEVEL_SHIFT_DB
-        || shape_rmse_db > MAXIMUM_P0_REPEAT_SHAPE_RMSE_DB
-    {
-        return Err(format!(
-            "{} P0 end-repeat is unstable: level shift {level_shift_db:.2} dB \
-             (limit {:.2}), response-shape RMSE {shape_rmse_db:.2} dB (limit {:.2}). \
-             Keep volume/gain fixed, return the microphone approximately to the listening-center \
-             area, and repeat both channels.",
-            channel.as_str(),
-            MAXIMUM_P0_REPEAT_LEVEL_SHIFT_DB,
-            MAXIMUM_P0_REPEAT_SHAPE_RMSE_DB,
-        ));
-    }
-    Ok(())
-}
-
 fn timed_impulse(measurement: &StoredMeasurement) -> TimedCombinedImpulse {
     TimedCombinedImpulse {
         samples: measurement.calibrated_impulse_samples.clone(),
@@ -13714,19 +14097,6 @@ fn timed_impulse(measurement: &StoredMeasurement) -> TimedCombinedImpulse {
             / f64::from(PROJECT_SAMPLE_RATE_HZ),
         arrival_time_seconds: None,
     }
-}
-
-/// Per-bin energy mean of two dB curves: the merged magnitude of one seat
-/// measured twice. Averaging in energy matches `weighted_energy_average_db`,
-/// so a merged P0 at weight 2.0 equals the two repeats at weight 1.0 each.
-fn energy_mean_db(first_db: &[f64], second_db: &[f64]) -> Vec<f64> {
-    first_db
-        .iter()
-        .zip(second_db)
-        .map(|(first, second)| {
-            10.0 * (0.5 * (10f64.powf(first / 10.0) + 10f64.powf(second / 10.0))).log10()
-        })
-        .collect()
 }
 
 fn build_response_set(session: &LiveSession) -> Result<MeasuredStereoResponseSet, String> {
@@ -13739,44 +14109,9 @@ fn build_response_set(session: &LiveSession) -> Result<MeasuredStereoResponseSet
         .into_iter()
         .collect::<Vec<_>>();
     ids.sort_by(|left, right| position_sort_key(left).cmp(&position_sort_key(right)));
-    let has_end_repeat = ids.iter().any(|id| id == "P0_END");
-    if has_end_repeat {
-        for channel in [LiveChannel::Left, LiveChannel::Right] {
-            let initial =
-                session
-                    .measurements
-                    .get(&(LiveCaptureKind::Baseline, "P0".to_string(), channel));
-            let repeated = session.measurements.get(&(
-                LiveCaptureKind::Baseline,
-                "P0_END".to_string(),
-                channel,
-            ));
-            if let (Some(initial), Some(repeated)) = (initial, repeated) {
-                if initial.summary.accepted && repeated.summary.accepted {
-                    if initial.frequencies_hz != repeated.frequencies_hz {
-                        return Err(format!(
-                            "{} P0 end-repeat uses a different response grid",
-                            channel.as_str()
-                        ));
-                    }
-                    validate_p0_repeat_response(
-                        &initial.frequencies_hz,
-                        &initial.magnitude_db,
-                        &repeated.magnitude_db,
-                        channel,
-                    )?;
-                }
-            }
-        }
-    }
     let mut positions = Vec::new();
     let mut frequencies = None;
     for id in ids {
-        if id == "P0_END" {
-            // The end repeat is the same physical seat measured twice, not an
-            // independent position: it folds into the P0 entry below.
-            continue;
-        }
         let left =
             session
                 .measurements
@@ -13803,51 +14138,15 @@ fn build_response_set(session: &LiveSession) -> Result<MeasuredStereoResponseSet
         } else {
             frequencies = Some(left.frequencies_hz.clone());
         }
-        // The central seat always weighs 2.0 against 1.0 for every
-        // surrounding position. When the accepted end repeat exists its
-        // magnitudes are energy-averaged into P0 (halving that seat's
-        // uncorrelated capture noise); the merged seat keeps P0's own timed
-        // impulse, because averaging two impulses taken minutes apart smears
-        // the arrival phase the repeat exists to double-check, and the
-        // repeat's agreement was already enforced above.
+        // The central seat weighs 2.0 against 1.0 for every surrounding
+        // position - the spatial statistic, independent of how many times any
+        // seat was captured. The listening centre is captured exactly once:
+        // the former end repeat was blended in here, but a hand-repositioned
+        // second capture is a different seat above a few hundred Hz, and the
+        // blend also left the SECS design fitting a two-capture magnitude to a
+        // single-capture excess phase.
         let (weight, left_magnitude_db, right_magnitude_db) = if id == "P0" {
-            let repeat_pair = if has_end_repeat {
-                let repeat_left = session.measurements.get(&(
-                    LiveCaptureKind::Baseline,
-                    "P0_END".to_string(),
-                    LiveChannel::Left,
-                ));
-                let repeat_right = session.measurements.get(&(
-                    LiveCaptureKind::Baseline,
-                    "P0_END".to_string(),
-                    LiveChannel::Right,
-                ));
-                match (repeat_left, repeat_right) {
-                    (Some(repeat_left), Some(repeat_right))
-                        if repeat_left.summary.accepted && repeat_right.summary.accepted =>
-                    {
-                        validate_stored_evidence(session, repeat_left)?;
-                        validate_stored_evidence(session, repeat_right)?;
-                        if repeat_left.frequencies_hz != left.frequencies_hz
-                            || repeat_right.frequencies_hz != right.frequencies_hz
-                        {
-                            return Err("P0 end-repeat uses a different response grid".to_string());
-                        }
-                        Some((repeat_left, repeat_right))
-                    }
-                    _ => None,
-                }
-            } else {
-                None
-            };
-            match repeat_pair {
-                Some((repeat_left, repeat_right)) => (
-                    2.0,
-                    energy_mean_db(&left.magnitude_db, &repeat_left.magnitude_db),
-                    energy_mean_db(&right.magnitude_db, &repeat_right.magnitude_db),
-                ),
-                None => (2.0, left.magnitude_db.clone(), right.magnitude_db.clone()),
-            }
+            (2.0, left.magnitude_db.clone(), right.magnitude_db.clone())
         } else {
             (1.0, left.magnitude_db.clone(), right.magnitude_db.clone())
         };
@@ -14316,11 +14615,25 @@ impl LiveMeasurementState {
                     // follows it instead of the probe.
                     fixed.max(SECS_AUTO_DELAY_MAX_MS)
                 } else {
-                    let resolved = secs_auto_delay_ceiling_ms(
-                        &left_impulse,
-                        &right_impulse,
-                        PROJECT_SAMPLE_RATE_HZ,
-                    )
+                    // The bug-fix edition designs AT the ceiling, so its
+                    // automatic ceiling always keeps taper headroom above
+                    // the measured requirement; the original rule maps any
+                    // requirement up to 10 ms to exactly 10 ms, the budget
+                    // measured to be pathological when the requirement
+                    // nearly fills it.
+                    let resolved = if settings.bugfix_edition && !settings.magnitude_delay_search {
+                        secs_edited_auto_delay_ceiling_ms(
+                            &left_impulse,
+                            &right_impulse,
+                            PROJECT_SAMPLE_RATE_HZ,
+                        )
+                    } else {
+                        secs_auto_delay_ceiling_ms(
+                            &left_impulse,
+                            &right_impulse,
+                            PROJECT_SAMPLE_RATE_HZ,
+                        )
+                    }
                     .map_err(|error| format!("SECS delay-requirement probe failed: {error}"))?;
                     delay_requirement_ms = Some(resolved.requirement_ms);
                     resolved.ceiling_ms
@@ -14364,7 +14677,8 @@ impl LiveMeasurementState {
         let magnitude_overrides = averaged_magnitudes
             .as_ref()
             .map(|(left, right)| (left.as_slice(), right.as_slice()));
-        let design = design_secs_stereo_filter(
+        let design = run_secs_design(
+            &settings,
             &left_impulse,
             &right_impulse,
             &config,
@@ -14372,11 +14686,7 @@ impl LiveMeasurementState {
             magnitude_overrides,
         )
         .map_err(|error| format!("SECS design failed: {error}"))?;
-        let algorithm_version_label = if settings.improved_phase {
-            format!("{SECS_ALGORITHM_VERSION}+{SECS_PHASE_GUARD_VERSION}")
-        } else {
-            SECS_ALGORITHM_VERSION.to_string()
-        };
+        let algorithm_version_label = secs_algorithm_version_label(&settings);
 
         // Group-delay gate, judged from the designed taps alone: an all-pass
         // timing defect changes no magnitude anywhere, so no other design or
@@ -14539,6 +14849,7 @@ impl LiveMeasurementState {
         let predicted_right_plot = smooth(right_grid_hz, &predicted_right_db, "predicted P0 R")?;
         let predicted_average_plot =
             energy_average_pair(&predicted_left_plot, &predicted_right_plot)?;
+        let (correction_high_hz, taper_end_hz) = secs_magnitude_correction_band_hz(&settings);
         let frequency_response_plot = LiveFrequencyResponsePlot {
             algorithm_version: LIVE_RESULT_PLOT_VERSION,
             display_smoothing_fwhm_octaves: LIVE_RESULT_PLOT_SMOOTHING_FWHM_OCTAVES,
@@ -14556,8 +14867,8 @@ impl LiveMeasurementState {
             verified_right_db: Vec::new(),
             verified_average_db: Vec::new(),
             correction_low_hz: 20.0,
-            correction_high_hz: 20_000.0,
-            taper_end_hz: 20_000.0,
+            correction_high_hz,
+            taper_end_hz,
             protected_dip_frequencies_hz: Vec::new(),
             corrected_peak_frequencies_hz: Vec::new(),
         };
@@ -14590,6 +14901,7 @@ impl LiveMeasurementState {
              ?id=speakers&no=514096 - see THIRD-PARTY-NOTICES.md.\n\
              Correction: mixed phase (excess-phase inversion with per-band pre-ringing\n\
              limits) plus minimum-phase magnitude EQ toward an adaptive target.\n\
+             Edition: {}.\n\
              Settings: boost cap +{:.1} dB, tilt {:.1} dB/oct, bass +{:.1} dB @ {:.0} Hz,\n\
              resolution {:?}, curtain {:.0} Hz, latency {:?}, target delay {:.1} ms\n\
              ({}), delay ceiling {:.0} ms ({}).\n\
@@ -14599,6 +14911,7 @@ impl LiveMeasurementState {
              (one shared subwoofer reproduces both channels there): {}.\n\
              The filter is pre-normalized to a 0 dB spectral peak (applied\n\
              attenuation {:.2} dB), so no extra convolution preamp is required.\n",
+            secs_edition_readme_line(&settings),
             settings.max_boost_db,
             settings.tilt_db_per_octave,
             settings.bass_boost_db,
@@ -14609,6 +14922,12 @@ impl LiveMeasurementState {
             design.auto_delay_ms,
             if settings.fixed_delay_ms.is_some() {
                 "fixed by the user"
+            } else if settings.latency_mode != LiveSecsLatencyMode::Normal {
+                "minimum phase, no delay"
+            } else if resolved_maximum_delay_ms > SECS_AUTO_DELAY_MAX_MS
+                || (settings.bugfix_edition && !settings.magnitude_delay_search)
+            {
+                "set to the delay ceiling"
             } else {
                 "automatic search"
             },
@@ -14732,13 +15051,11 @@ impl LiveMeasurementState {
 
 /// Accepted baseline seats carrying impulse evidence, in a deterministic
 /// order. The central seat always weighs 2.0 against 1.0 per surrounding
-/// seat; P0 and its end repeat are ONE merged seat of that weight, realized
-/// as two impulse entries of 1.0 each because a magnitude average cannot be
-/// formed at the impulse level without an FFT - mathematically identical to
-/// a single energy-merged P0 at 2.0, and bit-identical to what every
-/// verified trial to date was designed with, which the final export's
-/// byte-binding to the trial WAV depends on. Seats whose pair is incomplete
-/// or predates impulse storage are skipped, mirroring the magnitude design's
+/// seat, and it is one capture: the end repeat that used to supply a second
+/// 1.0-weight central entry was removed, so the seat-weighted magnitude
+/// average and the P0-only excess-phase correction now describe the same
+/// single capture of the listening centre. Seats whose pair is incomplete or
+/// predates impulse storage are skipped, mirroring the magnitude design's
 /// seat collection.
 /// One accepted baseline seat's identity, weight, and impulse pair.
 type SecsSeatImpulse = (String, f64, Vec<f64>, Vec<f64>);
@@ -14753,7 +15070,6 @@ fn secs_seat_impulses(session: &LiveSession) -> Result<Vec<SecsSeatImpulse>, Str
         .into_iter()
         .collect();
     ids.sort_by(|left, right| position_sort_key(left).cmp(&position_sort_key(right)));
-    let has_end_repeat = ids.iter().any(|id| id == "P0_END");
     let mut seats = Vec::new();
     for id in ids {
         let left =
@@ -14776,13 +15092,8 @@ fn secs_seat_impulses(session: &LiveSession) -> Result<Vec<SecsSeatImpulse>, Str
         }
         validate_stored_evidence(session, left)?;
         validate_stored_evidence(session, right)?;
-        // Half of the merged central seat's 2.0 when the end repeat exists
-        // (see the type docs above); the whole 2.0 when P0 stands alone.
-        let weight = match id.as_str() {
-            "P0" | "P0_END" if has_end_repeat => 1.0,
-            "P0" => 2.0,
-            _ => 1.0,
-        };
+        // The central seat carries the whole 2.0 (see the type docs above).
+        let weight = if id == "P0" { 2.0 } else { 1.0 };
         seats.push((
             id,
             weight,

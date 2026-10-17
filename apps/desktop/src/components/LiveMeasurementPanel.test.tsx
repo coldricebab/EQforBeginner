@@ -4,6 +4,7 @@ import { messages } from "../i18n";
 import {
   CaptureProgressPanel,
   LiveMeasurementPanel,
+  SecsBugfixEditionOptions,
   SUBWOOFER_DELAY_DEFAULTS,
   SweepChannelAnalysis,
   SweepPlaybackToggle,
@@ -11,7 +12,10 @@ import {
   WIDE_BAND_SEARCH_DEFAULTS,
   ZipDownloadControl,
 } from "./LiveMeasurementPanel";
-import { parseCrossoverCandidates } from "../lib/liveMeasurement";
+import {
+  parseCrossoverCandidates,
+  SECS_DEFAULT_SETTINGS,
+} from "../lib/liveMeasurement";
 
 describe("LiveMeasurementPanel", () => {
   it("starts the sub delay search wide enough for a beginner to get a real answer", () => {
@@ -219,6 +223,44 @@ describe("LiveMeasurementPanel", () => {
     expect(html).toContain("<dt>시작 신호</dt><dd>R 채널");
     expect(html).toContain("42.5 dB 우세");
     expect(html).toContain("<dt>종료 신호</dt><dd>R 채널");
+  });
+
+  it("offers the SECS bug-fix edition as an opt-in with its options in both locales", () => {
+    // Off: only the opt-in checkbox and its note render, unchecked.
+    const off = renderToStaticMarkup(
+      <SecsBugfixEditionOptions
+        copy={messages.ko.liveMeasurement}
+        settings={SECS_DEFAULT_SETTINGS}
+        onChange={() => undefined}
+      />,
+    );
+    expect(off).toContain("SECS 버그 수정판 사용");
+    expect(off).not.toContain("checked");
+    expect(off).not.toContain("보정 상한");
+    // On: the three edition options appear with the backend's limits and
+    // the edition's defaults, in both locales.
+    for (const [locale, upper, crush, search, follow] of [
+      [messages.ko, "보정 상한", "피크 크러시 강도", "원본 자동 지연 탐색", "고역 롤오프 따르기"],
+      [messages.en, "Correction upper limit", "Peak-crush strength", "original automatic delay search", "treble rolloff"],
+    ] as const) {
+      const on = renderToStaticMarkup(
+        <SecsBugfixEditionOptions
+          copy={locale.liveMeasurement}
+          settings={{ ...SECS_DEFAULT_SETTINGS, bugfixEdition: true }}
+          onChange={() => undefined}
+        />,
+      );
+      expect(on).toContain(upper);
+      expect(on).toContain(crush);
+      expect(on).toContain(search);
+      expect(on).toContain(follow);
+      // Following the HF target is on by default.
+      expect(on).toMatch(/type="checkbox" checked=""[^>]*\/?>\s*<span>[^<]*(고역 롤오프|treble rolloff)/);
+      expect(on).toContain('min="200"');
+      expect(on).toContain('max="20000"');
+      expect(on).toContain('value="500"');
+      expect(on).toContain('value="0.3"');
+    }
   });
 
   it("keeps custom TXT targets available in the live design UI", () => {

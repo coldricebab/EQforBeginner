@@ -71,8 +71,8 @@ export const en: Messages = {
       {
         short: "Positions",
         title: "Measure more positions",
-        description: "Capture the center and five nearby listening positions.",
-        tip: "The center measurement is repeated at the end for stability.",
+        description: "Capture the center and the eight surrounding listening positions.",
+        tip: "The center P0 is measured once and carries double weight in the average.",
       },
       {
         short: "Target",
@@ -164,7 +164,6 @@ export const en: Messages = {
     heading: "Measure the listening area, not one perfect point",
     body: "Move roughly around the head area. Exact millimeter placement is not required.",
     center: "P0 center",
-    repeat: "P0 repeat",
     position: "Nearby position",
     weight: "Default weight",
     none: "No positions measured",
@@ -509,8 +508,8 @@ export const en: Messages = {
     cachedMeasurementBadge: "accepted cache",
     timestampDiagnostic: "CoreAudio timestamp variation: {frames} frames (not proof of PCM loss)",
     baselineTitle: "Raw multipoint measurement",
-    baselineBody: "Begin at center P0, measure five surrounding positions, then repeat P0. Play L and R separately at each position.",
-    baselineBody21: "Begin at center P0, measure five surrounding positions, then repeat P0. Play L and R separately while the amplifier's bass management keeps the sub normally engaged, measuring the combined L+Sub/R+Sub paths.",
+    baselineBody: "Begin at center P0, then measure the eight surrounding positions P1–P8. Play L and R separately at each position.",
+    baselineBody21: "Begin at center P0, then measure the eight surrounding positions P1–P8. Play L and R separately while the amplifier's bass management keeps the sub normally engaged, measuring the combined L+Sub/R+Sub paths.",
     selectedMicrophone: "Selected real input",
     noMicrophone: "Scan for and select a 48 kHz input channel",
     scanMicrophones: "Scan / refresh microphones",
@@ -553,7 +552,6 @@ export const en: Messages = {
       P6: "P6 lower front-right",
       P7: "P7 lower back-right",
       P8: "P8 lower back-left",
-      P0_END: "P0 end repeat",
     },
     positionDetails: {
       P0: "Normal head center · ear height (the exact center of the box)",
@@ -565,7 +563,6 @@ export const en: Messages = {
       P6: "Lower front-right corner: 25–30 cm right · 20–25 cm toward the speakers · 10–15 cm down",
       P7: "Lower back-right corner: 25–30 cm right · 20–25 cm behind · 10–15 cm down",
       P8: "Lower back-left corner: 25–30 cm left · 20–25 cm behind · 10–15 cm down",
-      P0_END: "Return approximately to the starting center area and repeat",
     },
     positionGuide: {
       title: "Where should the microphone go?",
@@ -579,10 +576,10 @@ export const en: Messages = {
       floor: "Floor",
       earHeight: "Ear height",
       microphone: "Microphone",
-      note: "Keep the microphone upright in its 90° calibration orientation. Change only the height — 10–15 cm up for P1–P4, down for P5–P8 — and keep amplifier volume and microphone gain unchanged through P0_END.",
+      note: "Keep the microphone upright in its 90° calibration orientation. Change only the height — 10–15 cm up for P1–P4, down for P5–P8 — and keep amplifier volume and microphone gain unchanged from P0 through P8. The center P0 is measured once only: a second pass at the center is a hand-placed seat rather than a true repeat, and blending it in would blur the very capture the phase correction is built from.",
     },
     channelLabels: { left: "L sweep", right: "R sweep" },
-    pairProgress: "{complete}/{total} accepted L/R positions · A trial can use P0 alone, but all positions and the end repeat are recommended.",
+    pairProgress: "{complete}/{total} accepted L/R positions · A trial can use P0 alone, but all nine positions are recommended.",
     pending: "Not measured",
     listening: "Input armed",
     accepted: "Quality accepted",
@@ -666,7 +663,7 @@ export const en: Messages = {
     customTargetRequired: "Import a valid file before using the Custom TXT target.",
     customTargetFormat: "Use one frequency_hz level_db pair per line. Spaces, tabs, commas, and # or ; comments are accepted. The curve is vertically aligned by the robust 200–500 Hz level.",
     customTargetCoverageWarning: "This target does not cover the full 20–500 Hz correction band. Values outside its range use the nearest endpoint; check the file before continuing.",
-    incompleteBaselineWarning: "A surrounding position or the final P0 repeat is missing. You may proceed, but single-seat overfit and session-stability risk increase.",
+    incompleteBaselineWarning: "A surrounding position is missing. You may proceed, but the risk of overfitting a single seat increases.",
     designButton: "Generate predicted trial",
     designing: "Running the existing Phase 4 design…",
     trialReady: "48 kHz trial filter created",
@@ -675,7 +672,7 @@ export const en: Messages = {
     secsToggleNote:
       "SECS is a single-point algorithm ported under the MIT License granted by its original author. It designs a full-band mixed-phase filter from the central P0 measurement only, ignoring the other seats and their safety limits (protected dips, bounded boost). The trial is predicted-only until you declare it active in Roon and pass the same P0 L/R closed-loop verification as the main path (judged 20-650 Hz on smoothed curves, so a small microphone reposition is tolerated). Final export then ships per-rate SECS redesigns bound to the verified 48 kHz filter.",
     secsCredit:
-      "SECS was created by 한플 (Hanpeul) and is used here under the MIT License granted by the author. Multi-position averaging, target-curve following, the 2.1 shared sub band, verification and export are this app's additions, not the original design.",
+      "SECS was created by 한플 (Hanpeul) and is used here under the MIT License granted by the author. Multi-position averaging, target-curve following, the 2.1 shared sub band, the bug-fix edition, verification and export are this app's additions, not the original design.",
     secsCreditLink: "View the original",
     secsDesigning: "Running the SECS design…",
     secsTrialReady: "SECS trial filter created (predicted-only)",
@@ -684,7 +681,7 @@ export const en: Messages = {
     secsHighCutoff: "Detected high cutoff",
     secsPreamp: "Applied normalization",
     secsBalanceTrim: "L/R balance trim",
-    secsPhaseScore: "Input phase score",
+    secsDecayScore: "Input decay score (1-10 kHz reverb decay)",
     secsSettingsTitle: "SECS parameters",
     secsSettingsSummary: "Settings used",
     secsMaxBoost: "Boost ceiling (dB, 0-24)",
@@ -709,6 +706,31 @@ export const en: Messages = {
       "Where the room's bass arrives later than the pre-ring budget can advance, the original mixed-phase corrector turns the intended advance into extra delay (a real filter delayed 20–120 Hz by 70–200 ms while every magnitude chart looked fine). The improved path leaves those bands uncorrected instead, and the designed filter must pass a group-delay gate. Unchecked runs the original SECS algorithm bit for bit.",
     secsGroupDelayReport:
       "Filter's own group delay vs its treble (worst channel): {bands}. A magnitude chart cannot show this; it is judged from the designed filter alone.",
+    secsBugfixEdition: "Use the SECS bug-fix edition (secs_edited)",
+    secsBugfixEditionNote:
+      "Fixes defects found in the original algorithm. Its 5-band smoothing weights summed to as much as 1.26, so even a perfectly flat speaker got a -2 dB dip around 174 Hz. Its broad tonal EQ could add up to +6 dB beyond the boost ceiling, trying to fill reflection nulls. Its stereo crop could cut the later-arriving channel's main tap (in a synthetic test the right filter came out 32 dB too quiet at a 3 ms arrival difference). The options below tune the edition. It always runs with the improved phase path, and like every SECS trial it is predicted-only until a measurement verifies it. So far it has been checked on synthetic test signals only - confirm it with the closed-loop measurement and by ear. Unchecked runs the original port unchanged.",
+    secsBugfixEditionNeedsImproved:
+      "The bug-fix edition always runs with the improved phase path (its delay fix needs the extended window).",
+    secsCorrectionUpper: "Correction upper limit (Hz, 200-20000)",
+    secsCorrectionUpperNote:
+      "Above this frequency the broad tonal EQ fades out (completely by twice the value), and the level reference is taken from the uncorrected band above it. In-room treble is dominated by reverberation, so pulling it to the target brightened the direct sound (+2-3 dB at 4-8 kHz in a synthetic room). 20000 restores the original full-band behavior.",
+    secsMagnitudeDelaySearch: "Use the original automatic delay search (magnitude only)",
+    secsMagnitudeDelaySearchNote:
+      "The original search picks the 2-10 ms delay whose bass magnitude fits best and never looks at timing, so it can leave most of the bass timing error in place. By default the edition designs at the delay ceiling instead, and the automatic ceiling keeps headroom above the measured requirement (requirement + 10 ms). That adds playback latency (typically 15-20 ms; harmless for music).",
+    secsCrushIntensity: "Peak-crush strength (0-1)",
+    secsCrushIntensityNote:
+      "An extra cut applied only to narrow peaks below 500 Hz. The original tied it to the resolution (0.6 at Normal), which cut peaks without filling dips and lowered the 100-400 Hz level by about 1 dB; the edition defaults to 0.3.",
+    secsHfTargetFollow: "Follow the target's treble rolloff above the upper limit (cut only, recommended)",
+    secsHfTargetFollowNote:
+      "Above the correction upper limit the tonal EQ keeps steering toward the target curve, but it can only cut: treble that sits above the target (for example a flat in-room treble against a target that falls -1 dB/oct) is brought down along the curve, while treble that already falls below the target is never lifted - so the brightening the upper limit fixed cannot return. The bass correction below the limit is unchanged. Unchecked leaves the treble untouched.",
+    secsEditionHfFollow: "treble follows target (cut only)",
+    secsEdition: "SECS edition",
+    secsEditionOriginal: "Original port",
+    secsEditionBugfix: "Bug-fix edition",
+    secsEditionFullBand: "full band",
+    secsEditionUpTo: "up to {hz} Hz",
+    secsEditionCrush: "crush {value}",
+    secsEditionDelaySearch: "original delay search",
     secsGroupDelayLimit: "limit {limit} ms",
     secsMaxDelay: "Delay ceiling",
     secsMaxDelayAuto: "Automatic (recommended) — measured optimum",

@@ -13,7 +13,6 @@
 
 use crate::analysis::{frequency_response, FrequencyResponse};
 use crate::calibration::MicrophoneCalibration;
-use crate::validation::fft_convolve;
 use crate::wireless_sweep::WirelessSweepDetection;
 use crate::{DspError, DspResult};
 use rustfft::num_complex::Complex;
@@ -47,6 +46,21 @@ pub struct SweepDeconvolutionConfig {
     pub clipping_threshold_linear: f64,
     pub minimum_capture_snr_db: f64,
     pub minimum_reconstruction_fit_db: f64,
+    /// Frequency band over which the reconstruction fit is scored. The fit
+    /// exists to answer "did the linear time-invariant model explain this
+    /// capture", and that question is only well-posed where the reference
+    /// sweep actually carries energy. Outside the sweep band the regularized
+    /// spectral division amplifies whatever the room put there - measured
+    /// 2026-08-22: subsonic rumble (HVAC/traffic, 5-18 Hz, ~10% of one
+    /// room's capture energy) hitting near-null reference bins was amplified
+    /// by up to ~40 dB, and the impulse truncation then turned it into a
+    /// per-take phase lottery that swung the reported fit between -4 and
+    /// +21 dB across captures whose in-band waveforms matched within
+    /// -32 dB. Band-limiting the score to >=30 Hz collapsed that session's
+    /// 32 captures to a uniform 18-33 dB. The 30 Hz edge is a single-room
+    /// calibration (the rumble's leakage skirts reached ~25 Hz) and is a
+    /// hypothesis in the STATUS.md sense, not a physical constant.
+    pub reconstruction_fit_band_hz: [f64; 2],
     /// When false the fit remains an auditable diagnostic but does not reject
     /// a capture whose independent timing and signal-quality gates passed.
     pub enforce_minimum_reconstruction_fit: bool,
@@ -102,6 +116,7 @@ impl Default for SweepDeconvolutionConfig {
             clipping_threshold_linear: 0.999,
             minimum_capture_snr_db: 30.0,
             minimum_reconstruction_fit_db: 12.0,
+            reconstruction_fit_band_hz: [30.0, 20_000.0],
             enforce_minimum_reconstruction_fit: true,
             minimum_start_correlation: 0.45,
             maximum_clock_drift_ppm: 2_000.0,
@@ -238,6 +253,19 @@ fn validate_config(config: &SweepDeconvolutionConfig) -> DspResult<()> {
     {
         return Err(DspError::InvalidArgument(
             "measurement calibration band must be finite, positive, increasing, and below Nyquist"
+                .into(),
+        ));
+    }
+    if config
+        .reconstruction_fit_band_hz
+        .iter()
+        .any(|value| !value.is_finite())
+        || config.reconstruction_fit_band_hz[0] <= 0.0
+        || config.reconstruction_fit_band_hz[1] <= config.reconstruction_fit_band_hz[0]
+        || config.reconstruction_fit_band_hz[1] > nyquist_hz
+    {
+        return Err(DspError::InvalidArgument(
+            "measurement reconstruction-fit band must be finite, positive, increasing, and below Nyquist"
                 .into(),
         ));
     }
@@ -484,17 +512,98 @@ fn inverse_real(mut spectrum: Vec<Complex<f64>>) -> DspResult<Vec<f64>> {
     Ok(samples)
 }
 
+/// Signal-to-residual ratio of the truncated linear reconstruction, scored
+/// inside `band_hz` only.
+///
+/// Both the capture and the transfer spectrum are hard-masked to the band
+/// BEFORE the impulse truncation, which is exactly equivalent to running the
+/// whole deconvolution on a band-limited capture. Masking the residual after
+/// the fact would not be: the out-of-band blow-up leaks into the band through
+/// the truncation's spectral skirts, so the source has to be removed first
+/// (verified against the 2026-08-22 field captures; see the config field's
+/// documentation for the failure this prevents). The measurement outputs -
+/// impulse, magnitude response, everything downstream - are untouched; only
+/// this diagnostic is band-limited.
 fn reconstruction_fit_db(
-    reference: &[f64],
-    impulse: &[f64],
-    aligned_capture: &[f64],
+    reference_spectrum: &[Complex<f64>],
+    capture_spectrum: &[Complex<f64>],
+    raw_transfer_spectrum: &[Complex<f64>],
+    aligned_length: usize,
+    impulse_length: usize,
+    sample_rate_hz: u32,
+    band_hz: [f64; 2],
 ) -> DspResult<f64> {
-    let reconstructed = fft_convolve(reference, impulse)?;
-    let compared = reconstructed.len().min(aligned_capture.len());
-    let signal_rms = rms(&aligned_capture[..compared]).unwrap_or(0.0);
+    let fft_size = reference_spectrum.len();
+    let bin_hz = f64::from(sample_rate_hz) / fft_size as f64;
+    // Raised-cosine edges INSIDE the band instead of a brick wall: a hard
+    // edge is a sinc in time whose ringing spans sample_rate/width samples,
+    // and truncating that ringing to the retained impulse window would charge
+    // a clean capture with a fake residual. Each edge is therefore at least
+    // 8 * sample_rate / impulse_length wide - eight truncation bins, keeping
+    // the mask kernel's time support well inside the window at every allowed
+    // window size - and at least a third of an octave so the production
+    // window's edge is not needlessly sharp. Suppression outside [lo, hi] is
+    // total; the ramp lives just inside each edge. Field check 2026-08-22:
+    // this weighting took the same 32-capture session from a -4..+21 dB
+    // scatter to a uniform 30.1-33.8 dB.
+    let minimum_edge_hz = 8.0 * f64::from(sample_rate_hz) / impulse_length as f64;
+    let fractional_octave_width =
+        |frequency_hz: f64| frequency_hz * (1.0 - 2.0_f64.powf(-1.0 / 3.0));
+    let low_edge_hz = fractional_octave_width(band_hz[0]).max(minimum_edge_hz);
+    let high_edge_hz = fractional_octave_width(band_hz[1]).max(minimum_edge_hz);
+    let weight_at = |frequency_hz: f64| -> f64 {
+        let rise =
+            |position: f64| 0.5 - 0.5 * (std::f64::consts::PI * position.clamp(0.0, 1.0)).cos();
+        let low = rise((frequency_hz - band_hz[0]) / low_edge_hz);
+        let high = rise((band_hz[1] - frequency_hz) / high_edge_hz);
+        low * high
+    };
+    let mask_to_band = |spectrum: &[Complex<f64>]| -> Vec<Complex<f64>> {
+        spectrum
+            .iter()
+            .enumerate()
+            .map(|(index, bin)| {
+                let mirrored_index = index.min(fft_size - index);
+                let frequency_hz = mirrored_index as f64 * bin_hz;
+                *bin * weight_at(frequency_hz)
+            })
+            .collect()
+    };
+    let banded_capture = inverse_real(mask_to_band(capture_spectrum))?;
+    let mut banded_impulse = inverse_real(mask_to_band(raw_transfer_spectrum))?;
+    // The scoring window is the production window [0, impulse_length) plus a
+    // wrap-around margin at the buffer's far end. The band mask convolves the
+    // impulse with its own kernel, whose anti-causal half lands at negative
+    // lags - circularly, at the END of the buffer. Cutting it there would
+    // charge a clean capture with the kernel tail's energy whenever the
+    // room's arrival sits near the window start (pre-zero 0, as the offline
+    // path and the fixtures run). Negative lags beyond the retained pre-zero
+    // are acoustically before the earliest arrival, so admitting them keeps
+    // the metric's meaning: late reverberation past the retained window,
+    // at positive lags, is still fully penalized.
+    let narrowest_edge_hz = low_edge_hz.min(high_edge_hz);
+    let wrap_margin = ((4.0 * f64::from(sample_rate_hz) / narrowest_edge_hz).ceil() as usize)
+        .min((fft_size - impulse_length) / 2);
+    for sample in &mut banded_impulse[impulse_length..fft_size - wrap_margin] {
+        *sample = 0.0;
+    }
+    // fft_size >= reference length + impulse length - 1, so this circular
+    // product equals the linear convolution over the compared window (the
+    // wrap-margin half contributes at negative lags, which the pre-zero
+    // timeline already defines).
+    let banded_impulse_spectrum = forward_real(&banded_impulse, fft_size);
+    let reconstructed = inverse_real(
+        banded_impulse_spectrum
+            .iter()
+            .zip(reference_spectrum)
+            .map(|(impulse_bin, reference_bin)| impulse_bin * reference_bin)
+            .collect(),
+    )?;
+    let compared = aligned_length.min(banded_capture.len());
+    let signal_rms = rms(&banded_capture[..compared]).unwrap_or(0.0);
     let residual_sum = reconstructed[..compared]
         .iter()
-        .zip(&aligned_capture[..compared])
+        .zip(&banded_capture[..compared])
         .map(|(model, measured)| {
             let residual = model - measured;
             residual * residual
@@ -644,6 +753,18 @@ pub fn deconvolve_recognized_sweep(
     let raw_full_impulse = inverse_real(raw_transfer_spectrum.clone())?;
     let uncalibrated_impulse_samples = raw_full_impulse[..config.impulse_length_samples].to_vec();
 
+    // Scored now, while the spectra are still whole; the gate that may use
+    // the value keeps its place in the issue order below.
+    let reconstruction_fit_db = reconstruction_fit_db(
+        &reference_spectrum,
+        &capture_spectrum,
+        &raw_transfer_spectrum,
+        aligned_length,
+        config.impulse_length_samples,
+        config.sample_rate_hz,
+        config.reconstruction_fit_band_hz,
+    )?;
+
     let mut issues = Vec::new();
     let calibration_to_apply = match calibration {
         Some(calibration) if calibration.covers(config.calibration_band_hz) => Some(calibration),
@@ -731,8 +852,6 @@ pub fn deconvolve_recognized_sweep(
         }
     }
 
-    let reconstruction_fit_db =
-        reconstruction_fit_db(reference, &uncalibrated_impulse_samples, &aligned_capture)?;
     if config.enforce_minimum_reconstruction_fit
         && reconstruction_fit_db < config.minimum_reconstruction_fit_db
     {
@@ -810,6 +929,7 @@ pub fn deconvolve_recognized_sweep(
 mod tests {
     use super::*;
     use crate::calibration::parse_umik_calibration;
+    use crate::validation::fft_convolve;
     use crate::wireless_sweep::{
         WirelessClockDriftEvidence, WirelessSweepCaptureSegment, WirelessSweepDetection,
         WIRELESS_SWEEP_RECOGNITION_VERSION,
@@ -939,6 +1059,65 @@ mod tests {
         );
         assert!(measurement.quality.capture_snr_db.unwrap() > 100.0);
         assert!(measurement.quality.reconstruction_fit_db > 70.0);
+    }
+
+    #[test]
+    fn out_of_band_rumble_no_longer_dominates_the_reconstruction_fit() {
+        // 2026-08-22 field defect: subsonic room rumble (HVAC/traffic,
+        // 5-18 Hz) sits where the reference sweep has near-zero energy, so
+        // the regularized division amplified it and the impulse truncation
+        // turned it into a per-capture phase lottery - the reported fit swung
+        // between -4 and +21 dB across captures whose in-band waveforms
+        // matched within -32 dB. The fit is now scored inside
+        // `reconstruction_fit_band_hz` only: identical captures with and
+        // without rumble must score the same, while genuinely unexplainable
+        // IN-band content must still pull the fit down.
+        let reference = logarithmic_sweep(32_768, 48_000.0);
+        let mut expected_ir = vec![0.0; 256];
+        expected_ir[0] = 0.8;
+        expected_ir[40] = -0.3;
+        let config = measurement_config();
+
+        let fit_of = |tone_hz: Option<f64>| {
+            let mut detection = fixture_detection(&reference, &expected_ir, 2_048, 1.0e-7);
+            if let Some(tone_hz) = tone_hz {
+                for (index, sample) in detection.capture_segment.samples.iter_mut().enumerate() {
+                    *sample +=
+                        0.05 * (std::f64::consts::TAU * tone_hz * index as f64 / 48_000.0).sin();
+                }
+            }
+            deconvolve_recognized_sweep(
+                &reference,
+                &detection,
+                Some(&flat_calibration(0.0)),
+                &config,
+            )
+            .unwrap()
+            .quality
+            .reconstruction_fit_db
+        };
+
+        let clean_fit = fit_of(None);
+        // A 12 Hz tone is below the 30 Hz scoring edge: out-of-band rumble,
+        // however loud, must no longer move the diagnostic.
+        let rumble_fit = fit_of(Some(12.0));
+        // An 800 Hz tone is unexplainable in-band content (no LTI response of
+        // the sweep produces a tone that also rings before and after it), so
+        // the fit must still expose it.
+        let in_band_fit = fit_of(Some(800.0));
+
+        assert!(clean_fit > 40.0, "clean fixture fit {clean_fit}");
+        // The rectangular analysis window gives the tone spectral skirts that
+        // brush the scoring ramp, so a few dB of movement is expected; the
+        // defect this test pins collapsed the fit to ~10 dB and below.
+        assert!(
+            rumble_fit > 40.0 && rumble_fit > clean_fit - 15.0,
+            "out-of-band rumble dominated the fit: clean {clean_fit}, rumble {rumble_fit}"
+        );
+        assert!(
+            in_band_fit < rumble_fit - 15.0,
+            "in-band garbage no longer detected: in-band {in_band_fit}, rumble {rumble_fit}"
+        );
     }
 
     #[test]

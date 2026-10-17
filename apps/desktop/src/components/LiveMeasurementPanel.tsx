@@ -30,6 +30,8 @@ import {
   type LiveCaptureSummary,
   type LiveSweepPlaybackReport,
   type LiveChannel,
+  SECS_CORRECTION_UPPER_LIMITS_HZ,
+  SECS_CRUSH_INTENSITY_LIMITS,
   SECS_DEFAULT_SETTINGS,
   SECS_ORIGINAL_URL,
   DIRAC_TARGET_SOURCE_URL,
@@ -2277,10 +2279,16 @@ export function LiveMeasurementPanel({
           {secsMode && (
             <fieldset className="live-secs-settings" disabled={busy !== null}>
               <legend>{copy.secsSettingsTitle}</legend>
+              <SecsBugfixEditionOptions
+                copy={copy}
+                settings={secsSettings}
+                onChange={setSecsSettings}
+              />
               <label className="live-secs-settings__toggle">
                 <input
                   type="checkbox"
                   checked={secsSettings.improvedPhase}
+                  disabled={secsSettings.bugfixEdition}
                   onChange={(event) => {
                     const improvedPhase = event.target.checked;
                     setSecsSettings((current) => ({
@@ -2303,6 +2311,11 @@ export function LiveMeasurementPanel({
                 <span>{copy.secsImprovedPhase}</span>
               </label>
               <p className="live-hint">{copy.secsImprovedPhaseNote}</p>
+              {secsSettings.bugfixEdition && (
+                <p className="live-hint">
+                  {copy.secsBugfixEditionNeedsImproved}
+                </p>
+              )}
               <label className="live-secs-settings__toggle">
                 <input
                   type="checkbox"
@@ -2590,7 +2603,8 @@ export function LiveMeasurementPanel({
               <div><dt>{copy.secsHighCutoff}</dt><dd>{formatMetric(secsDesign.highCutoffHz, "Hz")}</dd></div>
               <div><dt>{copy.secsPreamp}</dt><dd>{formatMetric(secsDesign.preampDb, "dB")}</dd></div>
               <div><dt>{copy.secsBalanceTrim}</dt><dd>{formatMetric(secsDesign.channelBalanceTrimDb, "dB")}</dd></div>
-              <div><dt>{copy.secsPhaseScore}</dt><dd>{formatMetric(secsDesign.inputPhaseScore, "")}</dd></div>
+              <div><dt>{copy.secsDecayScore}</dt><dd>{formatMetric(secsDesign.inputPhaseScore, "")}</dd></div>
+              <div><dt>{copy.secsEdition}</dt><dd>{secsDesign.settings.bugfixEdition ? [copy.secsEditionBugfix, secsDesign.settings.correctionUpperHz >= SECS_CORRECTION_UPPER_LIMITS_HZ.max ? copy.secsEditionFullBand : copy.secsEditionUpTo.replace("{hz}", String(secsDesign.settings.correctionUpperHz)), copy.secsEditionCrush.replace("{value}", String(secsDesign.settings.crushIntensity)), ...(secsDesign.settings.hfTargetFollow && secsDesign.settings.correctionUpperHz < SECS_CORRECTION_UPPER_LIMITS_HZ.max ? [copy.secsEditionHfFollow] : []), ...(secsDesign.settings.magnitudeDelaySearch ? [copy.secsEditionDelaySearch] : [])].join(" · ") : copy.secsEditionOriginal}</dd></div>
               <div><dt>{copy.secsSettingsSummary}</dt><dd>{`+${secsDesign.settings.maxBoostDb} dB · ${secsDesign.settings.tiltDbPerOctave} dB/oct · +${secsDesign.settings.bassBoostDb} dB@${secsDesign.settings.bassFrequencyHz} Hz · ${secsDesign.settings.resolution} · ${secsDesign.settings.curtainHz} Hz · ${secsDesign.settings.latencyMode}${secsDesign.maximumDelayResolvedMs > 10 ? ` · max ${secsDesign.maximumDelayResolvedMs} ms${secsDesign.settings.maximumDelayMs === null ? " (auto)" : ""}` : ""}${secsDesign.settings.fixedDelayMs != null ? ` · ${secsDesign.settings.fixedDelayMs} ms` : ""}`}</dd></div>
             </dl>
             <div className="live-result__improvement">
@@ -2975,6 +2989,121 @@ function adaptiveHfDescription(
     reason ??
     "";
   return copy.adaptiveHfFallback.replace("{reason}", reasonText);
+}
+
+/** SECS bug-fix edition opt-in and its options (rendered inside the SECS
+ * settings fieldset). Turning the edition on also restores the improved
+ * phase path it requires; the backend refuses the other combination. */
+export function SecsBugfixEditionOptions({
+  copy,
+  settings,
+  onChange,
+}: {
+  copy: Messages["liveMeasurement"];
+  settings: LiveSecsDesignSettings;
+  onChange: (
+    update: (current: LiveSecsDesignSettings) => LiveSecsDesignSettings,
+  ) => void;
+}) {
+  return (
+    <>
+      <label className="live-secs-settings__toggle">
+        <input
+          type="checkbox"
+          checked={settings.bugfixEdition}
+          onChange={(event) => {
+            const bugfixEdition = event.target.checked;
+            onChange((current) => ({
+              ...current,
+              bugfixEdition,
+              // The edition runs on the improved phase path only, so turning
+              // it on also restores that path and its automatic ceiling.
+              ...(bugfixEdition && !current.improvedPhase
+                ? { improvedPhase: true, maximumDelayMs: null }
+                : {}),
+            }));
+          }}
+        />
+        <span>{copy.secsBugfixEdition}</span>
+      </label>
+      <p className="live-hint">{copy.secsBugfixEditionNote}</p>
+      {settings.bugfixEdition && (
+        <div className="live-secs-edition">
+          <label>
+            <span>{copy.secsCorrectionUpper}</span>
+            <input
+              type="number"
+              min={SECS_CORRECTION_UPPER_LIMITS_HZ.min}
+              max={SECS_CORRECTION_UPPER_LIMITS_HZ.max}
+              step={50}
+              value={settings.correctionUpperHz}
+              onChange={(event) => {
+                const value = Number(event.target.value);
+                if (Number.isFinite(value)) {
+                  onChange((current) => ({
+                    ...current,
+                    correctionUpperHz: value,
+                  }));
+                }
+              }}
+            />
+          </label>
+          <label>
+            <span>{copy.secsCrushIntensity}</span>
+            <input
+              type="number"
+              min={SECS_CRUSH_INTENSITY_LIMITS.min}
+              max={SECS_CRUSH_INTENSITY_LIMITS.max}
+              step={0.05}
+              value={settings.crushIntensity}
+              onChange={(event) => {
+                const value = Number(event.target.value);
+                if (Number.isFinite(value)) {
+                  onChange((current) => ({
+                    ...current,
+                    crushIntensity: value,
+                  }));
+                }
+              }}
+            />
+          </label>
+          <p className="live-hint">{copy.secsCorrectionUpperNote}</p>
+          <p className="live-hint">{copy.secsCrushIntensityNote}</p>
+          <label className="live-secs-settings__toggle">
+            <input
+              type="checkbox"
+              checked={settings.hfTargetFollow}
+              disabled={
+                settings.correctionUpperHz >= SECS_CORRECTION_UPPER_LIMITS_HZ.max
+              }
+              onChange={(event) =>
+                onChange((current) => ({
+                  ...current,
+                  hfTargetFollow: event.target.checked,
+                }))
+              }
+            />
+            <span>{copy.secsHfTargetFollow}</span>
+          </label>
+          <p className="live-hint">{copy.secsHfTargetFollowNote}</p>
+          <label className="live-secs-settings__toggle">
+            <input
+              type="checkbox"
+              checked={settings.magnitudeDelaySearch}
+              onChange={(event) =>
+                onChange((current) => ({
+                  ...current,
+                  magnitudeDelaySearch: event.target.checked,
+                }))
+              }
+            />
+            <span>{copy.secsMagnitudeDelaySearch}</span>
+          </label>
+          <p className="live-hint">{copy.secsMagnitudeDelaySearchNote}</p>
+        </div>
+      )}
+    </>
+  );
 }
 
 export function TargetCurveSelector({

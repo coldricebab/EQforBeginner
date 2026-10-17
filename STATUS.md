@@ -86,6 +86,16 @@ Python reference is pinned by `crates/dsp-core/tests/secs_parity.rs` against
 SECS closed loop and produced a verified package on 2026-07-30 (one room, one
 system); broader listening evaluation is ongoing.
 
+An opt-in **SECS bug-fix edition** (`secs-bugfix-v1`, `crates/dsp-core/src/secs_edited.rs`)
+fixes the defects of a developer bug report against SECS.py: smoothing weights summed
+past one (a -2 dB dip at 174 Hz in a flat speaker), a macro EQ that boosted past the
+boost ceiling, a full-band macro EQ that brightened the direct sound, a magnitude-only
+delay choice, and a stereo crop that could cut the later channel's main tap. Its fixes
+are pinned by synthetic tests. With every fix off, the edition reproduces the original
+port bit for bit. The original port stays the default and stays parity-pinned. The
+edition has been checked offline on stored real captures but **not with a real microphone
+and Roon**; see `docs/dsp.md`, "SECS bug-fix edition".
+
 ## Verification actually run
 
 Deterministic suites, on macOS, at the commit that opens this beta:
@@ -124,7 +134,9 @@ that single room:
 - The isolated-capture leakage gate's 20 dB band-SNR qualification (measured 9.9/10.9 dB
   with the subwoofer physically switched off versus 32.1/33.1 dB with it live).
 - The 4,800-sample deconvolution pre-zero window (central repeat agreement moved from
-  1.3814 ms to 0.2394 ms against an unchanged 0.5 ms criterion).
+  1.3814 ms to 0.2394 ms against an unchanged 0.5 ms criterion). That evidence came from
+  the P0 end repeat, which has since been removed from the measurement flow; the
+  constant stands on the historical record and can no longer be re-derived in-app.
 - The per-octave-cell improvement gate, adopted after a filter that measurably worked
   failed the previous whole-band unsmoothed judgment.
 

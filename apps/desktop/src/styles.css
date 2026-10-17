@@ -3531,6 +3531,17 @@ h3 {
   accent-color: var(--accent);
 }
 
+/* Bug-fix edition options, grouped under their checkbox. */
+.live-secs-edition {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 9px;
+  padding: 8px 10px;
+  border-left: 3px solid var(--accent);
+  border-radius: 4px;
+}
+
 .live-hint {
   font-size: 0.7812rem;
   color: var(--ink-muted);

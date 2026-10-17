@@ -375,6 +375,25 @@ export type LiveSecsDesignSettings = {
    * design measures how late the room's bass arrives and resolves the
    * smallest covering ceiling itself (original 10 when nothing needs more). */
   maximumDelayMs: number | null;
+  /** Bug-fix edition (`secs_edited`): fixes the defects reported against
+   * SECS (smoothing weights that did not sum to one, a macro EQ that boosted
+   * past the boost ceiling, a stereo crop that could cut the later channel's
+   * main tap) and enables the three options below. Requires improvedPhase.
+   * Off = the original port, unchanged. */
+  bugfixEdition: boolean;
+  /** Edition option: correction upper limit in Hz (200–20000). The macro EQ
+   * fades out between this and twice it; 20000 restores the original
+   * full-band behavior. */
+  correctionUpperHz: number;
+  /** Edition option: restore the original magnitude-only 2–10 ms delay
+   * search instead of designing at the resolved delay ceiling. */
+  magnitudeDelaySearch: boolean;
+  /** Edition option: peak-crush exponent below 500 Hz (0–1). */
+  crushIntensity: number;
+  /** Edition option: above the correction upper limit keep following the
+   * target curve, cut-only — the target's HF rolloff applies, but treble
+   * below the target is never lifted. Off = treble left untouched. */
+  hfTargetFollow: boolean;
 };
 
 /// SECS.py "Flat" preset — the backend rejects out-of-range values instead
@@ -392,7 +411,16 @@ export const SECS_DEFAULT_SETTINGS: LiveSecsDesignSettings = {
   targetCurve: "flat",
   improvedPhase: true,
   maximumDelayMs: null,
+  bugfixEdition: false,
+  correctionUpperHz: 500,
+  magnitudeDelaySearch: false,
+  crushIntensity: 0.3,
+  hfTargetFollow: true,
 };
+
+/** Bug-fix edition option limits, mirrored from the backend validation. */
+export const SECS_CORRECTION_UPPER_LIMITS_HZ = { min: 200, max: 20000 } as const;
+export const SECS_CRUSH_INTENSITY_LIMITS = { min: 0, max: 1 } as const;
 
 export type LiveSecsDesignSummary = {
   settings: LiveSecsDesignSettings;
@@ -526,7 +554,6 @@ export const LIVE_BASELINE_POSITIONS = [
   "P6",
   "P7",
   "P8",
-  "P0_END",
 ] as const;
 
 export type LiveBaselinePosition = (typeof LIVE_BASELINE_POSITIONS)[number];

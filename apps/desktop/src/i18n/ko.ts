@@ -71,8 +71,8 @@ export const ko: Messages = {
       {
         short: "다지점",
         title: "다지점 측정",
-        description: "중앙과 주변 5개 청취 위치를 측정합니다.",
-        tip: "안정성 확인을 위해 마지막에 중앙 위치를 반복 측정합니다.",
+        description: "중앙과 주변 8개 청취 위치를 측정합니다.",
+        tip: "중앙 P0는 한 번만 측정하며, 평균에서 두 배 가중치를 가집니다.",
       },
       {
         short: "타겟",
@@ -164,7 +164,6 @@ export const ko: Messages = {
     heading: "완벽한 한 점이 아니라 청취 영역을 측정합니다",
     body: "머리 주변 영역에서 대략 이동하세요. 밀리미터 단위의 정확한 배치는 필요하지 않습니다.",
     center: "P0 중앙",
-    repeat: "P0 반복",
     position: "주변 위치",
     weight: "기본 가중치",
     none: "측정된 위치 없음",
@@ -509,8 +508,8 @@ export const ko: Messages = {
     cachedMeasurementBadge: "승인 캐시",
     timestampDiagnostic: "CoreAudio 타임스탬프 변동 {frames} frames (PCM 손실 증거 아님)",
     baselineTitle: "Raw 다지점 측정",
-    baselineBody: "P0 중앙에서 시작해 주변 5지점과 마지막 P0 반복을 측정합니다. 각 위치에서 L과 R을 따로 재생합니다.",
-    baselineBody21: "P0 중앙에서 시작해 주변 5지점과 마지막 P0 반복을 측정합니다. L 또는 R을 따로 재생하되 앰프의 bass management를 통해 서브가 정상 연동된 L+Sub/R+Sub 결합 경로를 측정합니다.",
+    baselineBody: "P0 중앙에서 시작해 주변 8지점 P1–P8을 측정합니다. 각 위치에서 L과 R을 따로 재생합니다.",
+    baselineBody21: "P0 중앙에서 시작해 주변 8지점 P1–P8을 측정합니다. L 또는 R을 따로 재생하되 앰프의 bass management를 통해 서브가 정상 연동된 L+Sub/R+Sub 결합 경로를 측정합니다.",
     selectedMicrophone: "선택한 실제 입력",
     noMicrophone: "48 kHz 입력 채널을 검색해 선택하세요",
     scanMicrophones: "마이크 검색 / 새로고침",
@@ -553,7 +552,6 @@ export const ko: Messages = {
       P6: "P6 아래 앞-오른쪽",
       P7: "P7 아래 뒤-오른쪽",
       P8: "P8 아래 뒤-왼쪽",
-      P0_END: "P0 종료 반복",
     },
     positionDetails: {
       P0: "평소 머리 중심 · 귀 높이 (직육면체의 정중앙)",
@@ -565,7 +563,6 @@ export const ko: Messages = {
       P6: "아래 앞-오른쪽 꼭짓점: 오른쪽 25–30 cm · 스피커 쪽 20–25 cm · 아래 10–15 cm",
       P7: "아래 뒤-오른쪽 꼭짓점: 오른쪽 25–30 cm · 뒤 20–25 cm · 아래 10–15 cm",
       P8: "아래 뒤-왼쪽 꼭짓점: 왼쪽 25–30 cm · 뒤 20–25 cm · 아래 10–15 cm",
-      P0_END: "처음 P0의 중앙 영역으로 대략 돌아와 반복",
     },
     positionGuide: {
       title: "마이크를 어디에 놓나요?",
@@ -579,10 +576,10 @@ export const ko: Messages = {
       floor: "바닥",
       earHeight: "귀 높이",
       microphone: "마이크",
-      note: "항상 마이크를 위로 세우고 90° 캘리브레이션 방향을 유지하세요. 높이는 P1–P4에서 위로, P5–P8에서 아래로 10–15 cm만 바꾸고, P0_END까지 앰프 음량과 마이크 gain은 바꾸지 마세요.",
+      note: "항상 마이크를 위로 세우고 90° 캘리브레이션 방향을 유지하세요. 높이는 P1–P4에서 위로, P5–P8에서 아래로 10–15 cm만 바꾸고, P0부터 P8까지 앰프 음량과 마이크 gain은 바꾸지 마세요. 중앙 P0는 한 번만 측정합니다 — 손으로 다시 놓은 두 번째 중앙 측정은 같은 자리의 반복이 아니라 다른 자리이고, 그것을 섞으면 위상 보정이 근거로 삼는 바로 그 측정이 흐려집니다.",
     },
     channelLabels: { left: "L 스윕", right: "R 스윕" },
-    pairProgress: "승인된 L/R 위치 {complete}/{total} · P0 한 쌍만으로도 시험 설계는 가능하지만 모든 위치와 P0 반복을 권장합니다.",
+    pairProgress: "승인된 L/R 위치 {complete}/{total} · P0 한 쌍만으로도 시험 설계는 가능하지만 9개 위치 전부를 권장합니다.",
     pending: "측정 전",
     listening: "입력 대기 중",
     accepted: "품질 승인",
@@ -665,7 +662,7 @@ export const ko: Messages = {
     customTargetRequired: "사용자 TXT 타겟을 선택하려면 먼저 유효한 파일을 불러오세요.",
     customTargetFormat: "한 줄에 frequency_hz level_db를 입력합니다. 공백·탭·쉼표와 # 또는 ; 주석을 지원하며, 200–500 Hz의 robust 레벨로 수직 정렬합니다.",
     customTargetCoverageWarning: "이 타겟은 20–500 Hz 보정 대역 전체를 덮지 않습니다. 범위 밖은 가장 가까운 끝점으로 연장되므로 파일을 확인하세요.",
-    incompleteBaselineWarning: "주변 위치 또는 마지막 P0 반복이 비어 있습니다. 진행할 수 있지만 한 좌석 과적합과 세션 안정성 위험이 커집니다.",
+    incompleteBaselineWarning: "주변 위치가 비어 있습니다. 진행할 수 있지만 한 좌석 과적합 위험이 커집니다.",
     designButton: "예측 시험 FIR 생성",
     designing: "기존 Phase 4 알고리즘 실행 중…",
     trialReady: "48 kHz 시험 필터 생성됨",
@@ -674,7 +671,7 @@ export const ko: Messages = {
     secsToggleNote:
       "SECS는 원작자가 MIT 라이선스로 허락한 단일 지점 알고리즘을 이식한 것입니다. 중앙 P0 측정만으로 전대역 혼합위상 필터를 설계하며, 나머지 좌석과 기존 안전 한계(보호 딥, 제한 부스트)를 사용하지 않습니다. 시험본은 예측 전용이며, 기본 경로와 동일하게 Roon 활성 선언 후 P0 L/R 폐루프 검증을 통과해야 최종 내보내기가 열립니다(판정은 20–650 Hz 스무딩 곡선이라 마이크의 작은 재배치는 허용됩니다). 최종 패키지는 검증된 48 kHz 필터에 바인딩된 레이트별 SECS 재설계입니다.",
     secsCredit:
-      "SECS는 한플님이 만드신 프로그램이며 원작자가 MIT 라이선스로 사용을 허락해 주셨습니다. 다지점 평균, 타겟 커브 추종, 2.1 공유 서브 대역, 검증과 내보내기는 이 앱에서 추가한 것으로 원작자의 설계가 아닙니다.",
+      "SECS는 한플님이 만드신 프로그램이며 원작자가 MIT 라이선스로 사용을 허락해 주셨습니다. 다지점 평균, 타겟 커브 추종, 2.1 공유 서브 대역, 버그 수정판, 검증과 내보내기는 이 앱에서 추가한 것으로 원작자의 설계가 아닙니다.",
     secsCreditLink: "원본 글 보기",
     secsDesigning: "SECS 설계 실행 중…",
     secsTrialReady: "SECS 시험 필터 생성됨 (예측 전용)",
@@ -683,7 +680,7 @@ export const ko: Messages = {
     secsHighCutoff: "검출된 고역 한계",
     secsPreamp: "적용된 정규화",
     secsBalanceTrim: "L/R 밸런스 보정",
-    secsPhaseScore: "입력 위상 점수",
+    secsDecayScore: "입력 잔향 감쇠 점수 (1-10 kHz)",
     secsSettingsTitle: "SECS 세부 설정",
     secsSettingsSummary: "사용된 설정",
     secsMaxBoost: "부스트 한계 (dB, 0-24)",
@@ -708,6 +705,31 @@ export const ko: Messages = {
       "방의 저음이 프리링잉 허용치(2–10 ms)로 당길 수 있는 것보다 늦게 도착하면, 원본 혼합위상 보정기는 잘려 나간 앞당김이 오히려 추가 지연으로 뒤집힙니다(실제 필터에서 20–120 Hz가 70–200 ms 늦어졌지만 모든 크기 그래프는 정상으로 보였습니다). 개량 경로는 그런 대역을 보정하지 않고 그대로 두며, 설계된 필터는 군지연 게이트를 통과해야 합니다. 체크를 끄면 원본 SECS 알고리즘이 비트 단위 그대로 실행됩니다.",
     secsGroupDelayReport:
       "필터 자체의 군지연(고역 기준, 나쁜 채널): {bands}. 크기 그래프에는 보이지 않으며 설계된 필터만으로 판정합니다.",
+    secsBugfixEdition: "SECS 버그 수정판 사용 (secs_edited)",
+    secsBugfixEditionNote:
+      "원본 알고리즘에서 확인된 결함을 고친 판입니다. 5밴드 스무딩 가중치의 합이 최대 1.26이어서 완전히 평탄한 스피커에도 174 Hz 부근에 −2 dB 딥을 만들었습니다. 넓은 음색 EQ가 부스트 한계를 넘어 최대 +6 dB를 더 얹어 반사 딥을 메우려 했습니다. 스테레오 크롭이 늦게 도착하는 채널의 메인 탭을 잘라낼 수 있었습니다(합성 시험에서 도달 차 3 ms일 때 오른쪽 필터가 32 dB 작아짐). 아래 옵션으로 수정판을 조정합니다. 수정판은 항상 개량 위상 경로와 함께 동작하며, 다른 SECS 시험본처럼 측정으로 검증하기 전까지는 예측 전용입니다. 지금까지는 합성 신호로만 확인했으니 폐루프 측정과 청감으로 확인하세요. 체크를 끄면 원본 이식판이 그대로 실행됩니다.",
+    secsBugfixEditionNeedsImproved:
+      "버그 수정판은 항상 개량 위상 경로로 동작합니다(지연 수정에 확장 창이 필요합니다).",
+    secsCorrectionUpper: "보정 상한 (Hz, 200-20000)",
+    secsCorrectionUpperNote:
+      "이 주파수 위에서는 넓은 음색 EQ가 서서히 꺼지고(2배 주파수에서 완전히), 레벨 기준도 그 위의 보정하지 않는 대역에서 잡습니다. 실내 고역은 잔향이 지배하기 때문에 이를 타겟으로 끌어당기면 직접음이 밝아졌습니다(합성 방 모델에서 4-8 kHz +2-3 dB). 20000이면 원본의 전대역 동작입니다.",
+    secsMagnitudeDelaySearch: "원본 자동 지연 탐색 사용 (크기만 봄)",
+    secsMagnitudeDelaySearchNote:
+      "원본 탐색은 2-10 ms 중 저역 크기가 가장 잘 맞는 지연을 고르고 타이밍은 보지 않아, 저역 타이밍 오차를 대부분 남길 수 있습니다. 수정판은 기본적으로 지연 상한에서 설계하며, 자동 상한은 측정한 필요량보다 여유를 둡니다(필요량 + 10 ms). 그만큼 재생 지연이 늘어납니다(보통 15-20 ms, 음악에는 무해).",
+    secsCrushIntensity: "피크 크러시 강도 (0-1)",
+    secsCrushIntensityNote:
+      "500 Hz 아래의 좁은 피크에만 추가로 거는 컷입니다. 원본은 해상도에 묶여(보통 0.6) 딥은 채우지 않고 피크만 더 깎아 100-400 Hz 레벨이 약 1 dB 내려갔습니다. 수정판 기본값은 0.3입니다.",
+    secsHfTargetFollow: "보정 상한 위에서 타깃의 고역 롤오프 따르기 (깎기만, 권장)",
+    secsHfTargetFollowNote:
+      "보정 상한 위에서도 음색 EQ가 타깃 커브를 따라가되 깎기만 합니다. 타깃보다 높은 고역(예: 실내 고역이 평탄한데 타깃은 −1 dB/oct로 내려가는 경우)은 커브를 따라 내리고, 이미 타깃보다 낮은 고역은 절대 올리지 않습니다. 그래서 보정 상한이 고친 '고역이 밝아지는 문제'는 다시 생기지 않습니다. 상한 아래 저역 보정은 그대로입니다. 체크를 끄면 고역을 건드리지 않습니다.",
+    secsEditionHfFollow: "고역 타깃 따름(깎기만)",
+    secsEdition: "사용한 SECS",
+    secsEditionOriginal: "원본 이식판",
+    secsEditionBugfix: "버그 수정판",
+    secsEditionFullBand: "전대역",
+    secsEditionUpTo: "{hz} Hz 이하",
+    secsEditionCrush: "크러시 {value}",
+    secsEditionDelaySearch: "원본 지연 탐색",
     secsGroupDelayLimit: "한계 {limit} ms",
     secsMaxDelay: "지연 상한",
     secsMaxDelayAuto: "자동 (권장) — 측정으로 최적 상한 결정",

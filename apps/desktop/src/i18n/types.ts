@@ -107,7 +107,6 @@ export type Messages = {
     heading: string;
     body: string;
     center: string;
-    repeat: string;
     position: string;
     weight: string;
     none: string;
@@ -418,29 +417,11 @@ export type Messages = {
     rawRoonChecklist21: string[];
     position: string;
     positionLabels: Record<
-      | "P0"
-      | "P1"
-      | "P2"
-      | "P3"
-      | "P4"
-      | "P5"
-      | "P6"
-      | "P7"
-      | "P8"
-      | "P0_END",
+      "P0" | "P1" | "P2" | "P3" | "P4" | "P5" | "P6" | "P7" | "P8",
       string
     >;
     positionDetails: Record<
-      | "P0"
-      | "P1"
-      | "P2"
-      | "P3"
-      | "P4"
-      | "P5"
-      | "P6"
-      | "P7"
-      | "P8"
-      | "P0_END",
+      "P0" | "P1" | "P2" | "P3" | "P4" | "P5" | "P6" | "P7" | "P8",
       string
     >;
     positionGuide: {
@@ -545,7 +526,7 @@ export type Messages = {
     secsHighCutoff: string;
     secsPreamp: string;
     secsBalanceTrim: string;
-    secsPhaseScore: string;
+    secsDecayScore: string;
     secsSettingsTitle: string;
     secsSettingsSummary: string;
     secsMaxBoost: string;
@@ -568,6 +549,25 @@ export type Messages = {
     secsFollowTarget: string;
     secsImprovedPhase: string;
     secsImprovedPhaseNote: string;
+    secsBugfixEdition: string;
+    secsBugfixEditionNote: string;
+    secsBugfixEditionNeedsImproved: string;
+    secsCorrectionUpper: string;
+    secsCorrectionUpperNote: string;
+    secsMagnitudeDelaySearch: string;
+    secsMagnitudeDelaySearchNote: string;
+    secsCrushIntensity: string;
+    secsCrushIntensityNote: string;
+    secsHfTargetFollow: string;
+    secsHfTargetFollowNote: string;
+    secsEditionHfFollow: string;
+    secsEdition: string;
+    secsEditionOriginal: string;
+    secsEditionBugfix: string;
+    secsEditionFullBand: string;
+    secsEditionUpTo: string;
+    secsEditionCrush: string;
+    secsEditionDelaySearch: string;
     secsMaxDelay: string;
     secsMaxDelayAuto: string;
     secsMaxDelayAutoNote: string;

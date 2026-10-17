@@ -182,8 +182,7 @@ The live path intentionally contains no second correction implementation:
   deconvolution/quality, optional before/after marker clock mapping, immutable session
   persistence, conversion of accepted L/R pairs into the Phase 4 response model,
   microphone/evidence-generation locking, bounded complete-segment marker admission
-  followed by strict two-marker spacing validation, hand-repositioned P0 ending-repeat
-  gross-stability checking, persisted manual
+  followed by strict two-marker spacing validation, persisted manual
   trial activation attestation, post-trial P0 closed-loop comparison, verified-trial
   to native-48k response binding, conservative signal/FIR-bound headroom,
   `measured-fr-result-plot-v2` serialization of the admitted Raw/Target/Predicted/

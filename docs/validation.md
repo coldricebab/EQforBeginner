@@ -130,7 +130,13 @@ not lost. A measurement enters a spatial/design set only when all of these are t
   whenever the pre-zero window grows;
 - capture SNR is >=20 dB; reconstruction fit is recorded as a diagnostic when a
   complete repeated-marker pair independently qualifies extent/clock, while the
-  markerless fallback still requires >=12 dB;
+  markerless fallback still requires >=12 dB. The fit is scored inside
+  30 Hz-20 kHz (raised-cosine edges) only: outside the sweep's band the
+  regularized deconvolution amplifies room rumble into the truncated impulse
+  and the number becomes a per-capture phase lottery rather than a quality
+  measure (2026-08-22 field session: -4..+21 dB scatter at a fixed microphone
+  collapsed to a uniform 30-34 dB once band-limited). The 30 Hz edge is
+  calibrated on that one room and is a hypothesis, not a physical constant;
 - effective/marker rate mismatch remains within 2,000 ppm and the live
   magnitude-only timing fit is <=96 samples;
 - CPAL reports a complete capture with no format error, stream/runtime error, timeout,
@@ -150,13 +156,18 @@ microphone-motion classification are not implemented; they remain human beta-tes
 checks.
 
 At design time only accepted common-grid L/R pairs are retained. Baseline P0 L/R is
-mandatory. P1-P8 and P0_END are optional; missing pairs are not invented. P0 has weight
-2 unless P0_END exists, in which case both center measurements have weight 1.
-When both central pairs exist, each channel must keep its absolute 200-500 Hz median
-level shift within 1.0 dB. Its level-removed 20-500 Hz shape RMSE must remain within a
-loose 6.0 dB gross-change bound. This accommodates hand repositioning after P1-P8 while
-still rejecting a clearly different signal path or listening region. Failure blocks
-design; this gate does not qualify timing or exact P0 replacement.
+mandatory. P1-P8 are optional; missing pairs are not invented. P0 always has weight 2
+and each retained surrounding position has weight 1.
+
+The listening centre is captured exactly once. An end repeat (`P0_END`) used to be
+captured after P1-P8, energy-averaged into P0, and gated for level and shape stability;
+it was removed. The microphone is repositioned by hand, so above a few hundred Hz the
+second pass samples a different seat rather than repeating P0, and blending it in left
+the SECS design fitting a two-capture magnitude to a single-capture excess phase. The
+`P0_END` position id is no longer part of the baseline vocabulary, so legacy snapshots
+carrying it are skipped by the measurement-cache restore. The end-of-session gain-drift
+check the repeat provided is gone; the per-capture absolute level and SNR gates remain
+the only guard against a volume or microphone-gain change mid-session.
 
 ## Phase 1 offline gates
 
@@ -447,10 +458,8 @@ invalidates previously captured verification evidence.
 The session is locked to the first actual microphone device ID. Active captures carry
 the session ID, evidence generation, device, calibration hash, channel-sweep hash and,
 for verification, exact trial hash. Changing any of them makes the completing capture
-stale. If accepted P0 and P0_END pairs both exist, each channel must pass <=1.0 dB
-200-500 Hz median level shift and <=6.0 dB level-removed 20-500 Hz shape RMSE before
-trial design. The latter is deliberately only a gross-change guard for a hand-returned
-center-area point. The repeat gate does not authorize timing.
+stale. The former P0 end-repeat stability gate no longer exists; the centre is
+captured once.
 
 `live-closed-loop-validation-v4` runs the existing frequency-response validation for
 each baseline/verified channel, with one replacement: the overall target-improvement

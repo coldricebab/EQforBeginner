@@ -56,7 +56,9 @@ Implemented algorithm identifiers:
   correction (MIT-licensed by the author); in 2.1 it corrects both channels in common
   below the confirmed crossover. With the default-on "improved SECS" option the label
   gains `+phase-guard-v1`: unrealizable excess-phase corrections are neutralized and
-  the designed filter must pass a group-delay gate.
+  the designed filter must pass a group-delay gate. With the opt-in bug-fix edition
+  (`crates/dsp-core/src/secs_edited.rs`) the label further gains `+secs-bugfix-v1`
+  (see "SECS bug-fix edition" below).
 - `live-closed-loop-validation-v4`: post-trial P0 magnitude-response and
   predicted-versus-verified admission gate.
 - `verified-trial-native48-response-binding-v1`: final native 48 kHz response binding
@@ -796,20 +798,24 @@ export eligibility, and recommended headroom cannot be inferred.
 
 The live developer beta reuses `run_phase4_offline` rather than reimplementing the
 objective above. Accepted L/R capture pairs on the same frequency grid become measured
-positions. P0 has weight 2 by default; if P0_END is present, P0 and P0_END each have
-weight 1. P1-P8 each have weight 1. A trial requires at least an accepted P0 pair.
-When both central pairs exist, let `m_c,p` be the median level over 200-500 Hz and
-remove it from each channel response. Trial design additionally requires
+positions. P0 has weight 2; P1-P8 each have weight 1. A trial requires at least an
+accepted P0 pair.
 
-```text
-|m_c,P0_END - m_c,P0| <= 1.0 dB
-RMSE_20-500((L_c,P0_END - m_c,P0_END) - (L_c,P0 - m_c,P0)) <= 6.0 dB
-```
-
-for both channels. The absolute level bound remains the session/gain stability check.
-The shape bound is intentionally loose because P0_END is returned by hand after P1-P8;
-it rejects only a gross path/location change and does not demand exact modal
-reproduction. This checks repeat level and coarse shape, not arrival-time repeatability.
+The listening centre is captured exactly once. An end repeat `P0_END` used to be
+measured after P1-P8, energy-averaged into P0 (the pair then entering the SECS seat
+list as two 1.0-weight entries instead of one 2.0), and gated by a 1.0 dB
+200-500 Hz median level bound plus a loose 6.0 dB level-removed 20-500 Hz shape RMSE.
+It was removed for two reasons. First, the microphone is repositioned by hand: at
+1 kHz a 3 cm placement error is a tenth of a wavelength, at 10 kHz it is a whole
+wavelength, so above a few hundred Hz the second pass re-randomises the comb pattern
+and samples a different seat instead of repeating P0 - the claimed halving of
+uncorrelated capture noise held only in the modal region. Second, the SECS design takes
+its excess-phase correction from the P0 impulse alone while taking its magnitude from
+the seat-weighted average; with the repeat present the centre contributed a two-capture
+magnitude against a single-capture phase, so the minimum-phase and excess-phase halves
+of the same filter described slightly different acoustic states. Capturing the centre
+once makes both halves refer to one capture. The cost is that the end-of-session
+gain-drift check disappears; only the per-capture absolute level and SNR gates remain.
 The live Phase 4 trial uses the existing native 48 kHz duration, 16,320 samples; the
 offline Phase 4 default remains 16,384.
 
@@ -1229,3 +1235,98 @@ Defects in these belong to this project, not to the original author.
 - A mixed-phase filter **grows broadband program peaks by several dB even at a 0 dB response
   peak** (+2.8 to +6.4 dB measured), which is why the recommended headroom is far larger than
   a sweep-based estimate suggests.
+
+### SECS bug-fix edition (`secs-bugfix-v1`, opt-in)
+
+A developer bug report against SECS.py listed ten defects. Each was checked against this
+port with independent analysis (raw |H| or one unbiased 1/3-octave power boxcar, never
+the SECS smoothing that hides them). The port is kept untouched as the original
+(`secs.rs`, still pinned to SECS.py by the parity fixture). The fixes live in a separate
+module, `secs_edited.rs`, selected by the "SECS bug-fix edition" checkbox. With every fix
+switched off, a unit test proves the edition reproduces the original **bit for bit**, so
+the fork changes nothing but the fixes. The edition requires the improved phase path.
+
+| # | Defect in the original | Fix in the edition | Synthetic check: original → edition |
+| --- | --- | --- | --- |
+| 1 | The five LR4 smoothing weights sum to up to 1.257 (+2 dB) near 173 Hz, so a flat speaker gets a −2 dB dip there, while the SECS graph (same weights) shows a match | Weights normalized per bin (mandatory) | Delta IR, worst 50–600 Hz band vs 1–5 kHz: −1.96 → 0.00 dB, all three resolutions |
+| 2 | The boost ceiling bounds only the minimum-phase stage; the macro EQ adds up to +6 dB more, filling reflection nulls | Macro EQ is cut-only (mandatory). The boost ceiling now also bounds a target shelf | 100 Hz SBIR null, filter max gain re 600–1200 Hz: Boost 0 +5.98 → +0.02 dB, Boost 3 +7.93 → +3.02 dB |
+| 3 | The macro EQ pulls the reverberant steady state to the target over the whole band, and the level anchor (35th percentile of 100 Hz–10 kHz bins) sits in the treble | The level anchor becomes the RMS of the 1/3-octave-smoothed corrected magnitude between U and 4U (default U = 500 Hz). Above U the macro EQ, cut-only after fix [2], keeps following the target by default, so a target's HF rolloff still applies but treble below the target is never lifted; optionally it fades out between U and 2U instead. U = 20000 restores the original exactly | Room with a −1.2 dB/oct steady state, filter re 1 kHz: 8 kHz +2.90 → +0.01 dB; 50–400 Hz −3.36 → −2.22 dB |
+| 4 | The automatic 2–10 ms delay is chosen on L+R magnitude only, so low-band timing is left uncorrected | The design runs at the delay ceiling. The automatic ceiling always keeps taper headroom (requirement + 10 ms, 5 ms steps; 10 ms only when nothing needs advancing). The original search is an option | Anechoic bass-managed model: 40 Hz excess group delay +5.96 → +0.34 ms; pre-ring energy −33.9 → −40.6 dB; 25–63 Hz realized magnitude within 0.6 dB |
+| 5 | The stereo crop starts from the larger peak after arrival alignment, cutting the later-arriving (unshifted) channel's front | Crop starts from the earliest main tap (mandatory) | L δ, R 1.25·δ 3 ms later, 2 ms delay: right filter energy −31.8 dB → expected −1.94 dB. Low-latency mode: −41.4 dB → −1.94 dB |
+| 6 | Vector (time-domain) averaging of the nine seats | Not present here: the multi-position path already uses the seat-weighted power average for magnitude and P0 for phase | 9-seat power average after correction, 40–100 Hz: within 0.11 dB of target |
+| 7 | No microphone calibration input | Not present here: calibration is divided out of every impulse before SECS (`measurement.rs`, v6), with a standing warning without a file | — |
+| 8 | The peak-crush exponent is tied to the resolution (0.6 at Normal) | Its own setting, default 0.3 | Characterization only |
+| 9 | "Phase score" is a 1–10 kHz reverberant decay measure | Shown as "decay score" (`secs_decay_score`) | Same number |
+| 10 | Unpinned pip auto-install | Not applicable (Rust, `Cargo.lock`) | — |
+
+**Why fix [4] is not simply "10 ms fixed".** The report suggested fixing the delay at
+10 ms. Measured on the original window (a cosine taper over the whole pre-ring extent),
+that choice costs the *realized* filter −7.7 dB at 25 Hz on the same anechoic model. The
+truncated-then-renormalized excess corrector spreads anti-causal energy past the budget,
+and the crop discards it. The damage is non-monotonic in the delay (2 ms −6.7 dB, 6 ms
+−2.5 dB, 10 ms −7.7 dB); the magnitude-only search had been quietly avoiding it. The
+improved path's extended window (flat top plus bulk split) with a budget of at least the
+requirement plus its 10 ms taper is clean on the same model: at 20 ms the deep bass stays
+within 0.1 dB, and the 40 Hz excess group delay falls to +0.34 ms. The original automatic
+ceiling maps any requirement up to 10 ms to exactly 10 ms, which is the pathological
+budget, so the edition's ceiling always adds the headroom. The cost is latency: typically
+15–20 ms instead of 10 ms. That is harmless for music.
+
+**Following the target's treble rolloff (default).** The first edition faded the macro
+EQ out above U, which also removed the house curve's HF rolloff that users had relied
+on. Because the macro EQ is cut-only, it can stay active above U without reviving
+defect [3]: it lowers only treble that sits above the target. Below U nothing changes.
+Measured:
+- Synthetic test, flat in-room treble with a −4 dB-at-8 kHz house curve: with
+  following, 8 kHz lands within 1 dB of the curve. With fading, the treble stays flat.
+  The two filters agree within 0.05 dB from 40 to 315 Hz.
+- Sloped room from the [3] test: the treble moves at most −0.34 dB, never up.
+- Developer's stored 2.1 captures with the static Harman-6dB target: the 9-seat
+  1/2/12.5 kHz bands move from −0.6/+0.4/−4.2 dB (fade) to −1.4/−0.9/−4.2 dB against
+  a target of −1/−2/−4.6 dB. The filter below 400 Hz is identical (0.000 dB), and so
+  is the group delay.
+
+**No double cut at 16–20 kHz.** Above 1 kHz the SECS target carries two shapes that
+the following, cut-only macro EQ used to turn into extra treble cuts on top of the
+house curve. One is the 20 kHz fourth-power band edge of the base ideal (−3 dB at
+16 kHz, −6 dB at 20 kHz). The other is the natural-rolloff zone (from 0.8× the high
+cutoff, usually 16 kHz up), where the overlay was multiplied onto the measured envelope.
+So treble that already met the curve was cut a second time. With following on, the
+macro EQ's target above 1 kHz is the overlay alone, and in the rolloff zone it is the
+lower of the envelope and the overlay. Treble above the curve is still cut to it;
+treble below it is left alone. The minimum-phase inversion keeps the old target, and
+bins at or below 1 kHz are unchanged.
+- Synthetic test, direct sound low-passed at 14 kHz, curve −4 dB above 8 kHz: before,
+  16 kHz was cut from −5.8 to −8.5 dB. Now it stays within 2 dB of its natural level,
+  and 8 kHz still lands within 1 dB of the curve.
+- Stored captures with the default adaptive Harman-6dB target, 9-seat result re 500 Hz,
+  where the raw response is −5.3/−9.9 dB: 16/20 kHz went from −8.8/−14.2 dB to
+  −5.6/−9.9 dB. 1–12.5 kHz stays within about ±1 dB of the target. The filter is
+  identical from 20 to 400 Hz (0.000 dB), and so is the group delay.
+- The case following still cannot handle is a measurement that reads the treble too
+  bright, for example a 90° calibration file with the microphone pointed at the
+  speaker. In a +6 dB-at-20 kHz simulation, 8–16 kHz ends up 2.3–2.8 dB below the
+  target (5.1 dB at 16 kHz before this change). Match the calibration file to the
+  microphone's orientation.
+
+**Offline re-analysis of the developer's stored 2.1 captures** (P0–P8, 80 Hz crossover,
+flat target, both editions at the same 60 ms ceiling). This is a re-analysis of stored
+impulses, not a measurement made with the filter playing.
+
+- Treble, with a flat target: the original filter lifts 4/8/12.5 kHz by
+  +2.8/+4.1/+3.5 dB relative to 1 kHz. The edition never lifts it.
+- Fit to the target, 20–500 Hz, 1/3-octave, level-aligned, 9-seat power average:
+  L 2.33 → 1.53 dB, R 1.13 → 0.72 dB. At P0 alone: L 3.10 → 2.53 dB, R 1.99 → 2.09 dB.
+- Unchanged: the group-delay gate passes, and the 2.1 L/R phase stays matched (worst
+  15.8° at 20–70 Hz, mono-sum loss −0.01 dB).
+- Two visible differences:
+  - The normalization attenuation grows from −1.3 to −6.2 dB. The higher level anchor puts
+    more of the bass below the target, so dips are filled up to the boost ceiling. Lower the
+    ceiling if less dip filling is wanted.
+  - The pre-ringing energy share rises by 3–4 dB. Most of that is the denominator: the
+    original's treble lift no longer inflates the total energy. Measured against the
+    filter's own 1 kHz gain, the pre-ring energy itself rises 0.9–1.5 dB, as the low-band
+    corrector advances 20–100 Hz by about 2 ms more.
+
+None of this has been verified with a real microphone and Roon yet. As with every SECS
+trial, the closed-loop P0 measurement decides.

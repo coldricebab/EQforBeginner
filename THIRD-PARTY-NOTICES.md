@@ -71,6 +71,10 @@ Added by this project, and therefore **not** the original author's design:
 - the 2.1 shared-sub-band commonization below a confirmed crossover,
 - the closed-loop verification, per-native-rate export, and headroom
   calculation that wrap the design,
+- the opt-in bug-fix edition (`crates/dsp-core/src/secs_edited.rs`), a fork of
+  the port that changes the original's smoothing weights, macro EQ, delay
+  choice, stereo crop, and peak-crush exponent (the ported original stays
+  unchanged in `secs.rs`),
 - the Rust implementation itself and its numerical parity harness.
 
 Defects in any of the above belong to this project, not to the original

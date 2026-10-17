@@ -226,12 +226,8 @@ Run this only in the native Tauri app; the browser preview cannot open the micro
    (front-left, front-right, back-right, back-left in that order) and P5-P8 the
    same corners on the lower level, so walking the upper four first and then the
    lower four changes the stand height only once.
-   Measure P0 L/R first, then preferably P1-P8, then
-   return approximately to the original listening-center area for P0_END L/R; jig-level
-   replacement is not required. Stop immediately if the sweep is unexpectedly loud.
-   With both central pairs present, design is blocked if either channel shifts by more
-   than 1.0 dB in median 200-500 Hz level or 6.0 dB in level-removed 20-500 Hz shape
-   RMSE. The shape bound only catches a grossly different path or location.
+   Measure P0 L/R first, then preferably P1-P8. The centre is measured once:
+   there is no end repeat. Stop immediately if the sweep is unexpectedly loud.
 10. Retain only cells marked accepted. The app stores the raw mono WAV even when later
    recognition/deconvolution fails; an accepted measurement also receives a JSON
    snapshot with sweep/calibration hashes, IR/FR, metrics, algorithm versions, and
@@ -294,21 +290,22 @@ measurement path remains the only product measurement surface.
    live gate does not qualify arrival timing.
 3. Capture P1-P8 around the listening region using the on-screen placement guide.
 4. Allow inaccessible positions to be skipped, but never invent or mirror data.
-5. Repeat P0 at the end. The automatic gate invalidates excessive level or response-shape
-   drift; timing and other suspected path changes remain human checks.
+5. Keep amplifier volume and microphone gain fixed from P0 through P8.
 
-P0 has weight 2 and each retained surrounding position has weight 1. When P0_END is
-present, P0 and P0_END each have weight 1 instead of double-counting the center. A
+P0 has weight 2 and each retained surrounding position has weight 1. A
 single-point project may produce a predicted-only trial with an overfitting warning;
 it becomes final-export eligible only after separate accepted verification P0 L/R and
 the live closed-loop gate.
 
-The implemented ending-repeat stability gate compares P0 with P0_END independently
-for L and R. Median level drift over 200-500 Hz must be no greater than 1.0 dB. Because
-the stand is moved through the surrounding points and returned by hand, level-removed
-response-shape RMSE over 20-500 Hz uses a loose 6.0 dB gross-change bound. P0_END is a
-separate center-area sample, not proof of exact microphone replacement. Arrival timing
-is still not qualified by this test.
+The centre is captured once. A `P0_END` end repeat used to be measured after P1-P8 and
+energy-averaged into P0 under a level/shape stability gate; it was removed because a
+hand-repositioned second pass is a different seat above a few hundred Hz rather than a
+repeat, and because it left the SECS design fitting a two-capture magnitude to a
+single-capture excess phase. `P0_END` is no longer an accepted position id, so legacy
+snapshots holding it are skipped by the measurement-cache restore. The drift check the
+repeat provided is gone: per-capture absolute level and SNR gates are now the only
+automatic guard against a volume or gain change mid-session, so leave both untouched
+until the last position is accepted.
 
 ## Opening the measurements in REW
 
@@ -371,7 +368,9 @@ the right-speaker marker arrival; it is not an automatic timing correction.
 - Pre-sweep noise evidence and at least 20 dB capture SNR.
 - Reconstruction fit remains visible but is diagnostic when a complete repeated-marker
   pair supplies independent extent/clock evidence. The markerless fallback requires
-  at least 12 dB fit.
+  at least 12 dB fit. The fit is scored inside 30 Hz-20 kHz only, because outside
+  the sweep band the deconvolution amplifies subsonic room rumble (HVAC, traffic)
+  into a number that measures the rumble's phase draw instead of capture quality.
 - Either a chronological start/end marker pair with each correlation at least 0.20,
   or a unique fallback full sweep with at least 0.45 correlation, plus no gross rate
   mismatch.

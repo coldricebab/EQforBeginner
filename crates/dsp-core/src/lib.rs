@@ -17,6 +17,7 @@ pub mod phase4;
 pub mod phase6;
 pub mod pipeline;
 pub mod secs;
+pub mod secs_edited;
 pub mod smoothing;
 pub mod spatial;
 pub mod stereo;

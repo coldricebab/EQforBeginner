@@ -182,7 +182,7 @@ L/R 스윕은 앱에 내장된 기본 스윕이 자동으로 올라가 있으므
 - 원작자: 한플
 - 원본: [디시인사이드 스피커 갤러리 SECS 원본 글](https://gall.dcinside.com/mgallery/board/view/?id=speakers&no=514096&s_type=search_name&s_keyword=%ED%95%9C%ED%94%8C&page=1)
 
-다지점 평균, 타겟 커브 추종, 2.1 공유 서브 대역 공통화, 폐루프 검증과 내보내기는
-이 프로젝트에서 추가한 것이라 원작자의 설계가 아닙니다. 해당 부분의 결함은 이
+다지점 평균, 타겟 커브 추종, 2.1 공유 서브 대역 공통화, 버그 수정판(`secs_edited`),
+폐루프 검증과 내보내기는 이 프로젝트에서 추가한 것이라 원작자의 설계가 아닙니다. 해당 부분의 결함은 이
 프로젝트 책임입니다. 라이선스 전문과 이식 범위는
 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)에 있습니다.
